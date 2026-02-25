@@ -1,0 +1,60 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pludos"
+version = "1.0.0"
+description = "PLUDOS Central Server"
+dependencies = [
+   "flwr[simulation]>=1.9.0",
+    "xgboost",
+    "numpy",
+]
+
+[tool.flwr.app]
+publisher = "ggjinalaj"
+
+[tool.flwr.app.components]
+# Tell Flower where to find your Apps
+serverapp = "server:app"
+clientapp = "client:app"
+
+
+#######################################################################
+# CONFIGURATION MIGRATION NOTICE:
+#
+# What was previously called "federation config" for SuperLink
+# connections in pyproject.toml has been renamed and moved.
+#
+# These settings are now **SuperLink connection configuration**
+# and are defined in the Flower configuration file.
+#
+# The entries below are commented out intentionally and are kept
+# only as a migration reference.
+#
+# Docs: https://flower.ai/docs/framework/ref-flower-configuration.html
+#######################################################################
+
+
+#######################################################################
+# CONFIGURATION MIGRATION NOTICE:
+#
+# What was previously called "federation config" for SuperLink
+# connections in pyproject.toml has been renamed and moved.
+#
+# These settings are now **SuperLink connection configuration**
+# and are defined in the Flower configuration file.
+#
+# The entries below are commented out intentionally and are kept
+# only as a migration reference.
+#
+# Docs: https://flower.ai/docs/framework/ref-flower-configuration.html
+#######################################################################
+
+# [tool.flwr.federations]
+# default = "pludos-local"
+
+# [tool.flwr.federations.pludos-local]
+# # # We will simulate 1 Jetson connecting to the server for this test
+# options.num-supernodes = 1
