@@ -1,0 +1,36 @@
+services:
+  # 1. The CoAP Data Engine (Listens to the STM32)
+  data-engine:
+    build: .
+    container_name: pludos-data-engine
+    command: python3 data-engine.py
+    ports:
+      - "5683:5683/udp"
+    volumes:
+      - shared_ram_buffer:/app/ram_buffer
+    restart: unless-stopped
+
+  # 2. The AI Worker (Trains the XGBoost Model)
+  ai-worker:
+    build: .
+    container_name: pludos-ai-worker
+    command: python3 client.py
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    volumes:
+      - shared_ram_buffer:/app/ram_buffer
+    depends_on:
+      - data-engine
+    restart: unless-stopped
+
+# This creates a RAM-disk. It saves data to memory, NOT the physical SD card.
+volumes:
+  shared_ram_buffer:
+    driver_opts:
+      type: tmpfs
+      device: tmpfs

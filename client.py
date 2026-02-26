@@ -3,10 +3,52 @@ import xgboost as xgb
 import numpy as np
 import time
 import logging
+import os
+import pandas as pd
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+# Function for real data logic and not test data
+BUFFER_DIR = "./ram_buffer"
+
+def load_buffered_data():
+    logger.info("Scanning RAM buffer for telemetry Parquet files...")
+    
+    # 1. Find all parquet files in the buffer directory
+    if not os.path.exists(BUFFER_DIR):
+        logger.warning("No buffer directory found! Generating dummy data for failsafe.")
+        return np.random.rand(100, 3), np.random.randint(0, 2, 100)
+        
+    files = [f for f in os.listdir(BUFFER_DIR) if f.endswith('.parquet')]
+    
+    if not files:
+        logger.warning("No parquet files found in buffer! Generating dummy data for failsafe.")
+        return np.random.rand(100, 3), np.random.randint(0, 2, 100)
+    
+    # 2. Load the most recent mission data
+    # (In a real scenario, you might concatenate multiple files)
+    latest_file = sorted(files)[-1]
+    file_path = os.path.join(BUFFER_DIR, latest_file)
+    logger.info(f"Loading data from {latest_file}...")
+    
+    df = pd.read_parquet(file_path)
+    
+    # 3. Prepare the Features (X) and Labels (y)
+    # Our mock_stm32 creates columns like sensors.vib_x, sensors.vib_y, sensors.vib_z
+    feature_cols = ['sensors.vib_x', 'sensors.vib_y', 'sensors.vib_z']
+    X_train = df[feature_cols].values
+    
+    # Since this is an unsupervised/mock setup, we will create dummy labels 
+    # based on a simple threshold (e.g., if vibration Z is high, mark as anomaly '1')
+    y_train = (df['sensors.vib_z'] > 0.8).astype(int).values
+    
+    logger.info(f"Successfully loaded {len(X_train)} real samples from buffer.")
+    return X_train, y_train
+    
+    '''
 
 # ==========================================
 # 1. THE DATA INGESTION (From RAM Buffer)
@@ -24,6 +66,7 @@ def load_buffered_data():
     y_train = np.random.randint(0, 2, 1000) # 0 = Normal, 1 = Anomaly
     
     return X_train, y_train
+'''
 
 # ==========================================
 # 2. THE FLOWER CLIENT (The AI Worker)
