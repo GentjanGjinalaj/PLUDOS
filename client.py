@@ -179,8 +179,18 @@ class PLUDOSClient(fl.client.NumPyClient):
         profiler.stop()
         logger.info(f"FL Round {round_num} completed in {time.time() - start_time:.2f}s.")
         
-        # Returns dummy weights to satisfy Flower's FedAvg architecture for this prototype
-        return [np.array([1.0])], len(self.X_train), {}
+        # EXTRACTING REAL XGBOOST WEIGHTS ---
+        # 1. Extract the internal "Booster" (the actual decision trees)
+        booster = model.get_booster()
+        
+        # 2. Save the trees into a raw JSON byte-string format
+        raw_booster = booster.save_raw("json")
+        
+        # 3. Convert the bytes into a NumPy array so Flower can transmit it over the network
+        model_bytes = np.frombuffer(raw_booster, dtype=np.uint8)
+        
+        # Return the REAL model bytes to the Central Server!
+        return [model_bytes], len(self.X_train), {}
 
     def evaluate(self, parameters, config):
         """Evaluates the updated global model."""
