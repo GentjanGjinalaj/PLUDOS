@@ -59,7 +59,7 @@ class AlumetProfiler:
         
         # Connect to the Central Server's InfluxDB container on the standard port (8086).
         # We use SYNCHRONOUS writing to ensure data points are committed immediately during the short AI bursts.
-        self.client = InfluxDBClient(url="http://localhost:8086", token="pludos-secret-token", org="pludos")
+        self.client = InfluxDBClient(url="http://100.93.249.37:8086", token="pludos-secret-token", org="pludos")
         self.write_api = self.client.write_api(write_options=SYNCHRONOUS)
 
     def start(self):
