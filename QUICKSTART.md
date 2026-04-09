@@ -35,5 +35,7 @@ To view the energy metrics (future Alumet integration):
 
 1. Run the Podman compose file (requires rootless permissions or sudo):
     ```bash
+    cd server
     podman compose up -d
+    ```
 2. Open a browser and navigate to http://localhost:3000 to access Grafana.

@@ -1,0 +1,3 @@
+../Drivers/BSP/B-U585I-IOT02A/b_u585i_iot02a_bus.c:10:17:SPI_Send_HAL	24	static
+../Drivers/BSP/B-U585I-IOT02A/b_u585i_iot02a_bus.c:23:17:SPI_Receive_HAL	24	static
+../Drivers/BSP/B-U585I-IOT02A/b_u585i_iot02a_bus.c:36:9:WIFI_RegisterBusIO	4	static

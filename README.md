@@ -14,12 +14,12 @@ The PLUDOS system strictly separates testing logic from production deployment us
 * **`mock_stm32.py`**: A simulator for the physical STM32 microcontroller. It mimics "Event-Driven Telemetry" by blasting UDP packets containing 3D vibration data, power metrics, and a crucial `mission_active` status flag.
 * **`data-engine.py`**: The Jetson's Gatekeeper. It listens on UDP Port 5683 and features **Smart Buffering**. It holds packets in RAM until a soft limit (e.g., 80% capacity) is reached, but *waits* for the STM32 to send a `mission_active: false` signal before flushing. It then automatically reorders the scrambled UDP packets chronologically and saves them as a highly compressed `.parquet` file.
 * **`client.py`**: The AI Worker (`ClientApp`). It strictly enforces production hardware standards (demanding NVIDIA `cuda` and real `.parquet` files). It scans the RAM buffer, loads the real vibration data, and uses the Jetson's GPU to train an XGBoost model.
-* **`Dockerfile` & `jetson-compose.yaml`**: The deployment blueprints. These files package `data-engine.py` and `client.py` into secure Podman containers with a virtual RAM disk (`tmpfs`) to protect the physical SD card from wear.
+* **`client/Containerfile` & `client/compose.yaml`**: The deployment blueprints. These files package `data-engine.py` and `client.py` into secure Podman containers with a virtual RAM disk (`tmpfs`) to protect the physical SD card from wear.
 
 ### 2. The Central Server Island (Your Laptop/Cloud)
-* **`server.py`**: The AI Orchestrator (`ServerApp`). It coordinates Jetson clients and aggregates their learned weights using the `FedAvg` strategy.
+* **`server/server.py`**: The AI Orchestrator (`ServerApp`). It coordinates Jetson clients and aggregates their learned weights using the `FedAvg` strategy.
 * **`pyproject.toml`**: The modern Flower configuration file, linking Server and Client Apps for local Ray-engine simulations.
-* **`compose.yaml`**: The analytics infrastructure spinning up InfluxDB and Grafana for future Alumet energy monitoring.
+* **`server/compose.yaml`**: The analytics infrastructure spinning up InfluxDB and Grafana for future Alumet energy monitoring.
 
 ## 🔄 The Sequence of Operations
 1. STM32 senses vibration -> Sends CoAP UDP packet with Packet Number and Power data.

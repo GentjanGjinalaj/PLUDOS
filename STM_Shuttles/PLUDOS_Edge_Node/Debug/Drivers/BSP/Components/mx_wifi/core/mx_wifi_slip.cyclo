@@ -1,0 +1,3 @@
+/home/ggjinalaj/STM_Shuttles/PLUDOS_Edge_Node/Drivers/BSP/Components/mx_wifi/mx_wifi_bare_os.h:49:25:mx_buf_alloc	2
+../Drivers/BSP/Components/mx_wifi/core/mx_wifi_slip.c:55:10:slip_transfer	10
+../Drivers/BSP/Components/mx_wifi/core/mx_wifi_slip.c:106:11:slip_input_byte	20

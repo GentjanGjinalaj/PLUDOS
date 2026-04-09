@@ -1,0 +1,8 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^cd /home/ggjinalaj/PLUDOS && python - <<'PY'\nfrom pathlib import Path\np=Path\\('copilot-instructions\\.md'\\)\ntext=p\\.read_text\\(\\)\nprint\\(repr\\(text\\)\\)\nPY$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}

@@ -11,6 +11,7 @@ away from the Jetson and onto the physical edge device.
 import asyncio
 import json
 import logging
+import os
 import random
 import aiocoap
 from aiocoap import *
@@ -18,6 +19,10 @@ from aiocoap import *
 # Configure standard terminal logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+COAP_SERVER = os.getenv('COAP_SERVER', '127.0.0.1')
+COAP_PORT = int(os.getenv('COAP_PORT', '5683'))
+COAP_PATH = os.getenv('COAP_PATH', 'telemetry')
 
 async def simulate_mission():
     logger.info("STM32 Simulator Waking Up... Starting LPBAM Mission.")
@@ -61,22 +66,30 @@ async def simulate_mission():
         payload_bytes = json.dumps(payload_dict).encode('utf-8')
         
         # --- NETWORK TRANSPORT ---
-        # We use aiocoap.Unreliable (UDP 'Fire-and-Forget'). The STM32 does not 
-        # waste energy waiting for the Jetson to acknowledge receipt of the packet.
+        uri = f"coap://{COAP_SERVER}:{COAP_PORT}/{COAP_PATH}"
         request = Message(
-            code=POST, 
-            payload=payload_bytes, 
-            uri="coap://127.0.0.1/telemetry",
-            transport_tuning=aiocoap.Unreliable
+            code=POST,
+            payload=payload_bytes,
+            uri=uri
         )
-        
-        try:
-            # Transmit the packet
-            protocol.request(request)
-            if not is_active:
-                logger.info(f"Sent final packet {i}. STM32 RAM at {stm_ram_pct:.1f}%. Mission Stopped.")
-        except Exception as e:
-            logger.error(f"Failed to send packet {i}: {e}")
+
+        # Critical: vibration + accelerometer + energy must be confirmed and retried.
+        send_success = False
+        for attempt in range(1, 5):
+            try:
+                response = await protocol.request(request).response
+                logger.info(f"Packet {i} ACKed with code {response.code} (attempt {attempt})")
+                send_success = True
+                break
+            except Exception as e:
+                logger.warning(f"CoAP send retry {attempt}/4 for packet {i} failed: {e}")
+                await asyncio.sleep(0.1)
+
+        if not send_success:
+            logger.error(f"Failed to send packet {i} after 4 attempts. Dropping packet.")
+
+        if not is_active and send_success:
+            logger.info(f"Sent final packet {i}. STM32 RAM at {stm_ram_pct:.1f}%. Mission Stopped.")
             
         # Sleep for 20ms to mimic a 50Hz hardware sensor sampling rate
         await asyncio.sleep(0.02)
