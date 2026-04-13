@@ -1,3 +1,5 @@
 pludos_venv/
 __pycache__/
 *.parquet
+GEMINI.md
+.github/
