@@ -15,14 +15,16 @@ import os
 import random
 import aiocoap
 from aiocoap import *
+import struct
+import time
 
 # Configure standard terminal logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-COAP_SERVER = os.getenv('COAP_SERVER', '127.0.0.1')
+COAP_SERVER = os.getenv('COAP_SERVER', '10.187.8.48')
 COAP_PORT = int(os.getenv('COAP_PORT', '5683'))
-COAP_PATH = os.getenv('COAP_PATH', 'telemetry')
+COAP_PATH = os.getenv('vib')
 
 async def simulate_mission():
     logger.info("STM32 Simulator Waking Up... Starting LPBAM Mission.")
@@ -43,27 +45,24 @@ async def simulate_mission():
         stm_ram_pct = min((i / total_packets) * 100.0, 100.0)
         
         # --- PAYLOAD CONSTRUCTION ---
-        payload_dict = {
-            "header": {
-                "shuttle_id": "STM32-Alpha", 
-                "packet_num": i          # Essential for Jetson to chronologically reorder UDP packets
-            },
-            "status": {
-                "mission_active": is_active,
-                "ram_usage_pct": round(stm_ram_pct, 1)  # The STM32 dictates its own memory state
-            },
-            "energy": {
-                "power_mw": round(random.uniform(145.0, 155.0), 2) # Instantaneous power draw
-            },
-            "sensors": {
-                "vib_x": random.random(),
-                "vib_y": random.random(),
-                "vib_z": random.random()
-            }
-        }
+        # Instead of JSON, we now pack into the 39-byte binary structure matching CoapPayload_t in main.c
+        # Format: <12s H I B f f f f f
+        # char[12], uint16, uint32, uint8, float, float, float, float, float
+        power_mw = round(random.uniform(145.0, 155.0), 2)
+        tick_ms = int(time.time() * 1000) & 0xFFFFFFFF
         
-        # Encode the dictionary into a UTF-8 JSON byte string
-        payload_bytes = json.dumps(payload_dict).encode('utf-8')
+        payload_bytes = struct.pack(
+            '<12sHIBfffff',
+            b'STM32-Alpha',
+            i,                   # packet_num
+            tick_ms,             # relative_tick_count
+            int(is_active),      # mission_active
+            stm_ram_pct,         # ram_usage_pct
+            power_mw,            # power_mw
+            random.random(),     # vib_x
+            random.random(),     # vib_y
+            random.random()      # vib_z
+        )
         
         # --- NETWORK TRANSPORT ---
         uri = f"coap://{COAP_SERVER}:{COAP_PORT}/{COAP_PATH}"
@@ -100,4 +99,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(simulate_mission())
     except KeyboardInterrupt:
-        logger.info("Simulation forcefully aborted.")
+        logger.info("Simulation forcefully aborted.")     

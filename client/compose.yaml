@@ -1,4 +1,19 @@
 services:
+  # 0. Zero-Touch Provisioning VPN (Tailscale)
+  tailscale:
+    image: tailscale/tailscale:latest
+    container_name: pludos-tailscale
+    hostname: pludos-jetson
+    environment:
+      - TS_AUTHKEY=${TS_AUTHKEY:?Tailscale Auth Key is required}
+    cap_add:
+      - net_admin
+      - sys_module
+    volumes:
+      - /dev/net/tun:/dev/net/tun
+      - tailscale_data:/var/lib/tailscale
+    restart: unless-stopped
+
   # 1. The CoAP Data Engine (Listens to the STM32)
   data-engine:
     build: .
@@ -6,8 +21,11 @@ services:
     command: python3 data-engine.py
     ports:
       - "5683:5683/udp"
+      - "5000:5000/udp" # UDP Broadcast Beacon for STM32 discovery
     volumes:
       - shared_ram_buffer:/app/ram_buffer
+    depends_on:
+      - tailscale
     restart: unless-stopped
 
   # 2. The AI Worker (Trains the XGBoost Model)
@@ -34,3 +52,4 @@ volumes:
     driver_opts:
       type: tmpfs
       device: tmpfs
+  tailscale_data:

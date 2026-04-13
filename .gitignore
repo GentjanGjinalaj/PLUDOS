@@ -3,3 +3,4 @@ __pycache__/
 *.parquet
 GEMINI.md
 .github/
+CLAUDE.md
