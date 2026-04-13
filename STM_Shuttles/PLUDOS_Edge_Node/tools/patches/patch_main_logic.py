@@ -1,6 +1,10 @@
 import sys
+import os
 
-file_path = "STM_Shuttles/PLUDOS_Edge_Node/Core/Src/main.c"
+# Construct path relative to this script's location
+script_dir = os.path.dirname(os.path.abspath(__file__))
+file_path = os.path.join(script_dir, '../../Core/Src/main.c')
+
 with open(file_path, "r") as f:
     content = f.read()
 

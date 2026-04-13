@@ -1,6 +1,11 @@
 import sys
+import os
 
-with open("STM_Shuttles/PLUDOS_Edge_Node/Core/Src/main.c", "r") as f:
+# Construct path relative to this script's location
+script_dir = os.path.dirname(os.path.abspath(__file__))
+main_c_path = os.path.join(script_dir, '../../Core/Src/main.c')
+
+with open(main_c_path, "r") as f:
     content = f.read()
 
 # 1. Update typedefs
@@ -142,6 +147,6 @@ if old_phase2 in content:
 else:
     print("Warning: old_phase2 not found")
 
-with open("STM_Shuttles/PLUDOS_Edge_Node/Core/Src/main.c", "w") as f:
+with open(main_c_path, "w") as f:
     f.write(content)
 

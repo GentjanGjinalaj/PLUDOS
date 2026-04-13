@@ -1,11 +1,13 @@
 services:
-  # 0. Zero-Touch Provisioning VPN (Tailscale)
+  # 0. Zero-Touch Provisioning VPN (Jetson <-> Server only)
   tailscale:
     image: tailscale/tailscale:latest
     container_name: pludos-tailscale
     hostname: pludos-jetson
+    profiles:
+      - vpn
     environment:
-      - TS_AUTHKEY=${TS_AUTHKEY:?Tailscale Auth Key is required}
+      - TS_AUTHKEY=${TS_AUTHKEY:-}
     cap_add:
       - net_admin
       - sys_module
@@ -14,7 +16,7 @@ services:
       - tailscale_data:/var/lib/tailscale
     restart: unless-stopped
 
-  # 1. The CoAP Data Engine (Listens to the STM32)
+  # 1. The CoAP Data Engine (STM32 <-> Jetson local WiFi path)
   data-engine:
     build: .
     container_name: pludos-data-engine
@@ -24,15 +26,15 @@ services:
       - "5000:5000/udp" # UDP Broadcast Beacon for STM32 discovery
     volumes:
       - shared_ram_buffer:/app/ram_buffer
-    depends_on:
-      - tailscale
     restart: unless-stopped
 
-  # 2. The AI Worker (Trains the XGBoost Model)
+  # 2. The AI Worker (Jetson <-> Server relay path via Tailscale)
   ai-worker:
     build: .
     container_name: pludos-ai-worker
     command: python3 client.py
+    profiles:
+      - vpn
     deploy:
       resources:
         reservations:
@@ -44,6 +46,7 @@ services:
       - shared_ram_buffer:/app/ram_buffer
     depends_on:
       - data-engine
+      - tailscale
     restart: unless-stopped
 
 # This creates a RAM-disk. It saves data to memory, NOT the physical SD card.
