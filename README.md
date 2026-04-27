@@ -1,28 +1,51 @@
-# PLUDOS: Energy-Aware Federated Learning System
+# PLUDOS: Modular Framework for Industrial Frugal Data Collection & Edge AI
 
-This repository contains the core software architecture for a PhD research project focusing on Energy-Aware Federated Learning (HE-AFL) at the extreme edge. 
+**Industrial-Academic Collaboration:** [Savoye SASU](https://www.savoye.com/) & PhD Research [[theses.fr/s410359](https://theses.fr/s410359)]
 
-The system bridges ultra-low-power microcontrollers (STM32) with edge AI accelerators (Jetson Orin Nano) and a central aggregation server, using CoAP (UDP) for lightweight telemetry and the Flower framework for AI orchestration.
+PLUDOS (**P**ower-aware **L**ightweight **U**DP **D**ata **O**rchestration **S**ystem) is a modular framework designed for **frugal data collection** and **Energy-Aware Federated Learning (HE-AFL)** at the extreme edge. Developed for large-scale industrial logistics, the system optimizes the energy-accuracy trade-off in warehouse automation environments.
 
+> ### ⚖️ Intellectual Property Notice
+> **Copyright © 2026 Gentjan Gjinalaj & Savoye SASU. All Rights Reserved.**
+> 
+> This repository contains proprietary research and industrial code. Unauthorized copying, modification, distribution, or use is strictly prohibited. Access is provided for review and academic validation within the context of the doctoral thesis.
 
+---
 
-## 🏗️ The System Architecture & Logic Flow
+## 🎯 Core Research Objectives
 
-The PLUDOS system strictly separates testing logic from production deployment using Environment Variables (`TEST_MODE=1`). The architecture is divided into two main "Islands":
+* **Computational Frugality:** Minimizing the energy footprint of the monitoring system itself to ensure a "net-zero" monitoring overhead.
+* **Modular Scalability:** Rapid deployment across diverse industrial hardware architectures, from ultra-low-power microcontrollers to edge AI accelerators.
+* **High-Granularity Telemetry:** Real-time vibration and power analysis utilizing lightweight, event-driven protocols (CoAP/UDP).
 
-### 1. The Edge Island (Jetson Orin Nano & STM32)
-* **`mock_stm32.py`**: A simulator for the physical STM32 microcontroller. It mimics "Event-Driven Telemetry" by blasting UDP packets containing 3D vibration data, power metrics, and a crucial `mission_active` status flag.
-* **`data-engine.py`**: The Jetson's Gatekeeper. It listens on UDP Port 5683 and features **Smart Buffering**. It holds packets in RAM until a soft limit (e.g., 80% capacity) is reached, but *waits* for the STM32 to send a `mission_active: false` signal before flushing. It then automatically reorders the scrambled UDP packets chronologically and saves them as a highly compressed `.parquet` file.
-* **`client.py`**: The AI Worker (`ClientApp`). It strictly enforces production hardware standards (demanding NVIDIA `cuda` and real `.parquet` files). It scans the RAM buffer, loads the real vibration data, and uses the Jetson's GPU to train an XGBoost model.
-* **`client/Containerfile` & `client/compose.yaml`**: The deployment blueprints. These files package `data-engine.py` and `client.py` into secure Podman containers with a virtual RAM disk (`tmpfs`) to protect the physical SD card from wear.
+---
 
-### 2. The Central Server Island (Your Laptop/Cloud)
-* **`server/server.py`**: The AI Orchestrator (`ServerApp`). It coordinates Jetson clients and aggregates their learned weights using the `FedAvg` strategy.
-* **`pyproject.toml`**: The modern Flower configuration file, linking Server and Client Apps for local Ray-engine simulations.
-* **`server/compose.yaml`**: The analytics infrastructure spinning up InfluxDB and Grafana for future Alumet energy monitoring.
+## 🏗️ System Architecture
 
-## 🔄 The Sequence of Operations
-1. STM32 senses vibration -> Sends CoAP UDP packet with Packet Number and Power data.
-2. Jetson `data-engine` buffers packets in RAM -> Sorts them -> Saves to `.parquet`.
-3. Central Server starts an FL Round -> Pings Jetson `client.py`.
-4. Jetson `client.py` reads the `.parquet` file -> Trains XGBoost on GPU -> Sends weights back to Server.
+### 1. The Edge Provisioning Layer (Industrial IoT)
+* **Hardware Abstraction:** Bridges ultra-low-power microcontrollers (**STM32**) with Edge AI accelerators (**NVIDIA Jetson Orin Nano**).
+* **Event-Driven Telemetry:** Implements a lightweight CoAP-based UDP protocol for 3-axis vibration data and high-frequency power metrics.
+* **Smart Buffering Engine:** A deterministic data engine that handles packet reordering and high-performance serialization into compressed **Apache Parquet** formats, protecting edge storage from excessive wear.
+
+### 2. The Federated Learning Island (AI Orchestration)
+* **Edge Worker (`ClientApp`):** A containerized AI client leveraging **NVIDIA CUDA** for on-device XGBoost training. It enforces strict production hardware standards for industrial reliability.
+* **Central Orchestrator (`ServerApp`):** Coordinates global model updates using the **Flower framework**, utilizing the `FedAvg` strategy to aggregate insights across distributed logistics nodes.
+* **Deployment Suite:** Fully containerized via **Podman** and **Docker Compose**, featuring virtual RAM disks (`tmpfs`) to ensure operational longevity in 24/7 industrial environments.
+
+---
+
+## 🔄 Operational Sequence
+
+1.  **Ingestion:** Industrial sensors transmit telemetry via CoAP UDP with mission-critical status flags.
+2.  **Orchestration:** The Data Engine sorts, validates, and serializes high-velocity streams into frugal, compressed data structures.
+3.  **Training:** The Central Server triggers a Federated Learning round; Edge Workers train local models on real-world industrial datasets.
+4.  **Aggregation:** Model weights are returned to the server to refine the global energy-efficiency model without sharing raw data.
+
+---
+
+## 🛠️ Technical Stack
+
+* **Languages:** Python, C (Firmware)
+* **AI/ML:** Flower (FL), XGBoost, NVIDIA CUDA
+* **Protocol:** CoAP (UDP), Custom Telemetry Headers
+* **Storage:** Apache Parquet, InfluxDB, Grafana
+* **DevOps:** Podman, Docker Compose, Ray Engine
