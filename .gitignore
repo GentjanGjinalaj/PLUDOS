@@ -29,3 +29,6 @@ GEMINI.md
 
 # IDE workspace files (machine-specific, regenerated)
 .vscode/settings.json
+
+# Claude Code worktrees (isolation branches, not for repo)
+.claude/worktrees/
