@@ -105,6 +105,40 @@ the disagreement so the doc gets fixed in the same commit.
 - No magic numbers. Use `#define` (C) or module constants (Python).
 - Prefer fewer lines that read clearly over clever one-liners.
 
+## Commenting rules
+
+Every function and every non-obvious code block must have a short comment.
+The goal: someone reading the code months later (including me) should
+understand *what this does*, *why it exists here*, or *what constraint it
+respects* — in one line. No paragraphs, no restating the code.
+
+**Functions** — one line above the signature explaining purpose or contract:
+```c
+/* Flush buffer to Parquet when SRAM threshold reached or mission ends. */
+void flush_sensor_buffer(void) { ... }
+```
+```python
+# Sort by (shuttle_id, seq_id) before write — guarantees time-series order.
+def flush_to_parquet(buffer: list[dict]) -> None: ...
+```
+
+**Important code blocks / non-obvious lines** — inline or above:
+```c
+HAL_Delay(10); /* EMW3080 needs 10 ms after SPI CS de-assert before next cmd */
+```
+```python
+offset = receipt_ms - tick_ms  # anchor STM32 relative time to gateway NTP wall clock
+```
+
+**What NOT to comment:**
+- Variable declarations with self-explanatory names
+- Closing braces of short functions
+- One-liners that already read like English
+- Re-stating what the next line does (`i++; /* increment i */`)
+
+Keep comments in English. Keep them honest — an outdated comment is worse
+than no comment. If you change logic, update the comment in the same edit.
+
 ## When you're stuck or uncertain
 
 - Searching the web is fine for current STM32 errata, Flower API

@@ -84,6 +84,29 @@ CoAP packets the firmware emits. Run it on a laptop on the same network
 as the shuttle to inspect traffic without needing the full Jetson stack.
 The wire protocol it expects is in `@docs/wire_protocol.md`.
 
+## C commenting rules
+
+Use `/* ... */` for function headers and block comments, `//` for
+inline end-of-line notes. One line per function describing what it does
+or the constraint it respects. Examples:
+
+```c
+/* Sample accelerometer at 50 Hz; returns 0 on success, -1 on I2C error. */
+int sensor_sample_accel(SensorSample_t *out) { ... }
+
+buffer_head = (buffer_head + 1) % SENSOR_BUFFER_SIZE; /* ring wrap */
+HAL_Delay(2); /* EMW3080 SPI de-assert hold time per datasheet §4.3 */
+```
+
+Mark CubeMX-generated regions clearly:
+```c
+/* USER CODE BEGIN 0 */
+/* your code here */
+/* USER CODE END 0 */
+```
+Never add comments outside these guards in generated files — they will
+be wiped on the next CubeMX regeneration.
+
 ## Skill triggers
 
 When you see firmware C code, the `pludos-c-review` skill applies.

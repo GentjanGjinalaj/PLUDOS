@@ -142,17 +142,15 @@ If you see these logs, **CoAP communication is working! ✅**
 
 ---
 
-## **Step 8: Run in Background (Optional: systemd Service)**
+## **Step 8: Run in Background (Systemd User Service)**
 
 To keep the container running on Jetson restart:
-
-### Option A: Simple Podman systemd Service
 
 ```bash
 # Create systemd user service directory
 mkdir -p ~/.config/systemd/user
 
-# Create service file
+# Create service file (replace 'warehouse1' with your Jetson username)
 cat > ~/.config/systemd/user/pludos-data-engine.service << 'EOF'
 [Unit]
 Description=PLUDOS Data Engine (CoAP Server)
@@ -166,19 +164,24 @@ ExecStart=/usr/bin/podman-compose up data-engine
 ExecStop=/usr/bin/podman-compose down
 Restart=always
 RestartSec=10s
-User=warehouse1
 
 [Install]
 WantedBy=default.target
 EOF
 
 # Enable and start service
-systemctl --user enable pludos-data-engine.service
-systemctl --user start pludos-data-engine.service
+systemctl --user daemon-reload
+systemctl --user enable --now pludos-data-engine.service
+
+# IMPORTANT: enable-linger so the user service starts at boot even without a login session
+loginctl enable-linger $(whoami)
 
 # Verify it's running
 systemctl --user status pludos-data-engine.service
 ```
+
+> **Why `loginctl enable-linger`?** Without it, user systemd services only start after
+> you log in interactively. With it, they start at boot. Easy to forget, hard to debug.
 
 ---
 
@@ -277,8 +280,29 @@ environment:
 
 ---
 
-## **Support**
+## **Dependency model (why no venv on the Jetson host)**
 
-- **PLUDOS Architecture:** See [docs/ARCHITECTURE_AND_CONFIG.md](../ARCHITECTURE_AND_CONFIG.md)
-- **Network Setup:** See [docs/NETWORK_SETUP.md](../NETWORK_SETUP.md)
+The Jetson is a container runtime host, not a dev machine.
+
+| Layer | Where it runs | Python env |
+|---|---|---|
+| Development (laptop) | Directly, inside `pludos_venv` | `pludos_venv/` |
+| Production (Jetson) | Inside Podman container | Baked into image |
+
+The Jetson host only needs three tools: `podman`, `podman-compose`, `git`.
+All Python dependencies are installed inside the container at build time
+from `client/requirements.txt`. The host needs no `pip install`, no venv.
+
+If you ever need to run directly on the Jetson host (debugging only):
+```bash
+python3 -m venv ~/pludos_venv && source ~/pludos_venv/bin/activate
+pip install -r requirements.txt
+python3 data-engine.py
+```
+This is not the deployment approach — containerized is the standard path.
+
+## **References**
+
+- **PLUDOS Architecture:** See [docs/architecture.md](architecture.md)
+- **Network Setup:** See [docs/NETWORK_SETUP.md](NETWORK_SETUP.md)
 - **Patch file details:** See [STM_Shuttles/PLUDOS_Edge_Node/tools/patches/README.md](../../STM_Shuttles/PLUDOS_Edge_Node/tools/patches/README.md)
