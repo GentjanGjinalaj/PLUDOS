@@ -1,27 +1,51 @@
 # Network & Hotspot Configuration
 
-The PLUDOS Edge Node relies on a local WiFi hotspot (provided by a phone) to connect to the Jetson Nano gateway via CoAP over UDP.
+The PLUDOS Edge Node connects to the Jetson gateway via a local WiFi hotspot
+(typically a phone hotspot) using CoAP over UDP.
 
-## Hotspot Requirements (Phone)
-The MXCHIP EMW3080 WiFi module **only supports 2.4GHz**. It does not support 5GHz.
+> **Security note:** Real SSID, password, and IP addresses are NOT committed
+> here. Configure them locally in `wifi_credentials.h` (gitignored) on the
+> STM32 side, and in `client/.env` on the Jetson side.
 
-- **SSID:** `Galaxy S24 Ultra` (Exact match, case-sensitive)
-- **Password:** `12345666` (Exactly 8 characters)
-- **Band:** `2.4 GHz` (Critical: Ensure 5GHz is disabled on the hotspot)
-- **Security:** `WPA2-AES`
+## Hotspot Requirements
 
-## Jetson Configuration (Gateway)
-The Jetson acts as the CoAP server. The STM32 sends UDP packets to the Jetson's IP address.
+The MXCHIP EMW3080 WiFi module **only supports 2.4 GHz**. It will not join a
+5 GHz or auto-band network.
 
-1. Find the Jetson's IP address by running `hostname -I` on the Jetson while it is connected to the phone hotspot.
-2. If the Jetson's IP is different from `10.17.194.48`, update `Core/Src/main.c` in the STM32 project:
-   ```c
-   #define JETSON_IP "YOUR_JETSON_IP"
-   ```
-3. Rebuild the STM32 firmware and flash it.
-4. Ensure the CoAP server is listening on the Jetson: `ss -tlnup | grep 5683`.
+| Setting | Requirement |
+|---|---|
+| Band | **2.4 GHz only** — disable 5 GHz or use a 2.4 GHz-only hotspot |
+| Security | WPA2-AES |
+| SSID | Your choice — must match `WIFI_SSID` define in firmware |
+| Password | Your choice — must match `WIFI_PASSWORD` define in firmware |
+
+Configure your phone (Android or iOS) to broadcast on 2.4 GHz only.
+On Android, check "Extended compatibility" or "2.4 GHz band" in hotspot settings.
+
+## Jetson IP (Gateway)
+
+1. Connect Jetson to the hotspot network.
+2. Find its IP: `ip -4 addr show wlan0` (or `hostname -I`).
+3. Update the STM32 firmware with that IP (`JETSON_IP` define in `main.c`),
+   rebuild, and flash.
+4. Verify CoAP listener is up: `ss -tlnup | grep 5683`.
+
+## Ports Used
+
+| Port | Protocol | Service |
+|---|---|---|
+| 5683 | UDP | CoAP (confirmable telemetry) |
+| 5000 | UDP | Beacon discovery (stubbed, future zero-touch) |
+
+Open both on the Jetson firewall:
+```bash
+sudo ufw allow 5683/udp
+sudo ufw allow 5000/udp
+```
 
 ## Troubleshooting
-- **Cannot find WiFi:** Check that the phone is broadcasting in 2.4GHz.
-- **Connection Timeout:** Verify the exact SSID and password.
-- **Data Not Reaching Jetson:** Check if the Jetson's IP has changed or if the Ubuntu firewall (`ufw`) is blocking port `5683 UDP`.
+
+- **STM32 can't find WiFi:** Hotspot is broadcasting on 5 GHz — force 2.4 GHz.
+- **Connection timeout:** SSID or password mismatch in firmware defines.
+- **CoAP ACKs missing:** Verify Jetson IP in firmware matches `ip -4 addr show wlan0` output.
+- **Firewall blocking:** `sudo ufw status` — 5683/udp must show ALLOW.

@@ -1,5 +1,31 @@
+# Python
 pludos_venv/
 __pycache__/
+*.py[cod]
+*.egg-info/
+
+# Data files (runtime output, never commit)
 *.parquet
+# ram_buffer/ directories hold .parquet files (ignored above) and a .gitkeep — don't ignore the dir
+
+# Secrets and local config (never commit)
+client/.env
+server/.env
+Core/Inc/wifi_credentials.h
+
+# STM32CubeIDE build output
+STM_Shuttles/PLUDOS_Edge_Node/Debug/
+*.elf
+*.bin
+*.hex
+*.map
+*.list
+*.o
+*.d
+
+# AI assistant context files (project-specific, not for repo)
 GEMINI.md
 .github/
+
+# IDE workspace files (machine-specific, regenerated)
+.vscode/settings.json

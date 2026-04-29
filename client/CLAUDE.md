@@ -97,12 +97,36 @@ walk through the candidates in ADR-010 first.
 
 ## Tests / mocks
 
-`mock_stm32.py` (referenced in QUICKSTART.md but currently missing —
-P0-7 in current_problems) is the local-laptop test driver. It should
-emit CoAP CON packets matching `@docs/wire_protocol.md` so the
-data-engine can be exercised without hardware. If I ask you to write
-or fix it, build the wire format directly (no aiocoap dependency, just
-raw `socket.SOCK_DGRAM`) so it stays a single-file script.
+`tools/mock_stm32.py` (at repo root `tools/` directory) is the local-laptop
+test driver. It emits CoAP CON packets matching `@docs/wire_protocol.md`
+so the data-engine can be exercised without hardware. If extending it,
+keep the wire format direct (no aiocoap dependency, just raw
+`socket.SOCK_DGRAM`) so it stays a single-file script.
+
+## Python commenting rules
+
+One `#` comment line above every function and every non-obvious block.
+Keep it to one line. State the purpose, contract, or constraint — not
+what the next line of code does. Examples:
+
+```python
+# Write sorted packets atomically; os.replace() is crash-safe on Linux.
+def flush_to_parquet(buffer: list[dict], path: Path) -> None: ...
+
+# Per-shuttle offset: anchors STM32 relative tick to gateway NTP time.
+offset_ms = receipt_time_ms - tick_ms
+
+# Hard limit: drop oldest packets if gateway RAM fills beyond 500 entries.
+if len(self.ram_buffer) >= MAX_BUFFER_SIZE:
+    ...
+```
+
+Async gotcha — always comment why a call is safe to block on (or why
+it's on an executor):
+```python
+# PyArrow write is sync but fires only on flush — acceptable latency spike.
+table.to_parquet(tmp_path)
+```
 
 ## Skill triggers
 
