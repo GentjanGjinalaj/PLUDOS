@@ -21,15 +21,18 @@ typedef struct __attribute__((packed)) {
     uint16_t sequence_id;      /* monotonic packet counter per shuttle     */
     uint32_t tick_ms;          /* HAL_GetTick() — ms since STM32 boot      */
     uint8_t  mission_active;   /* 1 = shuttle moving, 0 = mission ended    */
-    float    ram_pct;          /* STM32 SRAM buffer fill % (0–100)         */
-    float    power_mw;         /* Power consumption mW (150.0 placeholder) */
+    float    ram_usage_pct;    /* STM32 SRAM buffer fill % (0–100)         */
     float    accel_x;          /* Accelerometer X axis, g                  */
     float    accel_y;          /* Accelerometer Y axis, g                  */
     float    accel_z;          /* Accelerometer Z axis, g                  */
+    float    power_mw;         /* Power consumption mW (150.0 placeholder) */
 } CriticalPayload_t;           /* Total: 39 bytes                          */
 ```
 
 Python unpack string: `struct.unpack('<12sHIBfffff', data)`
+
+**Float field order:** `ram_usage_pct, accel_x, accel_y, accel_z, power_mw`.
+When updating `data-engine.py` unpacking, assign tuple positions accordingly.
 
 ### Field notes
 
@@ -43,30 +46,38 @@ Python unpack string: `struct.unpack('<12sHIBfffff', data)`
   writes Parquet on receipt.
 - `ram_pct`: allows the gateway to monitor STM32 SRAM pressure. At 70%,
   the STM32 triggers a flush; at 95%, it suspends sampling.
-- `power_mw`: placeholder `150.0f`. Will be real ADC reading once the power
-  sensing path is configured in CubeMX (see ADR in `decisions.md`).
+- `power_mw`: state-based estimate from `POWER_EstimateMilliwatts()` —
+  MCU run (~15 mA) + I2C sensors (~2 mA) + WiFi idle (~10 mA) or TX (~200 mA)
+  at 3.3V. Accuracy ±40%. No ADC shunt is wired; see P2-2 in `current_problems.md`
+  for the long-term INA219 path.
 
 ---
 
 ## 2. UDP Non-Critical Payload (STM32 → Jetson)
 
-Used for temperature, humidity, and future environmental sensors. Sent as
-raw UDP (no ACK, no retry). Sent during `STATE_IDLE` only.
+Used for temperature, humidity, and pressure. Sent as raw UDP (no ACK,
+no retry). Sent during `STATE_IDLE` only.
 
-**Status:** fields are declared in the firmware data model but the sensors
-(HTS221/SHT41 for temp/humidity) are not yet read. The payload format is
-TBD pending sensor integration.
+**Status:** implemented. HTS221 reads temp/humidity; LPS22HH reads pressure.
+Both on I2C2. Packet dropped if HTS221 unavailable. `pressure_hpa = 0.0`
+is the sentinel value for LPS22HH unavailable or data-not-ready.
 
-Provisional layout (subject to change):
 ```c
 typedef struct __attribute__((packed)) {
-    char     shuttle_id[12];
-    uint16_t sequence_id;
-    uint32_t tick_ms;
-    float    temperature_c;   /* °C */
-    float    humidity_pct;    /* % RH */
-} NonCriticalPayload_t;      /* ~26 bytes, not yet implemented */
+    char     shuttle_id[12];  /* identifies source shuttle for gateway correlation */
+    uint16_t sequence_id;     /* monotonic counter shared with CoAP sequence space */
+    uint32_t tick_ms;         /* HAL_GetTick() at sensor read time                 */
+    float    temp_c;          /* °C from HTS221                                    */
+    float    humidity_pct;    /* % RH from HTS221, clamped [0, 100]               */
+    float    pressure_hpa;    /* hPa from LPS22HH; 0.0 = sensor unavailable        */
+} NonCriticalPayload_t;       /* total: 30 bytes */
 ```
+
+Python unpack string: `struct.unpack('<12sHIfff', data)`
+
+**⚠ Breaking change from previous 26-byte format.** Update `data-engine.py`
+NonCritical unpack path to use `'<12sHIfff'` and handle the `pressure_hpa`
+field (index 5 in the unpacked tuple).
 
 ---
 

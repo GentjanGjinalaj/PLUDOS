@@ -11,25 +11,11 @@ fix P1 before any non-local deployment.
 
 ## P0 — Blocking
 
-### P0-1 · `jetson_ip` undeclared as writable buffer (Firmware)
-**File:** `Core/Src/main.c`
-`jetson_ip` is used as a char buffer in multiple places but is never declared
-as `static char jetson_ip[16] = {0};`. Causes a compile error or undefined
-behaviour depending on context.
-**Fix:** Add `static char jetson_ip[16] = {0};` at file scope and populate
-from `JETSON_IP` define at init.
+*No open P0 items.*
 
 ---
 
 ## P1 — Important
-
-### P1-1 · WiFi credentials hardcoded in `main.c` (Security)
-**File:** `Core/Src/main.c` lines 133–134
-`WIFI_SSID` and `WIFI_PASSWORD` are committed in source. Anyone with repo
-access can read the WiFi password.
-**Fix:** Move to `Core/Inc/wifi_credentials.h` with that header added to
-`.gitignore`. The main CLAUDE.md, `.gitignore`, and `docs/NETWORK_SETUP.md`
-already document this requirement.
 
 ### P1-2 · Jetson IP hardcoded in firmware (Flexibility)
 **File:** `Core/Src/main.c`
@@ -62,10 +48,8 @@ New deployers have no template showing which env vars are required.
 listing all required keys with safe placeholder values. These are committed;
 the real `.env` files are gitignored.
 
-### P1-6 · Tailscale image not pinned in `client/compose.yaml` (Reproducibility)
-`tailscale/tailscale:latest` will silently change on each pull.
-**Fix:** Pin to a specific version tag (e.g., `tailscale/tailscale:v1.66.0`).
-Update periodically with intent.
+### ~~P1-6~~ · Tailscale image pinned — **RESOLVED**
+`tailscale/tailscale:v1.66.0` in `client/compose.yaml`. Update the tag deliberately when upgrading.
 
 ---
 
@@ -77,12 +61,18 @@ The gateway never broadcasts its IP. The STM32 uses `JETSON_IP` directly.
 **Fix:** Implement UDP broadcast from gateway on port 5000 at startup. Have
 the STM32 listen before attempting CoAP connection.
 
-### P2-2 · ADC power sensing is a placeholder (Energy accuracy)
+### P2-2 · ADC power sensing — estimate implemented, real measurement pending (Energy accuracy)
 **File:** `Core/Src/main.c`
-`adc_power_mw` field in `SensorSample_t` is hardcoded to `150.0f`. The ADC
-peripheral is not configured in the `.ioc`.
-**Fix:** Configure ADC in CubeMX (use `pludos-stm32-cubemx` skill workflow),
-connect to power sensing path, implement `ADC_ReadPowerMilliwatts()`.
+`power_mw` is now computed by `POWER_EstimateMilliwatts()` using datasheet
+current figures (STM32U585 DS13259 §6.3.7 + MXCHIP EMW3080 §5.2) and the
+current WiFi/FSM state. This replaces the fixed `150.0f` placeholder and gives
+a meaningful ±40% estimate without any hardware changes.
+**Remaining gap:** No ADC is wired to a current-sense shunt. The board has no
+on-board power monitor IC reachable by the MCU (unlike the Jetson's INA3221).
+**Fix (long-term):** Add an INA219 on the 3.3V rail to I2C1 (I2C2 is
+full), configure in CubeMX, implement `INA219_ReadPowerMilliwatts()` to replace
+the estimate. Alternatively, calibrate the estimate constants against a bench
+ammeter measurement during development.
 
 ### P2-3 · AlumetProfiler writes mock values (Energy research)
 **File:** `client/client.py`
@@ -99,12 +89,10 @@ is replaced with a real aggregation strategy.
 **Fix:** Implement one of the candidates in ADR-010 (`decisions.md`). Requires
 a literature review and experimental design before coding.
 
-### P2-5 · Temperature/humidity sensors not read (Sensor coverage)
-**File:** `Core/Src/main.c`
-The wire protocol includes temp/humidity fields. The HTS221/SHT41 sensors
-are present on the board but no driver code reads them.
-**Fix:** Add I2C2 driver for HTS221 or SHT41 inside USER CODE guards. No CubeMX
-changes needed (I2C2 is already configured for the ISM330 accelerometer).
+### P2-5 · ~~Temperature/humidity sensors not read~~ — **RESOLVED**
+HTS221 driver in `Core/Src/sensors.c`; LPS22HH pressure driver added in same
+session. Both on I2C2, no CubeMX changes needed. UDP non-critical packet now
+carries `temp_c`, `humidity_pct`, and `pressure_hpa` (30 bytes).
 
 ### P2-6 · `evaluate()` returns dummy accuracy (Metrics)
 **File:** `client/client.py`

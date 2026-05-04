@@ -39,7 +39,7 @@ new files outside `Core/`.
 The board has more sensors than the firmware currently uses. Reference
 when planning extensions:
 
-- ISM330 (I2C2, addr 0x6A << 1) — 6-axis IMU, **currently used**
+- ISM330 (I2C2, addr 0x6B << 1 = 0xD6, SA0 tied to VDD on IOT02A) — 6-axis IMU, **currently used**
 - LIS2MDL — 3-axis magnetometer (I2C2)
 - LPS22HH — pressure (I2C2, INT pin PG2)
 - HTS221 / SHT41 — temperature + humidity (I2C2)

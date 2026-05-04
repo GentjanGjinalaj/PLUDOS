@@ -182,3 +182,22 @@ server. The PLUDOS `AlumetProfiler` should be replaced by this relay client.
 4. Update InfluxDB write to use Alumet output format.
 
 See the `pludos-alumet` skill for integration guidance.
+
+---
+
+## ADR-012 — Manual application-layer CoAP retry
+**Status:** Closed
+
+**Decision:** The firmware implements a manual retry loop (4 attempts, 2/4/8/16 s
+exponential backoff) rather than relying on RFC 7252 native retransmission.
+
+**Rationale:** The `mx_wifi` BSP does not expose RFC 7252 retransmission natively.
+Implementing it at the application layer gives explicit control over the timeout
+budget and allows per-attempt UART logging, which is essential for debugging over
+ST-Link. The behaviour (4 retries, binary exponential backoff, starting at 2 s)
+is consistent with RFC 7252 §4.8 default parameters (MAX_RETRANSMIT=4,
+ACK_TIMEOUT=2 s).
+
+**Consequence:** If a native CoAP library is adopted later (e.g. libcoap), the
+manual retry loop in `COAP_SendBufferedBatch` must be removed to avoid
+double-retransmission.
