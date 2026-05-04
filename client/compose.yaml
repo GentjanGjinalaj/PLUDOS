@@ -1,7 +1,7 @@
 services:
   # 0. Zero-Touch Provisioning VPN (Jetson <-> Server only)
   tailscale:
-    image: tailscale/tailscale:latest
+    image: tailscale/tailscale:v1.66.0
     container_name: pludos-tailscale
     hostname: pludos-jetson
     profiles:
@@ -22,8 +22,9 @@ services:
     container_name: pludos-data-engine
     command: python3 data-engine.py
     ports:
-      - "5683:5683/udp"
-      - "5000:5000/udp" # UDP Broadcast Beacon for STM32 discovery
+      - "5683:5683/udp"   # CoAP CON — CriticalPayload (aiocoap)
+      - "5684:5684/udp"   # raw UDP — NonCriticalPayload (separate socket, avoids aiocoap collision)
+      - "5000:5000/udp"   # UDP Broadcast Beacon for STM32 discovery (P2-1, stubbed)
     volumes:
       - shared_ram_buffer:/app/ram_buffer
     restart: unless-stopped

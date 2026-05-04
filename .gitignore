@@ -11,7 +11,7 @@ __pycache__/
 # Secrets and local config (never commit)
 client/.env
 server/.env
-Core/Inc/wifi_credentials.h
+**/wifi_credentials.h
 
 # STM32CubeIDE build output
 STM_Shuttles/PLUDOS_Edge_Node/Debug/
