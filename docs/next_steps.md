@@ -12,10 +12,10 @@ research questions.
 
 These prevent correct operation or represent security risks.
 
-- [ ] **P0-1** Fix `jetson_ip` undeclared buffer in `main.c` (compile blocker)
+- [x] **P0-1** Fix `jetson_ip` undeclared buffer in `main.c` (resolved — buffer is declared)
 - [ ] **P1-1** Move WiFi credentials to `Core/Inc/wifi_credentials.h` (gitignored)
-- [ ] **P1-5** Create `client/.env.example` and `server/.env.example`
-- [ ] **P1-6** Pin Tailscale image version in `client/compose.yaml`
+- [x] **P1-5** Create `client/.env.example` and `server/.env.example` (resolved)
+- [x] **P1-6** Pin Tailscale image version in `client/compose.yaml` (resolved — `tailscale/tailscale:v1.66.0`)
 
 ---
 
@@ -24,11 +24,12 @@ These prevent correct operation or represent security risks.
 Get the STM32 to a state where all thesis claims are backed by real code.
 
 - [ ] Configure ADC for power sensing in CubeMX → implement
-      `ADC_ReadPowerMilliwatts()` (P2-2)
-- [ ] Add I2C2 driver for HTS221/SHT41 (temperature/humidity) (P2-5)
-- [ ] Resolve CoAP retry strategy: keep manual loop or RFC 7252? Document
-      in `decisions.md` (P1-3)
-- [ ] Implement or formally defer beacon discovery (P2-1)
+      `ADC_ReadPowerMilliwatts()` (P2-2). Estimate in place (±40%), real INA219 deferred.
+- [x] Add I2C2 driver for HTS221/SHT41 (temperature/humidity) (P2-5 — resolved).
+      LPS22HH pressure also added. NC payload is 30 bytes.
+- [x] Resolve CoAP retry strategy (P1-3 — resolved via ADR-012: manual app-layer loop kept,
+      documented and justified against RFC 7252 §4.8 defaults)
+- [ ] Implement beacon discovery on STM32 side (P2-1 — gateway side done, STM32 side pending)
 - [ ] Test full mission cycle end-to-end: IDLE → MOVING → buffer fill →
       flush → CoAP ACK → IDLE
 
@@ -51,15 +52,12 @@ See the `pludos-alumet` skill and ADR-011 in `decisions.md`.
 
 ## Phase 3 — Real Federated Aggregation (ADR-010)
 
-Replace the "select largest booster" placeholder with a real aggregation strategy.
-Required before the thesis can claim federated XGBoost as a contribution.
-
-- [ ] Literature review: horizontal tree-set union, distillation, Flower's
-      built-in XGBoost support
-- [ ] Choose and document strategy in ADR-010 (`decisions.md`)
-- [ ] Implement chosen strategy in `XGBoostStrategy.aggregate_fit`
-- [ ] Test with ≥ 2 Jetson gateways and verify global model accuracy
-- [ ] Measure aggregation energy cost on the server side
+- [x] Literature review done; four candidates documented in `future_options.md §1`
+- [x] ADR-010 closed: Option A (horizontal tree-set union) chosen and implemented
+      in `server/server.py _merge_boosters()`
+- [ ] Test with ≥ 2 Jetson gateways and verify merged model accuracy
+- [ ] Measure aggregation energy cost on server side
+- [ ] Compare merged model accuracy vs. single-gateway baseline
 
 ---
 
@@ -95,9 +93,9 @@ Before submitting, confirm each claimed contribution is backed by code:
 
 | Claim | Status | Evidence |
 |---|---|---|
-| Energy-aware federated learning | ❌ Placeholder | ADR-011 |
-| SRAM-pressure-driven flush trigger | ✅ Implemented | `main.c` FSM |
-| CoAP CON for critical data | ✅ Implemented | `main.c`, `wire_protocol.md` |
-| Federated XGBoost aggregation | ❌ Selection only | ADR-010 |
-| Energy tagging per FL round | ❌ Mock values | ADR-011 |
-| Multi-shuttle scalability | ❌ Untested at scale | Phase 4 |
+| Energy-aware federated learning | ⚠️ Measurement loop open | ADR-011; tegrastats writes to InfluxDB but server never reads it back to adapt training |
+| SRAM-pressure-driven flush trigger | ✅ Implemented | `main.c` FSM (70% soft / 95% hard) |
+| CoAP CON for critical data | ✅ Implemented | `main.c`, `wire_protocol.md`, ADR-012 |
+| Federated XGBoost aggregation | ⚠️ Single-gateway tested | ADR-010 Option A; multi-gateway end-to-end pending |
+| Energy tagging per FL round | ⚠️ Phase 1 real data | tegrastats on Jetson; INA3221 (Phase 2) pending hardware |
+| Multi-shuttle scalability | ❌ Untested at scale | Per-shuttle buffers implemented (P2-9); stress test pending |

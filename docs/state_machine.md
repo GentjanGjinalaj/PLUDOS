@@ -63,13 +63,23 @@ the buffered data (receives CoAP ACK).
 ## Accelerometer Threshold
 
 - **Sensor:** ISM330DLC, 6-axis IMU, on I2C2 at address 0x6A
-- **Threshold:** 0.05 g² resultant magnitude (configurable in firmware)
+- **Threshold:** `0.05 g²` — this is a **squared resultant magnitude** comparison.
+  The firmware computes `ax² + ay² + az²` (in g²) and compares directly to `0.05`,
+  which is equivalent to a resultant magnitude of `√0.05 ≈ 0.224 g`.
+  No square root is computed in the firmware (avoids floating-point cost on M33).
 - **Dwell time for MOVING:** 500 ms continuous above threshold
 - **Dwell time for IDLE:** 10 s continuous below threshold
 
 These values are defined as `#define` constants in `main.c`. They were
 chosen empirically for warehouse shuttle speed profiles — adjust if deploying
 on a different vehicle type.
+
+**Note on units vs. the ML anomaly label:** The FSM threshold (`0.05 g²` ≈ `0.224 g`
+resultant) is for state-transition hysteresis — it determines when the shuttle is
+"in motion." The ML anomaly label in `client.py` uses `accel_z > ANOMALY_THRESHOLD_G`
+(default `0.8 g`, linear, Z-axis only). These serve different purposes and operate
+in different mathematical spaces. The anomaly threshold requires calibration against
+real fault data; the FSM threshold is a motion detector, not a fault detector.
 
 ---
 

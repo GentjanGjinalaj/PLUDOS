@@ -92,7 +92,7 @@ Migration to a dedicated server is listed as a future enhancement.
 | Component | Protocol | Port |
 |---|---|---|
 | STM32 → Jetson (critical) | CoAP CON over UDP | 5683 |
-| STM32 → Jetson (non-critical) | Raw UDP | 5683 (future: different port) |
+| STM32 → Jetson (non-critical) | Raw UDP | 5684 |
 | Beacon discovery | UDP broadcast | 5000 |
 | Jetson → Server (FL) | gRPC over Tailscale | Flower default |
 | Jetson → InfluxDB | HTTP | 8086 |

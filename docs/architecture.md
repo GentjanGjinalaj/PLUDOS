@@ -55,8 +55,8 @@ designed for ≥100 shuttles per gateway.
 
 - `data-engine` service: aiocoap-based CoAP server bound to 0.0.0.0:5683;
   ingests `CriticalPayload` packets from STM32 shuttles, buffers in process
-  memory (Python list `ram_buffer`), flushes to Parquet on the volume
-  `shared_ram_buffer` (a tmpfs RAM-disk).
+  memory (per-shuttle `dict[str, list[dict]]` keyed by `shuttle_id` — P2-9 fix),
+  flushes to Parquet on the volume `shared_ram_buffer` (a tmpfs RAM-disk).
 - `ai-worker` service: Flower client (`client.py`) that loads the latest
   Parquet file, trains XGBoost locally, and ships the booster bytes to the
   central server. Profiled by `AlumetProfiler` (see below).
@@ -77,18 +77,23 @@ designed for ≥100 shuttles per gateway.
 - The first packet from a given `shuttle_id` establishes the NTP offset:
   `offset = receipt_time_ms - tick_ms`. Subsequent packets have an absolute
   timestamp computed as `tick_ms + offset`.
-- This is per-shuttle, set once, never refreshed. Real-world clock drift on
-  the STM32 (no RTC battery on the IOT02A by default) will eventually cause
-  drift; periodic resync is not implemented.
+- The offset is refreshed every `NTP_REFRESH_INTERVAL` packets (default 100)
+  to bound STM32 crystal-drift accumulation. Drift delta is logged at each
+  refresh. The sort key is `(shuttle_id, sequence_id)`, not `timestamp_ms`,
+  so mid-mission offset corrections do not reorder Parquet rows. See ADR-009.
 
 **Energy profiling (AlumetProfiler in `client.py`):**
 
-- Spins a background thread at 10 Hz during `model.fit()` and writes power
-  samples to InfluxDB tagged with `fl_round`.
-- **Current implementation is not real Alumet.** It writes a Python
-  `random.uniform(25.0, 45.0)` in TEST_MODE and a hardcoded `12.0` in
-  production mode. Wiring this to real Jetson sensors (INA3221 via
-  `tegrastats` or Alumet's Jetson plugin) is open work.
+- Spins a background thread at 10 Hz during `model.fit()` and writes two InfluxDB measurements:
+  `fl_energy` (continuous power samples tagged `fl_round`) and `fl_phases` (one summary point per
+  named phase: load / train / round_total with duration_ms, energy_j, avg_power_w).
+- **Phase 1 done:** reads `tegrastats --interval 100 --count 1` and parses `VDD_GPU`, `VDD_CPU`,
+  `VDD_SOC` rails on the Jetson. `nvpmodel -q` read once at init and attached as an InfluxDB tag.
+  `energy_j` integrated as `power_w × elapsed_s`. TEST_MODE uses random mock (laptop-safe).
+- **Phase 2 scaffolded (hardware pending):** `client/alumet-relay/` sidecar reads INA3221 sysfs
+  via Alumet and writes a shared metrics file; `_read_relay_metrics()` in `client.py` reads it
+  with `tegrastats` as fallback. Relay gRPC forwarding to the server is wired; alumet-cli flags
+  must be verified on hardware before activating. See ADR-011 in `decisions.md`.
 
 ---
 
@@ -107,15 +112,11 @@ designed for ≥100 shuttles per gateway.
 - 3 rounds, `min_fit_clients = 1`, `min_available_clients = 1`.
 - `on_fit_config_fn` passes `server_round` to the client so the
   AlumetProfiler can tag energy samples by round.
-- Custom `XGBoostStrategy(FedAvg)` overrides `aggregate_fit`. **The current
-  override does NOT aggregate.** It decodes each client's parameters,
-  collects raw libxgboost byte streams, and selects
-  `max(streams, key=len)` — the largest booster wins and is sent back as
-  the global model. This is selection, not aggregation. Several public docs
-  (`README.md`, `CHANGELOG.md`) say FedAvg, the progress report claims
-  "Federated XGBoost over UDP Streams" as a contribution, and `CLAUDE.MD`
-  says "horizontal federated learning or strict tree pruning" — none of the
-  three matches `server.py`.
+- Custom `XGBoostStrategy(FedAvg)` overrides `aggregate_fit` with horizontal
+  tree-set union (ADR-010 Option A). Each client's booster JSON is parsed, all
+  tree objects concatenated, IDs re-sequenced to prevent collisions, and the
+  merged booster validated with `xgb.Booster.load_model()` before broadcast.
+  Single-client rounds return the booster unchanged. Multi-gateway test pending.
 
 ---
 
@@ -132,7 +133,8 @@ designed for ≥100 shuttles per gateway.
    server signals the gateway-side client; the client loads the latest
    Parquet, fits XGBoost on GPU, returns booster bytes, AlumetProfiler
    pushes power samples to InfluxDB during fit.
-6. Server "aggregates" (currently: picks largest booster) and ends round.
+6. Server aggregates via tree-set union (ADR-010 Option A): concatenates booster
+   trees from all clients, re-sequences IDs, validates merged model, broadcasts to gateways.
 
 ---
 
@@ -164,8 +166,7 @@ For thesis-writing purposes, distinguish carefully:
   the energy cost of an FL round as a tagged time-series for
   energy-aware adaptation, *if* the loop is closed (server reads InfluxDB
   to choose `n_estimators`, which is currently listed as future work).
-- **Currently unsupported by the code:** "Federated XGBoost" as a
-  contribution. The aggregation step is selection, not federation. To
-  defend this claim, the strategy needs to actually merge boosters
-  (e.g., by horizontal tree-set union with pruning, or distillation onto
-  a smaller global model).
+- **Now implemented:** "Federated XGBoost" via horizontal tree-set union (ADR-010 Option A).
+  Single-gateway test is working. Multi-gateway end-to-end test is pending.
+  The claim is defensible once multi-gateway data is collected. See `future_options.md §7`
+  for the full contribution checklist.

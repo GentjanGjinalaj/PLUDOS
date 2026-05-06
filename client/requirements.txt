@@ -1,3 +1,12 @@
+# Jetson Orin Nano (ARM64 / aarch64) — pinned lockfile.
+# IMPORTANT: This file was generated from an x86 laptop venv. It must be regenerated
+# on the physical Jetson after: pip install flwr xgboost numpy pandas pyarrow aiocoap influxdb-client
+# Use: pip freeze > client/requirements.txt  (with Jetson venv active, no [simulation] extras)
+#
+# Removed from x86 snapshot:
+#   - nvidia-nccl-cu12: x86-only binary wheel; JetPack provides NCCL at the system level
+#   - ray: pulled in by flwr[simulation]; Jetson runs flower-supernode, not simulation
+#
 aiocoap==0.4.17
 alembic==1.18.4
 attrs==25.4.0
@@ -23,7 +32,6 @@ MarkupSafe==3.0.3
 mdurl==0.1.2
 msgpack==1.1.2
 numpy==2.4.2
-nvidia-nccl-cu12==2.29.3
 packaging==26.0
 pandas==3.0.1
 pathspec==0.12.1
@@ -34,7 +42,6 @@ pycryptodome==3.23.0
 Pygments==2.19.2
 python-dateutil==2.9.0.post0
 PyYAML==6.0.3
-ray==2.51.1
 reactivex==4.1.0
 referencing==0.37.0
 requests==2.32.5

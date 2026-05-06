@@ -25,12 +25,11 @@ Current config:
   can tag energy samples by round in InfluxDB.
 - `XGBoostStrategy(FedAvg)` overrides `aggregate_fit`.
 
-**IMPORTANT — current aggregation is selection, not federation:**
-`aggregate_fit` picks the largest booster payload (`max(streams, key=len)`).
-This is not federated averaging. It's a placeholder pending ADR-010
-(`@docs/decisions.md`). Before changing this, read ADR-010 — the correct
-approach (horizontal tree-set union, distillation, or another method) is
-an open research question, not a quick fix.
+**Current aggregation: horizontal tree-set union (ADR-010 Option A, Closed).**
+`aggregate_fit` in `XGBoostStrategy` calls `_merge_boosters()`, which
+concatenates all client booster trees, re-sequences tree IDs, and validates
+the merged model before broadcast. Single-client rounds are a no-op passthrough.
+See `docs/decisions.md` ADR-010 and `docs/future_options.md §1` for alternatives.
 
 ## Monitoring stack (compose.yaml)
 

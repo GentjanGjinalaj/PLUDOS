@@ -1,0 +1,41 @@
+# PLUDOS Alumet relay sidecar — Jetson Orin Nano (ARM64)
+# Builds alumet-cli from source and adds a Python 3 INA3221 probe script.
+#
+# On the Jetson (ARM64), rust:1.78-slim resolves to the arm64 variant automatically.
+# Build on the Jetson directly or cross-compile with --platform linux/arm64.
+#
+# First build is slow (~10–20 min on Jetson) due to Rust compilation; subsequent
+# builds use the cargo registry layer cache.
+#
+# ADR-011 Phase 2 — two runtime modes:
+#   Probe-only:   ALUMET_SERVER_ADDR unset — writes INA3221 readings to shared file.
+#   Full relay:   ALUMET_SERVER_ADDR set   — probe + alumet-cli relays to server.
+#
+# TODO: pin alumet-cli version once relay flags are verified on Jetson hardware.
+# Run `alumet-cli --help` after build to confirm --output relay and --relay-server flags.
+
+# ---- Stage 1: build alumet-cli -----------------------------------------
+FROM rust:1.78-slim AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# TODO: pin version (e.g. alumet-cli@0.x.y) once relay flag names are confirmed.
+RUN cargo install alumet-cli
+
+# ---- Stage 2: minimal runtime ------------------------------------------
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /usr/local/cargo/bin/alumet-cli /usr/local/bin/alumet-cli
+COPY probe.py      /app/probe.py
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+CMD ["/usr/local/bin/entrypoint.sh"]

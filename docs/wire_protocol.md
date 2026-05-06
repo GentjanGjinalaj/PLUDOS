@@ -38,10 +38,17 @@ When updating `data-engine.py` unpacking, assign tuple positions accordingly.
 
 - `shuttle_id`: identifies which STM32 / shuttle sent this packet. The
   gateway uses it to maintain per-shuttle NTP offset and buffer state.
-- `sequence_id`: wraps at 65535. The gateway uses `(shuttle_id, sequence_id)`
-  to sort packets before writing Parquet. Never reset mid-mission.
+- `sequence_id`: `uint16`, wraps at 65535. The gateway tracks wraps in real-time
+  using `_seq_wrap_counts` and stores a monotonically increasing
+  `sequence_monotonic = sequence_id + wrap_count × 65536` in each packet dict
+  before buffering. Parquet sort key is `(shuttle_id, sequence_monotonic)` — not
+  the raw `sequence_id` — so missions longer than 22 min at 50 Hz sort correctly.
+  Never reset mid-mission; reset on `mission_active = 0`.
 - `tick_ms`: relative to STM32 boot (HAL_GetTick). The gateway converts to
   absolute time using a per-shuttle NTP offset computed on first packet.
+  **Systematic bias:** `timestamp_ms` represents gateway receipt time, not STM32
+  emission time. The offset equals the one-way network latency (~sub-ms on LAN).
+  This is accepted for the research prototype; see ADR-009.
 - `mission_active = 0`: signals end of mission. Gateway sorts buffer and
   writes Parquet on receipt.
 - `ram_pct`: allows the gateway to monitor STM32 SRAM pressure. At 70%,
@@ -59,8 +66,13 @@ Used for temperature, humidity, and pressure. Sent as raw UDP (no ACK,
 no retry). Sent during `STATE_IDLE` only.
 
 **Status:** implemented. HTS221 reads temp/humidity; LPS22HH reads pressure.
-Both on I2C2. Packet dropped if HTS221 unavailable. `pressure_hpa = 0.0`
-is the sentinel value for LPS22HH unavailable or data-not-ready.
+Both on I2C2. Packet dropped if HTS221 unavailable.
+
+`pressure_hpa = 0.0` is the wire-level sentinel for LPS22HH unavailable or
+data-not-ready (0 hPa is physically impossible at any altitude). The gateway's
+`_unpack_nc()` converts `0.0` to `float("nan")` before buffering, so Parquet
+files and ML pipelines see `NaN` rather than a spurious zero. Consumers must
+handle `NaN` explicitly — do not filter on `pressure_hpa == 0.0`.
 
 ```c
 typedef struct __attribute__((packed)) {
@@ -75,23 +87,34 @@ typedef struct __attribute__((packed)) {
 
 Python unpack string: `struct.unpack('<12sHIfff', data)`
 
-**⚠ Breaking change from previous 26-byte format.** Update `data-engine.py`
-NonCritical unpack path to use `'<12sHIfff'` and handle the `pressure_hpa`
-field (index 5 in the unpacked tuple).
+Python unpack string: `struct.unpack('<12sHIfff', data)` — `data-engine.py` is already updated.
 
 ---
 
-## 3. Gateway → InfluxDB (energy metrics)
+## 3. Energy metrics → InfluxDB
 
-Written by `AlumetProfiler` in `client.py` during `model.fit()`.
+Written by `AlumetProfiler` in `client.py` (Jetson) and the `alumet` container
+in `server/compose.yaml` (server). All devices share one measurement so
+Grafana queries span devices with a single `filter`.
 
-- **Measurement:** `fl_energy`
-- **Tags:** `fl_round` (Flower round number), `device` (`jetson-<hostname>`)
-- **Fields:** `power_w` (watts), `energy_j` (cumulative joules)
-- **Precision:** 10 Hz samples during training
+- **Measurement:** `fl_energy` (fixed — do not change; Grafana dashboards depend on it)
+- **Tags:**
+  - `fl_round` — Flower round number, e.g. `"1"`, `"2"`, `"3"`
+  - `device` — hostname; Jetson uses `jetson-<hostname>`, server uses `server`
+  - `nvpmodel` — NVPModel power mode at profiler init (Jetson only; `"N/A"` on server)
+- **Fields:**
+  - `power_gpu_w` — GPU rail watts (Jetson: VDD_GPU; server: `0.0` if no discrete GPU)
+  - `power_cpu_w` — CPU rail watts (Jetson: VDD_CPU; server: Intel RAPL package power)
+  - `power_total_w` — total system watts
+  - `energy_j` — cumulative joules integrated as `power × Δt` since round start
+- **Precision:** nanosecond timestamps, 10 Hz sample rate during training
 
-**Current state:** values are mocked (`random.uniform(25, 45)` W in
-TEST_MODE, `12.0` W in production). Real sensor integration is ADR-011.
+Also written by `AlumetProfiler`: `fl_phases` (per-phase summary: load/train/round_total) and
+`stm_mission` (per-shuttle mission energy). See `docs/ANALYTICS.md §3` for full schemas.
+
+**Status (ADR-011):** Phase 1 done — `tegrastats` on Jetson, Intel RAPL on server.
+Phase 2 scaffolded — Alumet relay sidecar built, relay flags confirmed, hardware build pending.
+See ADR-011 in `docs/decisions.md`.
 
 ---
 
@@ -102,9 +125,10 @@ and sends it to the server as `NumPy` parameter bytes.
 
 - **Format:** `booster.save_raw("json")` → raw bytes
 - **Transport:** gRPC over Tailscale VPN (Flower handles this)
-- **Server aggregation:** currently selects `max(payloads, key=len)` —
-  the largest booster wins. This is selection, not aggregation (see ADR-010
-  in `decisions.md`).
+- **Server aggregation:** horizontal tree-set union (ADR-010 Option A).
+  Each client's booster trees are concatenated, tree IDs re-sequenced, and
+  the merged booster validated before broadcast. Single-client rounds are a
+  no-op passthrough. See `server/server.py _merge_boosters()`.
 
 ---
 
@@ -118,5 +142,6 @@ and sends it to the server as `NumPy` parameter bytes.
 | Jetson → InfluxDB | HTTP | None currently | 1 | Sync write |
 
 Note: the STM32 uses a manual application-layer retry loop rather than
-RFC 7252 native CoAP retransmission. This is a known divergence from the
-design intent (documented in `architecture.md`).
+RFC 7252 native CoAP retransmission. This is a deliberate decision — the
+`mx_wifi` BSP does not expose native RFC 7252 retransmission. See ADR-012
+in `docs/decisions.md`.

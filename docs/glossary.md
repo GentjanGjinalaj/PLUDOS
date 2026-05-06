@@ -15,7 +15,7 @@ Domain terms used throughout the PLUDOS codebase and documentation.
 | **STATE_MOVING** | STM32 operating mode with high sampling rate (50 Hz). Shuttle is in motion. Samples are buffered locally; no transmission during motion. |
 | **CriticalPayload** | The 39-byte binary struct sent via CoAP CON from STM32 to gateway. Contains vibration, accelerometer, power, and status fields. See `wire_protocol.md`. |
 | **FL round** | One Flower federated learning round: server signals all clients to train locally, clients return model updates, server aggregates. PLUDOS currently runs 3 rounds. |
-| **AlumetProfiler** | Python class in `client.py` that measures energy consumption during FL training. Currently a placeholder; real integration is ADR-011. |
+| **AlumetProfiler** | Python class in `client.py` that measures energy consumption during FL training. Phase 1 done: reads `tegrastats` for real Jetson power rails. Phase 2 scaffolded: INA3221 via Alumet relay sidecar. See ADR-011. |
 | **Alumet** | Open-source energy measurement framework developed by UGA/LIG. Target for real energy sensing integration on the Jetson (tegrastats / INA3221). |
 | **Alumet relay** | An Alumet instance running on the Jetson that forwards local power metrics to the main Alumet instance on the central server. |
 | **NTP offset** | Per-shuttle correction factor: `offset_ms = receipt_time_ms - tick_ms`. Computed once on first CoAP packet. Converts STM32 relative `tick_ms` to gateway-local wall clock time. |

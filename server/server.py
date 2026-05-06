@@ -1,86 +1,254 @@
 """
-PLUDOS Central Server: AI Orchestrator
---------------------------------------
-This script acts as the Cloud/Central Aggregator. 
-It coordinates the Federated Learning rounds, gathers the raw XGBoost 
-decision trees from the Jetson edge gateways, and aggregates them.
+PLUDOS Central Server — Flower ServerApp
+Coordinates federated learning rounds across Jetson edge gateways.
+Aggregation: horizontal tree-set union (ADR-010 Option A).
+Energy-aware adaptation: n_estimators adjusted each round based on measured
+energy from InfluxDB fl_phases measurement (ADR-014).
 """
 
-import flwr as fl
+import json
 import logging
+import os
+from typing import Dict, List, Optional, Tuple, Union
+
+import flwr as fl
 import numpy as np
-from typing import List, Tuple, Dict, Optional, Union
-from flwr.common import Metrics, FitRes, Parameters, Scalar, ndarrays_to_parameters, parameters_to_ndarrays
+import xgboost as xgb
+from flwr.common import (
+    FitRes, Parameters, Scalar,
+    ndarrays_to_parameters, parameters_to_ndarrays,
+)
 from flwr.server.client_proxy import ClientProxy
+from influxdb_client import InfluxDBClient  # type: ignore
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# FL topology config — tunable via shell env before `flwr run .`
+# ---------------------------------------------------------------------------
+NUM_ROUNDS      = int(os.getenv("FL_NUM_ROUNDS",      "3"))
+MIN_FIT_CLIENTS = int(os.getenv("FL_MIN_FIT_CLIENTS", "1"))
+
+# ---------------------------------------------------------------------------
+# InfluxDB — queried after each round to measure energy and adapt n_estimators.
+# These must match the values in server/.env (same machine, InfluxDB runs locally).
+# ---------------------------------------------------------------------------
+INFLUXDB_URL    = os.getenv("INFLUXDB_URL",    "http://127.0.0.1:8086")
+INFLUXDB_TOKEN  = os.getenv("INFLUXDB_TOKEN",  "pludos-secret-token")
+INFLUXDB_ORG    = os.getenv("INFLUXDB_ORG",    "pludos")
+INFLUXDB_BUCKET = os.getenv("INFLUXDB_BUCKET", "alumet_energy")
+
+# ---------------------------------------------------------------------------
+# Energy-aware adaptation constants (ADR-014).
+# ENERGY_BUDGET_J: max acceptable energy (J) from any single gateway per round.
+# Set this after measuring a real baseline on your hardware — 50 J is a placeholder.
+# Control law: reduce by 2 if over budget, grow by 1 if under 60% of budget.
+# ---------------------------------------------------------------------------
+N_ESTIMATORS_DEFAULT = int(os.getenv("FL_N_ESTIMATORS_DEFAULT", "10"))
+N_ESTIMATORS_MIN     = int(os.getenv("FL_N_ESTIMATORS_MIN",     "5"))
+N_ESTIMATORS_MAX     = int(os.getenv("FL_N_ESTIMATORS_MAX",     "20"))
+ENERGY_BUDGET_J      = float(os.getenv("FL_ENERGY_BUDGET_J",    "50.0"))
+
+# Tracks n_estimators across rounds — starts at default, adapted by energy feedback.
+_current_n_estimators: int = N_ESTIMATORS_DEFAULT
+
+
+# ---------------------------------------------------------------------------
+# Energy query — reads InfluxDB for the previous round's measured energy
+# ---------------------------------------------------------------------------
+
+def _query_last_round_energy(prev_round: int) -> float | None:
+    """
+    Query InfluxDB for the maximum per-gateway energy_j from the given FL round.
+
+    Uses fl_phases measurement with phase=round_total. Queries the max across
+    all gateways so adaptation is driven by the most energy-constrained device.
+    Returns None on any failure so the caller keeps current n_estimators without
+    disrupting the round.
+    """
+    client = InfluxDBClient(url=INFLUXDB_URL, token=INFLUXDB_TOKEN, org=INFLUXDB_ORG)
+    try:
+        # group() merges all device tables into one; max() then finds the peak
+        # energy_j across all gateways for this round.
+        query = f'''
+from(bucket: "{INFLUXDB_BUCKET}")
+  |> range(start: -2h)
+  |> filter(fn: (r) => r["_measurement"] == "fl_phases")
+  |> filter(fn: (r) => r["_field"] == "energy_j")
+  |> filter(fn: (r) => r["phase"] == "round_total")
+  |> filter(fn: (r) => r["fl_round"] == "{prev_round}")
+  |> group()
+  |> max()
+'''
+        tables = client.query_api().query(query)
+        for table in tables:
+            for record in table.records:
+                return float(record.get_value())
+    except Exception as exc:
+        logger.warning("[ENERGY] InfluxDB query for round %d failed: %s", prev_round, exc)
+    finally:
+        client.close()
+    return None
+
+
+# ---------------------------------------------------------------------------
+# XGBoost federated aggregation — tree-set union (ADR-010 Option A)
+# ---------------------------------------------------------------------------
+
+def _merge_boosters(raw_streams: list[bytes]) -> bytes:
+    """
+    Horizontal tree-set union (ADR-010 Option A).
+
+    Parses each client's booster JSON, concatenates all tree objects,
+    re-sequences tree IDs (each client produces IDs 0..N-1, which would
+    collide after merge), updates num_trees, and returns the merged booster
+    as UTF-8 JSON bytes that XGBoost can load directly.
+
+    Tree count after merge: sum of all client tree counts.
+    tree_info stays all-zeros — correct for binary classification.
+    """
+    all_trees: list = []
+    base_model: Optional[dict] = None
+
+    for raw in raw_streams:
+        model_dict = json.loads(raw.decode("utf-8"))
+        trees = model_dict["learner"]["gradient_booster"]["model"]["trees"]
+        if base_model is None:
+            base_model = model_dict
+            all_trees = list(trees)
+        else:
+            all_trees.extend(trees)
+
+    # Re-number tree IDs so they are globally unique in the merged booster.
+    for idx, tree in enumerate(all_trees):
+        tree["id"] = idx
+
+    gb_model = base_model["learner"]["gradient_booster"]["model"]
+    gb_model["trees"]     = all_trees
+    gb_model["tree_info"] = [0] * len(all_trees)
+    gb_model["gbtree_model_param"]["num_trees"] = str(len(all_trees))
+
+    return json.dumps(base_model).encode("utf-8")
+
+
 class XGBoostStrategy(fl.server.strategy.FedAvg):
     """
-    Custom Federated Strategy for XGBoost. 
-    Instead of mathematically averaging weights (like Neural Networks), 
-    this strategy collects the tree structures from the edge clients.
+    Federated XGBoost aggregation via horizontal tree-set union (ADR-010 Option A).
+    Single-client rounds return the client's booster unchanged.
+    Multi-client rounds merge all trees and validate the result loads correctly.
     """
+
     def aggregate_fit(
         self,
         server_round: int,
         results: List[Tuple[ClientProxy, FitRes]],
         failures: List[Union[Tuple[ClientProxy, FitRes], BaseException]],
     ) -> Tuple[Optional[Parameters], Dict[str, Scalar]]:
-        
+
         if not results:
             return None, {}
 
-        logger.info(f"--- SERVER AGGREGATING ROUND {server_round} ---")
-        logger.info(f"Received XGBoost trees from {len(results)} Edge Gateway(s).")
+        logger.info("--- ROUND %d: aggregating from %d gateway(s) ---",
+                    server_round, len(results))
 
-        total_samples = sum([fit_res.num_examples for _, fit_res in results])
-        logger.info(f"Aggregated learning from {total_samples} physical vibration samples.")
+        total_samples = sum(fit_res.num_examples for _, fit_res in results)
 
-        # Parse each client's raw metrics and extract XGBoost bytes. In client.py,
-        # the model is sent as a single NumPy parameter array containing raw libxgboost bytes.
-        xgb_raw_streams = []
+        # Decode raw booster bytes from each client's NumPy parameter array.
+        raw_streams: list[bytes] = []
         for _, fit_res in results:
             if not fit_res.parameters:
                 continue
             try:
-                client_arrays = parameters_to_ndarrays(fit_res.parameters)
-                if len(client_arrays) == 1:
-                    xgb_raw_streams.append(client_arrays[0].tobytes())
+                arrays = parameters_to_ndarrays(fit_res.parameters)
+                if len(arrays) == 1:
+                    raw_streams.append(arrays[0].tobytes())
             except Exception as exc:
-                logger.warning(f"Unable to decode parameters from client: {exc}")
+                logger.warning("Could not decode booster from a client: %s", exc)
 
-        if not xgb_raw_streams:
-            logger.warning("No valid XGBoost boosters found from clients. Falling back to default FedAvg behavior.")
+        if not raw_streams:
+            logger.warning("No valid boosters — falling back to FedAvg default.")
             return super().aggregate_fit(server_round, results, failures)
 
-        # Basic merge heuristic (proof-of-concept): choose the largest booster payload
-        # for propagation. A full federated XGBoost aggregator should merge tree sets
-        # or adopt a model-distillation strategy.
-        aggregated_booster = max(xgb_raw_streams, key=len)
-        logger.info(f"Aggregated booster size: {len(aggregated_booster)} bytes.")
+        if len(raw_streams) == 1:
+            # Single gateway: pass its booster through unchanged.
+            merged_bytes = raw_streams[0]
+            logger.info("Single gateway: booster forwarded unchanged (%d B).", len(merged_bytes))
+        else:
+            # Multiple gateways: merge all trees, validate, fall back to largest on failure.
+            try:
+                merged_bytes = _merge_boosters(raw_streams)
+                check = xgb.Booster()
+                check.load_model(bytearray(merged_bytes))
+                n_trees = check.num_boosted_rounds()
+                logger.info(
+                    "Tree-set union: %d gateways → %d trees total (%d B).",
+                    len(raw_streams), n_trees, len(merged_bytes),
+                )
+            except Exception as exc:
+                # Covers both merge errors (bad JSON, missing keys) and load failures.
+                logger.error("Booster merge/validation failed (%s). Falling back to largest.", exc)
+                merged_bytes = max(raw_streams, key=len)
 
-        parameters = ndarrays_to_parameters([np.frombuffer(aggregated_booster, dtype=np.uint8)])
-        return parameters, {"num_round_samples": total_samples}
+        parameters = ndarrays_to_parameters(
+            [np.frombuffer(merged_bytes, dtype=np.uint8)]
+        )
+        return parameters, {"total_samples": total_samples}
 
 
-# This explicitly sends the Round Number to the Jetson so Alumet can tag it!
-def fit_config(server_round: int):
-    return {"server_round": server_round}
+# ---------------------------------------------------------------------------
+# fit_config — energy-aware n_estimators adaptation (ADR-014)
+# ---------------------------------------------------------------------------
+
+def fit_config(server_round: int) -> dict:
+    """
+    Returns training config for each client.
+
+    From round 2 onwards, queries InfluxDB for the previous round's peak
+    gateway energy and adapts n_estimators to stay within ENERGY_BUDGET_J.
+    Control law: reduce by 2 when over budget (fast response), grow by 1
+    when under 60% of budget (slow growth). The asymmetry prevents thrashing.
+    """
+    global _current_n_estimators
+
+    if server_round > 1:
+        energy_j = _query_last_round_energy(server_round - 1)
+        if energy_j is not None:
+            if energy_j > ENERGY_BUDGET_J:
+                _current_n_estimators = max(N_ESTIMATORS_MIN, _current_n_estimators - 2)
+                logger.info(
+                    "[ENERGY] Round %d: prev=%.2fJ > budget=%.2fJ → n_estimators=%d (reduced)",
+                    server_round, energy_j, ENERGY_BUDGET_J, _current_n_estimators,
+                )
+            elif energy_j < ENERGY_BUDGET_J * 0.6:
+                _current_n_estimators = min(N_ESTIMATORS_MAX, _current_n_estimators + 1)
+                logger.info(
+                    "[ENERGY] Round %d: prev=%.2fJ < 60%% budget → n_estimators=%d (grew)",
+                    server_round, energy_j, _current_n_estimators,
+                )
+            else:
+                logger.info(
+                    "[ENERGY] Round %d: prev=%.2fJ within budget → n_estimators=%d (stable)",
+                    server_round, energy_j, _current_n_estimators,
+                )
+        else:
+            logger.info(
+                "[ENERGY] Round %d: no energy data for round %d — keeping n_estimators=%d",
+                server_round, server_round - 1, _current_n_estimators,
+            )
+
+    return {"server_round": server_round, "n_estimators": _current_n_estimators}
 
 
-# Define the global server configuration (e.g., 3 rounds of training)
 def server_fn(context: fl.common.Context):
-    # Use our custom XGBoost Strategy
     strategy = XGBoostStrategy(
-        min_available_clients=1,     # Minimum Jetsons required to start
-        min_fit_clients=1,
-        min_evaluate_clients=1,      # Tells Flower we only have 1 Jetson for evaluation
-        on_fit_config_fn=fit_config  # Passes the Round Number to client.py
+        min_available_clients=MIN_FIT_CLIENTS,
+        min_fit_clients=MIN_FIT_CLIENTS,
+        min_evaluate_clients=MIN_FIT_CLIENTS,
+        on_fit_config_fn=fit_config,
     )
-    config = fl.server.ServerConfig(num_rounds=3)
+    config = fl.server.ServerConfig(num_rounds=NUM_ROUNDS)
     return fl.server.ServerAppComponents(strategy=strategy, config=config)
 
-# Initialize the Server App
+
 app = fl.server.ServerApp(server_fn=server_fn)

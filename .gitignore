@@ -9,8 +9,8 @@ __pycache__/
 # ram_buffer/ directories hold .parquet files (ignored above) and a .gitkeep — don't ignore the dir
 
 # Secrets and local config (never commit)
-client/.env
-server/.env
+# Catch-all: any .env file anywhere in the tree (root, client/, server/, etc.)
+**/.env
 **/wifi_credentials.h
 
 # STM32CubeIDE build output
@@ -25,10 +25,18 @@ STM_Shuttles/PLUDOS_Edge_Node/Debug/
 
 # AI assistant context files (project-specific, not for repo)
 GEMINI.md
-.github/
+CLAUDE.md
+client/CLAUDE.md
+server/CLAUDE.md
+STM_Shuttles/CLAUDE.md
 
-# IDE workspace files (machine-specific, regenerated)
-.vscode/settings.json
+
+.github/
+docs/
+.vscode/
+client/alumet-relay/probe.py
 
 # Claude Code worktrees (isolation branches, not for repo)
 .claude/worktrees/
+
+
