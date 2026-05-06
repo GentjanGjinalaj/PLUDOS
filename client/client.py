@@ -313,27 +313,34 @@ class PLUDOSClient(fl.client.NumPyClient):
         profiler = AlumetProfiler(round_num)
         profiler.start()
         profiler.begin_phase("round_total")
+        model = None
 
-        # Phase: data loading — I/O bound, typically short.
-        profiler.begin_phase("load")
-        X_train, y_train = load_buffered_data()
-        profiler.end_phase("load")
+        try:
+            # Phase: data loading — I/O bound, typically short.
+            profiler.begin_phase("load")
+            X_train, y_train = load_buffered_data()
+            profiler.end_phase("load")
 
-        # Phase: training — GPU bound, dominant energy consumer.
-        logger.info(
-            "Training XGBoost (device=%s, n_estimators=%d) for round %s",
-            DEVICE, n_estimators, round_num,
-        )
-        profiler.begin_phase("train")
-        # Artificial sleep in TEST_MODE ensures enough InfluxDB points for Grafana.
-        if TEST_MODE:
-            time.sleep(1.5)
-        model = xgb.XGBClassifier(n_estimators=n_estimators, tree_method="hist", device=DEVICE)
-        model.fit(X_train, y_train)
-        profiler.end_phase("train")
+            # Phase: training — GPU bound, dominant energy consumer.
+            logger.info(
+                "Training XGBoost (device=%s, n_estimators=%d) for round %s",
+                DEVICE, n_estimators, round_num,
+            )
+            profiler.begin_phase("train")
+            # Artificial sleep in TEST_MODE ensures enough InfluxDB points for Grafana.
+            if TEST_MODE:
+                time.sleep(1.5)
+            model = xgb.XGBClassifier(n_estimators=n_estimators, tree_method="hist", device=DEVICE)
+            model.fit(X_train, y_train)
+            profiler.end_phase("train")
+        finally:
+            # Always record round_total — even if load or train raised.
+            # This ensures fl_phases gets a data point for budget adaptation.
+            profiler.end_phase("round_total")
+            profiler.stop()
 
-        profiler.end_phase("round_total")
-        profiler.stop()
+        if model is None:
+            raise RuntimeError(f"Round {round_num}: training did not complete; check buffer.")
 
         # Serialise booster trees to raw JSON bytes for Flower transport.
         booster     = model.get_booster()

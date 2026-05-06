@@ -33,34 +33,50 @@ clientapp = "client:app"
 # Change num-supernodes to match the number of Jetsons you want to
 # simulate (each loads the same local Parquet — fine for unit tests).
 # -----------------------------------------------------------------------
-[tool.flwr.federations]
-default = "pludos-sim"
 
-[tool.flwr.federations.pludos-sim]
-options.num-supernodes = 1
+#######################################################################
+# CONFIGURATION MIGRATION NOTICE:
+#
+# What was previously called "federation config" for SuperLink
+# connections in pyproject.toml has been renamed and moved.
+#
+# These settings are now **SuperLink connection configuration**
+# and are defined in the Flower configuration file.
+#
+# The entries below are commented out intentionally and are kept
+# only as a migration reference.
+#
+# Docs: https://flower.ai/docs/framework/ref-flower-configuration.html
+#######################################################################
 
-# -----------------------------------------------------------------------
-# FEDERATION MODE 2 — Real deployment (physical Jetsons over Tailscale)
-#
-# Step-by-step — see docs/DEPLOYMENT_GUIDE.md §3.6 for full detail:
-#
-# 1. On the SERVER (this machine), start the SuperLink:
-#      flower-superlink --insecure
-#    SuperLink listens on 0.0.0.0:9091 for SuperNode and Fleet connections.
-#    Open the firewall: sudo ufw allow 9091/tcp
-#
-# 2. On EACH JETSON, start a SuperNode pointing at the server's
-#    Tailscale IP (run `tailscale ip -4` on the server to get it):
-#      flower-supernode --insecure --superlink <server-tailscale-ip>:9091
-#
-# 3. Uncomment [tool.flwr.federations.pludos-network] below, set the
-#    address to 127.0.0.1:9091 (Fleet API is on the same machine as the
-#    SuperLink), then run:
-#      flwr run . pludos-network
-#
-# Raise FL_MIN_FIT_CLIENTS in your shell to the actual number of Jetsons:
-#      FL_MIN_FIT_CLIENTS=2 flwr run . pludos-network
-# -----------------------------------------------------------------------
-# [tool.flwr.federations.pludos-network]
-# address = "127.0.0.1:9091"
-# insecure = true
+# [tool.flwr.federations]
+# default = "pludos-sim"
+
+# [tool.flwr.federations.pludos-sim]
+# options.num-supernodes = 1
+
+# # -----------------------------------------------------------------------
+# # FEDERATION MODE 2 — Real deployment (physical Jetsons over Tailscale)
+# #
+# # Step-by-step — see docs/DEPLOYMENT_GUIDE.md §3.6 for full detail:
+# #
+# # 1. On the SERVER (this machine), start the SuperLink:
+# #      flower-superlink --insecure
+# #    SuperLink listens on 0.0.0.0:9091 for SuperNode and Fleet connections.
+# #    Open the firewall: sudo ufw allow 9091/tcp
+# #
+# # 2. On EACH JETSON, start a SuperNode pointing at the server's
+# #    Tailscale IP (run `tailscale ip -4` on the server to get it):
+# #      flower-supernode --insecure --superlink <server-tailscale-ip>:9091
+# #
+# # 3. Uncomment [tool.flwr.federations.pludos-network] below, set the
+# #    address to 127.0.0.1:9091 (Fleet API is on the same machine as the
+# #    SuperLink), then run:
+# #      flwr run . pludos-network
+# #
+# # Raise FL_MIN_FIT_CLIENTS in your shell to the actual number of Jetsons:
+# #      FL_MIN_FIT_CLIENTS=2 flwr run . pludos-network
+# # -----------------------------------------------------------------------
+# # [tool.flwr.federations.pludos-network]
+# # address = "127.0.0.1:9091"
+# # insecure = true
