@@ -16,7 +16,7 @@
 # Run `alumet-cli --help` after build to confirm --output relay and --relay-server flags.
 
 # ---- Stage 1: build alumet-cli -----------------------------------------
-FROM rust:1.78-slim AS builder
+FROM docker.io/library/rust:1.78-slim AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
@@ -27,7 +27,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN cargo install alumet-cli
 
 # ---- Stage 2: minimal runtime ------------------------------------------
-FROM debian:bookworm-slim
+FROM docker.io/library/debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
