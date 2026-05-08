@@ -1,5 +1,7 @@
-# Use an NVIDIA base image so XGBoost can talk to the Jetson's GPU
-FROM nvcr.io/nvidia/l4t-pytorch:r35.2.1-pth2.0-py3
+# python:3.10-slim matches JetPack 6 (R36) host Python and avoids the
+# BSP mismatch from l4t-pytorch:r35 (JetPack 5, Python 3.8).
+# GPU access for ai-worker requires a JetPack 6 CUDA image — tracked separately.
+FROM python:3.10-slim
 
 # Set the working directory inside the container
 WORKDIR /app

@@ -34,9 +34,8 @@ STM_Shuttles/CLAUDE.md
 .github/
 docs/
 .vscode/
-client/alumet-relay/probe.py
-
 # Claude Code worktrees (isolation branches, not for repo)
 .claude/worktrees/
+.claude/
 
 

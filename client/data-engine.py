@@ -439,13 +439,15 @@ async def _broadcast_beacon() -> None:
     payload = f"PLUDOS-GW:{ip}".encode()
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    sock.setblocking(False)
+    # sock_sendto is Python 3.11+; use run_in_executor for the blocking sendto on 3.10.
     loop = asyncio.get_running_loop()
     logger.info("[BEACON] announcing %s on UDP port %d every %.0f s", ip, BEACON_PORT, BEACON_INTERVAL_S)
     try:
         while True:
             try:
-                await loop.sock_sendto(sock, payload, ("255.255.255.255", BEACON_PORT))
+                await loop.run_in_executor(
+                    None, sock.sendto, payload, ("255.255.255.255", BEACON_PORT)
+                )
             except OSError as exc:
                 logger.warning("[BEACON] broadcast failed: %s", exc)
             await asyncio.sleep(BEACON_INTERVAL_S)
