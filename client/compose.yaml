@@ -49,17 +49,16 @@ services:
               capabilities: [gpu]
     volumes:
       - ./ram_buffer:/app/ram_buffer
-      - power_metrics:/app/power_metrics   # reads INA3221 data from alumet-relay probe
     depends_on:
       - data-engine
       - tailscale
     restart: unless-stopped
 
-  # 3. Alumet relay sidecar — ADR-011 Phase 2 (INA3221 → shared file + gRPC relay to server)
-  # Probe-only mode (no ALUMET_SERVER_ADDR): reads INA3221 sysfs at 10 Hz, writes
-  # /app/power_metrics/latest.json so ai-worker gets accurate power readings.
-  # Full relay mode (ALUMET_SERVER_ADDR set): also forwards stream to server Alumet via gRPC.
-  # Runs without vpn profile — probe mode works on local WiFi without Tailscale.
+  # 3. Alumet relay sidecar — ADR-011 Phase 2
+  # alumet-cli reads INA3221 natively via the Jetson plugin.
+  # Local mode  (ALUMET_SERVER_ADDR unset): writes directly to InfluxDB.
+  # Relay mode  (ALUMET_SERVER_ADDR set):   forwards stream to server Alumet over gRPC.
+  # probe.py was removed — alumet-cli handles INA3221 without a Python shim.
   alumet-relay:
     build:
       context: ./alumet-relay
@@ -68,22 +67,15 @@ services:
     env_file:
       - .env
     environment:
-      # Set in .env to activate gRPC relay forwarding to server (requires Tailscale).
       - ALUMET_SERVER_ADDR=${ALUMET_SERVER_ADDR:-}
     volumes:
       # INA3221 hardware power monitor: read-only sysfs access from host.
       - /sys/bus/i2c/drivers/ina3221:/sys/bus/i2c/drivers/ina3221:ro
-      # Shared power metrics file: probe writes, ai-worker reads.
-      - power_metrics:/app/power_metrics
     restart: unless-stopped
 
-# ram_buffer is a bind-mount on ./ram_buffer (not a named volume) so it works in
-# rootless Podman without tmpfs privileges and is directly inspectable on the host.
+# ram_buffer is a bind-mount on ./ram_buffer so it works in rootless Podman
+# without tmpfs privileges and is directly inspectable on the host.
+# power_metrics volume removed — probe.py is gone, alumet-cli writes directly.
 volumes:
-  # Ephemeral latest.json written by alumet-relay probe, read by ai-worker.
-  power_metrics:
-    driver_opts:
-      type: tmpfs
-      device: tmpfs
-  # tailscale_data is persistent — survives container restart, keeps auth state.
+  # tailscale_data must persist across container restarts to keep Tailscale auth.
   tailscale_data:
