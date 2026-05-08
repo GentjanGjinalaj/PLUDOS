@@ -1,30 +1,35 @@
 # PLUDOS Alumet relay sidecar — Jetson Orin Nano (ARM64)
-# Builds alumet-cli from source. INA3221 is read natively via the Jetson plugin;
-# probe.py was removed — alumet-cli handles power measurement directly.
+# Builds alumet-agent from source (workspace crate: agent/, binary: alumet-agent).
+# INA3221 is read natively via the nvidia-jetson plugin compiled into the agent.
 #
-# On the Jetson (ARM64), rust:1.78-slim resolves to the arm64 variant automatically.
+# On the Jetson (ARM64), rust:slim resolves to the arm64 variant automatically.
 # Build on the Jetson directly or cross-compile with --platform linux/arm64.
 #
-# First build is slow (~10–20 min on Jetson) due to Rust compilation; subsequent
-# builds use the cargo registry layer cache.
+# First build is slow (~20–30 min on Jetson) due to Rust + full workspace compile.
+# Subsequent builds use the cargo registry and git layer cache.
 #
 # ADR-011 Phase 2 — two runtime modes (see entrypoint.sh):
-#   Local mode:   ALUMET_SERVER_ADDR unset — alumet-cli writes directly to InfluxDB.
-#   Relay mode:   ALUMET_SERVER_ADDR set   — alumet-cli relays stream to server Alumet.
+#   Local mode:  ALUMET_SERVER_ADDR unset — alumet-agent writes directly to InfluxDB.
+#   Relay mode:  ALUMET_SERVER_ADDR set   — alumet-agent relays stream to server Alumet.
 #
-# TODO: pin alumet-cli version once relay flags are verified on Jetson hardware.
-# Run `alumet-cli --help` after build to confirm --output relay and --relay-server flags.
+# After first build, verify actual flag names with: alumet-agent --help
+# Then update entrypoint.sh if --plugin, --relay-out, or --output flags differ.
 
-# ---- Stage 1: build alumet-cli -----------------------------------------
-FROM docker.io/library/rust:1.78-slim AS builder
+# ---- Stage 1: build alumet-agent ----------------------------------------
+# rust:slim tracks latest stable — required because alumet-agent needs Rust ≥ 1.89.
+FROM docker.io/library/rust:slim AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# TODO: pin version (e.g. alumet-cli@0.x.y) once relay flag names are confirmed.
-RUN cargo install alumet-cli
+# Install alumet-agent from the alumet monorepo (not published on crates.io).
+# Pinned to v0.9.4 for reproducibility — update when upgrading alumet.
+RUN cargo install \
+    --git https://github.com/alumet-dev/alumet \
+    --tag v0.9.4 \
+    alumet-agent
 
 # ---- Stage 2: minimal runtime ------------------------------------------
 FROM docker.io/library/debian:bookworm-slim
@@ -33,7 +38,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /usr/local/cargo/bin/alumet-cli /usr/local/bin/alumet-cli
+COPY --from=builder /usr/local/cargo/bin/alumet-agent /usr/local/bin/alumet-agent
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
