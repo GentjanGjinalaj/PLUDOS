@@ -154,6 +154,10 @@ static uint16_t current_packet_num = 1U;
 #define JETSON_PORT    5683U  /* CoAP CON critical packets — owned by aiocoap */
 #define JETSON_NC_PORT 5684U  /* raw UDP non-critical packets — separate socket on gateway */
 
+/* ARM Cortex-M33 is little-endian; mx_sockaddr_in.sin_port is network byte order.
+ * No stdlib htons() on bare metal — swap bytes at compile time. */
+#define PLUDOS_HTONS(x) ((uint16_t)(((uint16_t)(x) >> 8U) | ((uint16_t)(x) << 8U)))
+
 #define SENSOR_BUFFER_CAPACITY              256U
 #define SENSOR_BUFFER_TRIGGER_COUNT         ((SENSOR_BUFFER_CAPACITY * 70U) / 100U)
 #define SENSOR_BUFFER_SUSPEND_COUNT         ((SENSOR_BUFFER_CAPACITY * 95U) / 100U)
@@ -592,7 +596,7 @@ static int32_t COAP_SendBufferedBatch(void)
 
   dest_addr.sin_len = sizeof(dest_addr);
   dest_addr.sin_family = MX_AF_INET;
-  dest_addr.sin_port = JETSON_PORT;
+  dest_addr.sin_port = PLUDOS_HTONS(JETSON_PORT);
   dest_addr.sin_addr.s_addr = (uint32_t)mx_aton_r(jetson_ip);
 
   // RFC 7252 Binary Exponential Backoff
@@ -674,7 +678,7 @@ static void UDP_SendNonCritical(void)
 
   dest_addr.sin_len    = sizeof(dest_addr);
   dest_addr.sin_family = MX_AF_INET;
-  dest_addr.sin_port   = JETSON_NC_PORT;  /* separate port — avoids collision with aiocoap on 5683 */
+  dest_addr.sin_port   = PLUDOS_HTONS(JETSON_NC_PORT);  /* separate port — avoids collision with aiocoap on 5683 */
   dest_addr.sin_addr.s_addr = (uint32_t)mx_aton_r(jetson_ip);
 
   MX_WIFI_Socket_sendto(wifi_obj, socket_id, (uint8_t *)&payload, sizeof(payload),
