@@ -32,7 +32,9 @@ RUN cargo install \
     alumet-agent
 
 # ---- Stage 2: minimal runtime ------------------------------------------
-FROM docker.io/library/debian:bookworm-slim
+# Must match the builder's Debian base so GLIBC versions align.
+# rust:slim currently resolves to Debian 13 (trixie, GLIBC 2.39).
+FROM docker.io/library/debian:trixie-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
