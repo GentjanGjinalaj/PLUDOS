@@ -628,12 +628,9 @@ static int32_t COAP_SendBufferedBatch(void)
 
     if (COAP_IsAckValid(ack_packet, recv_result, message_id, token, sizeof(token)) != 0U)
     {
-      sprintf(uart_buf, "[COAP] ACK received for MID=0x%04X, sample sent\r\n", message_id);
-      HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
-
-      SENSOR_BufferDrop(1);  // Drop 1 sample
+      SENSOR_BufferDrop(1);  /* caller (NETWORK_ProcessBufferedSamples) logs milestones */
       coap_message_id++;
-      return 1;  // Sent 1 sample
+      return 1;
     }
 
     sprintf(uart_buf, "[COAP] No valid ACK on try %u/4 for MID=0x%04X. Backoff: %lu ms\r\n",
@@ -703,14 +700,22 @@ static void UDP_SendNonCritical(void)
 
   MX_WIFI_Socket_sendto(wifi_obj, socket_id, (uint8_t *)&payload, sizeof(payload),
                         0, (struct mx_sockaddr *)&dest_addr, sizeof(dest_addr));
+
+  /* Confirm temperature transmission in the terminal so it is visible alongside /vib CoAP. */
+  sprintf(uart_buf, "[TX/NC-UDP] temp=%.1fC rh=%.1f%% pres=%.0fhPa → /temperature\r\n",
+          payload.temp_c, payload.humidity_pct, payload.pressure_hpa);
+  HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
 }
 
 static void NETWORK_ProcessBufferedSamples(void)
 {
+  /* Tracks how many samples were queued when this flush started — reset when done or WiFi drops. */
+  static uint16_t flush_start_count = 0U;
   int32_t send_result;
 
   if ((socket_id < 0) || (wifi_station_ready == 0U) || (sensor_buffer_count == 0U))
   {
+    flush_start_count = 0U;
     return;
   }
 
@@ -719,19 +724,23 @@ static void NETWORK_ProcessBufferedSamples(void)
     return;
   }
 
+  /* Log once at flush start so the terminal shows what triggered and how many samples. */
+  if (flush_start_count == 0U)
+  {
+    flush_start_count = sensor_buffer_count;
+    sprintf(uart_buf, "[TX/CoAP] Flushing %u samples → /vib\r\n", flush_start_count);
+    HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+  }
+
   send_result = COAP_SendBufferedBatch();
 
-  if (send_result > 0)
+  if ((send_result > 0) && (sensor_buffer_count == 0U))
   {
-    sprintf(uart_buf, "[BUFFER] CoAP flush ok. Remaining: %u/%u\r\n",
-            sensor_buffer_count, SENSOR_BUFFER_CAPACITY);
+    /* Buffer fully drained — log once so the terminal shows mission-end clearly. */
+    flush_start_count = 0U;
+    sprintf(uart_buf, "[TX/CoAP] Flush done — /vib buffer empty\r\n");
+    HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
   }
-  else
-  {
-    sprintf(uart_buf, "[BUFFER] CoAP flush pending. Buffered: %u/%u\r\n",
-            sensor_buffer_count, SENSOR_BUFFER_CAPACITY);
-  }
-  HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
 }
 
 /* Estimate total board power from datasheet current figures — no ADC wired (P2-2).
@@ -1101,29 +1110,32 @@ int main(void)
       } // End of if (!suspend_sampling)
 
 	  // -----------------------------------------------------------------
-	  // PHASE 2.5: WIFI RECONNECT ON STA_DOWN
+	  // PHASE 2.5: WIFI RECONNECT ON STA_DOWN (non-blocking)
 	  // -----------------------------------------------------------------
-	  /* MXCHIP occasionally drops the association; without reconnect the loop
-	   * would spin silently forever. Re-join the same AP and wait for a new IP. */
-	  if ((wifi_station_ready == 0U) && (wifi_driver_initialized != 0U))
+	  /* Issue MX_WIFI_Connect once, then return immediately.  WIFI_StatusCallback
+	   * sets wifi_station_ready = 1 on MWIFI_EVENT_STA_GOT_IP; the event is
+	   * processed by MX_WIFI_IO_YIELD inside WIFI_DelayWithYield (10 ms slices)
+	   * so reconnect completes without blocking the sensor loop. */
 	  {
-	      uint8_t ip_addr[4] = {0};
-	      sprintf(uart_buf, "[NETWORK] STA_DOWN — reconnecting to '%s'...\r\n", WIFI_SSID);
-	      HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+	      static uint8_t reconnect_issued = 0U;
 
-	      MX_WIFI_Connect(wifi_obj, WIFI_SSID, WIFI_PASSWORD, MC_STATION);
-
-	      if (WIFI_WaitForStationIP(ip_addr, 30000U) == MX_WIFI_STATUS_OK)
+	      if ((wifi_station_ready == 0U) && (wifi_driver_initialized != 0U))
 	      {
-	          sprintf(uart_buf, "[NETWORK] Reconnected! IP: %d.%d.%d.%d\r\n",
-	                  ip_addr[0], ip_addr[1], ip_addr[2], ip_addr[3]);
+	          if (!reconnect_issued)
+	          {
+	              sprintf(uart_buf, "[NETWORK] STA_DOWN — reconnecting to '%s'\r\n", WIFI_SSID);
+	              HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+	              MX_WIFI_Connect(wifi_obj, WIFI_SSID, WIFI_PASSWORD, MC_STATION);
+	              reconnect_issued = 1U;
+	          }
+	          /* yield loop in PHASE 4 processes MXCHIP events; callback fires when IP is ready */
 	      }
-	      else
+	      else if (reconnect_issued)
 	      {
-	          /* Still down — will retry on next loop iteration */
-	          sprintf(uart_buf, "[NETWORK] Reconnect failed — will retry\r\n");
+	          reconnect_issued = 0U;
+	          sprintf(uart_buf, "[NETWORK] Reconnected!\r\n");
+	          HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
 	      }
-	      HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
 	  }
 
 	  // -----------------------------------------------------------------
