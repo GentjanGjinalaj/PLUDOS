@@ -1080,6 +1080,31 @@ int main(void)
 	      }
       } // End of if (!suspend_sampling)
 
+	  // -----------------------------------------------------------------
+	  // PHASE 2.5: WIFI RECONNECT ON STA_DOWN
+	  // -----------------------------------------------------------------
+	  /* MXCHIP occasionally drops the association; without reconnect the loop
+	   * would spin silently forever. Re-join the same AP and wait for a new IP. */
+	  if ((wifi_station_ready == 0U) && (wifi_driver_initialized != 0U))
+	  {
+	      uint8_t ip_addr[4] = {0};
+	      sprintf(uart_buf, "[NETWORK] STA_DOWN — reconnecting to '%s'...\r\n", WIFI_SSID);
+	      HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+
+	      MX_WIFI_Connect(wifi_obj, WIFI_SSID, WIFI_PASSWORD, MC_STATION);
+
+	      if (WIFI_WaitForStationIP(ip_addr, 30000U) == MX_WIFI_STATUS_OK)
+	      {
+	          sprintf(uart_buf, "[NETWORK] Reconnected! IP: %d.%d.%d.%d\r\n",
+	                  ip_addr[0], ip_addr[1], ip_addr[2], ip_addr[3]);
+	      }
+	      else
+	      {
+	          /* Still down — will retry on next loop iteration */
+	          sprintf(uart_buf, "[NETWORK] Reconnect failed — will retry\r\n");
+	      }
+	      HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+	  }
 
 	  // -----------------------------------------------------------------
 	  // PHASE 3: COAP FLUSH WHEN BUFFER REACHES 70%
