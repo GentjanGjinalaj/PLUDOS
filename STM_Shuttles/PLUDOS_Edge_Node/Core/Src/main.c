@@ -162,6 +162,8 @@ static uint16_t current_packet_num = 1U;
 #define SENSOR_BUFFER_TRIGGER_COUNT         ((SENSOR_BUFFER_CAPACITY * 70U) / 100U)
 #define SENSOR_BUFFER_SUSPEND_COUNT         ((SENSOR_BUFFER_CAPACITY * 95U) / 100U)
 #define IDLE_TRANSMIT_JITTER_MAX_MS         2000U   /* uniform window for IDLE-entry delay */
+#define NC_UDP_INTERVAL_MS                  30000U  /* temperature/humidity TX period; temperature changes slowly */
+#define NC_UDP_JITTER_MAX_MS                10000U  /* per-shuttle offset so 100+ shuttles don't burst together */
 #define COAP_URI_PATH                       "vib"
 #define COAP_PAYLOAD_BUFFER_SIZE            1024U
 #define COAP_PACKET_BUFFER_SIZE             1152U
@@ -645,11 +647,29 @@ static int32_t COAP_SendBufferedBatch(void)
   return -1;
 }
 
-/* Send temperature and humidity over raw UDP during STATE_IDLE; drops packet on sensor error. */
+/* Send temperature and humidity over raw UDP during STATE_IDLE; drops packet on sensor error.
+ * Throttled to NC_UDP_INTERVAL_MS with a one-time boot jitter so 100+ shuttles
+ * don't all transmit simultaneously even when they enter IDLE at the same time. */
 static void UDP_SendNonCritical(void)
 {
+  static uint32_t nc_last_tx_tick  = 0U;
+  static uint32_t nc_interval_ms   = 0U;  /* personalised interval, set once on first call */
   NonCriticalPayload payload = {0};
   struct mx_sockaddr_in dest_addr = {0};
+
+  /* Set a per-shuttle interval once: base + a jitter derived from the boot tick counter. */
+  if (nc_interval_ms == 0U)
+  {
+    nc_interval_ms = NC_UDP_INTERVAL_MS + (HAL_GetTick() % NC_UDP_JITTER_MAX_MS);
+    nc_last_tx_tick = HAL_GetTick(); /* don't send immediately on first IDLE entry */
+  }
+
+  /* Rate-limit: only transmit once per personalised interval. */
+  if (HAL_GetTick() - nc_last_tx_tick < nc_interval_ms)
+  {
+    return;
+  }
+  nc_last_tx_tick = HAL_GetTick();
 
   if ((socket_id < 0) || (wifi_station_ready == 0U) || (jetson_ip[0] == 0))
   {

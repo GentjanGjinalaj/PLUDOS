@@ -1,59 +1,41 @@
-# PLUDOS Alumet server-side energy profiler
-# Two-stage build: Rust toolchain for build, minimal Debian for runtime.
-# First build is slow (~10 min) due to Rust compilation; subsequent builds
-# use the cargo registry layer cache.
+# PLUDOS Alumet server-side energy profiler — x86_64 (laptop / future server)
+# Builds alumet-agent from source at v0.9.4. Same pattern as client/alumet-relay/Containerfile.
 #
-# RAPL requirement: the host must expose /sys/class/powercap (Intel RAPL).
-# Mount it read-only via compose.yaml. On AMD or VMs without RAPL, Alumet
-# falls back to process-level CPU accounting (less accurate).
+# Plugins loaded at runtime (entrypoint.sh):
+#   rapl               — Intel/AMD CPU energy via /sys/class/powercap (host mount in compose.yaml)
+#   relay-server       — gRPC receiver for Jetson alumet-relay streams (port 50051)
+#   influxdb           — persistent write to InfluxDB
+#   prometheus-exporter — live Grafana scrape on port 9091
 #
-# Phase 2 (ADR-011): relay-in receives metric streams from Jetson alumet-relay
-# sidecars over gRPC (Tailscale VPN).  Each Jetson forwards INA3221 readings;
-# this instance aggregates them with server RAPL data and writes to InfluxDB.
-#
-# Prometheus exporter runs on port 9091 for live Grafana scraping.
-# InfluxDB output runs in parallel for persistent storage.
+# First build is slow (~20 min); subsequent builds use cargo registry layer cache.
 
-# ---- Stage 1: build alumet-cli -----------------------------------------
-FROM rust:1.78-slim AS builder
+# ---- Stage 1: build alumet-agent ----------------------------------------
+# rust:slim tracks latest stable — required because alumet-agent needs Rust ≥ 1.89.
+FROM docker.io/library/rust:slim AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# TODO: pin version (e.g. alumet-cli@0.x.y) once relay flag names are verified.
-RUN cargo install alumet-cli
+# Install alumet-agent from the alumet monorepo (not published on crates.io).
+# Pinned to v0.9.4 for reproducibility — update when upgrading alumet.
+RUN cargo install \
+    --git https://github.com/alumet-dev/alumet \
+    --tag v0.9.4 \
+    alumet-agent
 
-# ---- Stage 2: minimal runtime image ------------------------------------
-FROM debian:bookworm-slim
+# ---- Stage 2: minimal runtime ------------------------------------------
+# Must match the builder's Debian base so GLIBC versions align.
+# rust:slim currently resolves to Debian 13 (trixie, GLIBC 2.39).
+FROM docker.io/library/debian:trixie-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /usr/local/cargo/bin/alumet-cli /usr/local/bin/alumet-cli
+COPY --from=builder /usr/local/cargo/bin/alumet-agent /usr/local/bin/alumet-agent
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
 
-# Plugins:
-#   --plugin rapl          : Intel RAPL CPU energy from /sys/class/powercap (host mount)
-#   --relay-in             : receive INA3221 streams from Jetson alumet-relay sidecars
-# Outputs (both run simultaneously):
-#   --output influxdb      : persistent time-series storage
-#   --output prometheus    : live scrape endpoint for Grafana on port 9091
-# Tags:
-#   device=$ALUMET_DEVICE_TAG : identifies server in multi-device dashboards
-#
-# NOTE: --relay-in flag name confirmed from Alumet docs.
-# NOTE: --output influxdb / --influxdb-* flag names assumed from common Alumet CLI
-#       conventions — verify with `alumet-cli --help` after installation.
-CMD ["sh", "-c", \
-     "alumet-cli \
-       --plugin rapl \
-       --relay-in 0.0.0.0:${ALUMET_RELAY_PORT:-50051} \
-       --output influxdb \
-       --influxdb-url ${INFLUXDB_URL} \
-       --influxdb-token ${INFLUXDB_TOKEN} \
-       --influxdb-org ${INFLUXDB_ORG} \
-       --influxdb-bucket ${INFLUXDB_BUCKET} \
-       --output prometheus \
-       --tag device=${ALUMET_DEVICE_TAG:-server}"]
+CMD ["/usr/local/bin/entrypoint.sh"]
