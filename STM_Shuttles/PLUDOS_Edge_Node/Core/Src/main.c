@@ -126,13 +126,14 @@ static uint32_t last_movement_tick = 0;
 
 #define MOVEMENT_THRESHOLD_G2    0.05f    /* deviation from 1g² below which the shuttle is considered still */
 #define MOVEMENT_DWELL_MS        500U     /* continuous movement required before entering STATE_MOVING */
-#define NO_MOVEMENT_TIMEOUT_MS   10000U   /* continuous stillness required before returning to STATE_IDLE */
+#define NO_MOVEMENT_TIMEOUT_MS   30000U   /* continuous stillness required before returning to STATE_IDLE */
 
 #define IDLE_SAMPLE_DELAY_MS     500U     /* 2 Hz sampling in IDLE */
 #define MOVING_SAMPLE_DELAY_MS   20U      /* 50 Hz sampling in MOVING */
 
 
-// Sensor I2C Address (0x6A shifted left by 1)
+/* ISM330 I2C addr: SA0 tied to VDD on IOT02A → base 0x6B, left-shifted → 0xD6.
+ * Confirmed in board schematic; datasheet default (SA0=0) gives 0x6A = 0xD4. */
 #define ISM330_ADDR 0xD6
 
 // Sensor Registers
@@ -165,7 +166,7 @@ static uint16_t current_packet_num = 1U;
 #define NC_UDP_INTERVAL_MS                  30000U  /* temperature/humidity TX period; temperature changes slowly */
 #define NC_UDP_JITTER_MAX_MS                10000U  /* per-shuttle offset so 100+ shuttles don't burst together */
 #define COAP_URI_PATH                       "vib"
-#define COAP_PAYLOAD_BUFFER_SIZE            1024U
+#define COAP_PAYLOAD_BUFFER_SIZE            64U    /* CriticalPayload is 39 bytes; 64 leaves headroom */
 #define COAP_PACKET_BUFFER_SIZE             1152U
 #define COAP_ACK_BUFFER_SIZE                128U
 #define COAP_ACK_TIMEOUT_MS                 2000U
@@ -435,7 +436,9 @@ static int32_t SENSOR_BuildSamplePayload(char *payload, uint32_t payload_size, u
   memcpy(coap_data.shuttle_id, SHUTTLE_ID, sizeof(coap_data.shuttle_id)); /* copies 11 chars + null from literal */
   coap_data.sequence_id    = sample->sequence_id;
   coap_data.tick_ms        = sample->tick_ms;
-  coap_data.mission_active = (current_state == STATE_MOVING) ? 1U : 0U; /* 0 signals mission end to gateway */
+  /* Send mission_active=0 only on the LAST packet of the IDLE flush so the
+   * gateway writes exactly one Parquet file per mission (it triggers on 0). */
+  coap_data.mission_active = ((current_state == STATE_IDLE) && (sensor_buffer_count <= 1U)) ? 0U : 1U;
   coap_data.ram_usage_pct  = (float)sensor_buffer_count / (float)SENSOR_BUFFER_CAPACITY * 100.0f;
   coap_data.accel_x        = sample->accel_x;
   coap_data.accel_y        = sample->accel_y;
@@ -640,6 +643,8 @@ static int32_t COAP_SendBufferedBatch(void)
     current_timeout_ms *= 2; // Exponential backoff
   }
 
+  /* Sample stays in buffer — caller retries on the next loop iteration.
+   * SENSOR_BufferDrop is called only on ACK success above. */
   coap_message_id++;
   return -1;
 }
@@ -1030,14 +1035,21 @@ int main(void)
       if (suspend_sampling) {
           /* Buffer drains only on successful CoAP ACK (via SENSOR_BufferDrop),
            * so empty-in-IDLE is equivalent to "IDLE + ACK received". */
-          if (current_state == STATE_IDLE && sensor_buffer_count == 0U) {
+          /* Clearing only in IDLE caused a deadlock: the state machine is
+           * skipped while suspended, so it could never reach IDLE.
+           * Clear as soon as the buffer drains regardless of state. */
+          if (sensor_buffer_count == 0U) {
               suspend_sampling = 0U;
               sprintf(uart_buf, "[BUFFER] Buffer cleared. Resuming sampling.\r\n");
               HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
           }
       }
 
-      if (!suspend_sampling) {
+      /* In IDLE the state machine must run even when suspend_sampling=1
+       * (buffer was >=95% during MOVING). Without this, shakes after a
+       * long MOVING phase are missed until the buffer fully drains.
+       * Buffering is gated on STATE_MOVING && !suspend_sampling inside. */
+      if (!suspend_sampling || current_state == STATE_IDLE) {
 	      // -----------------------------------------------------------------
 	      // PHASE 1: SENSOR ACQUISITION
 	      // -----------------------------------------------------------------
@@ -1098,8 +1110,13 @@ int main(void)
 		      sample.accel_y     = vib_y;
 		      sample.accel_z     = vib_z;
 
-		      SENSOR_BufferPush(&sample);
-		      current_packet_num++; // Increment packet number for each sample
+		      /* Only buffer during active missions — IDLE samples have no
+		       * mission value and cause a drip-CoAP loop blocking the sensor loop. */
+		      if ((current_state == STATE_MOVING) && (!suspend_sampling))
+		      {
+		          SENSOR_BufferPush(&sample);
+		          current_packet_num++;
+		      }
 	      }
 	      else
 	      {
@@ -1125,7 +1142,7 @@ int main(void)
 	          {
 	              sprintf(uart_buf, "[NETWORK] STA_DOWN — reconnecting to '%s'\r\n", WIFI_SSID);
 	              HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
-	              MX_WIFI_Connect(wifi_obj, WIFI_SSID, WIFI_PASSWORD, MC_STATION);
+	              MX_WIFI_Connect(wifi_obj, WIFI_SSID, WIFI_PASSWORD, MX_WIFI_SEC_AUTO);
 	              reconnect_issued = 1U;
 	          }
 	          /* yield loop in PHASE 4 processes MXCHIP events; callback fires when IP is ready */
@@ -1157,8 +1174,10 @@ int main(void)
 	  if (current_state == STATE_MOVING) {
 		  WIFI_DelayWithYield(MOVING_SAMPLE_DELAY_MS);
 	  } else {
-          UDP_SendNonCritical(); // Send Non-Critical telemetry during idle
-		  WIFI_DelayWithYield(IDLE_SAMPLE_DELAY_MS);
+          UDP_SendNonCritical();
+          /* Drain at 50 Hz while buffer is non-empty (recover from near-full
+           * MOVING phase in seconds not minutes). 2 Hz once buffer is clear. */
+		  WIFI_DelayWithYield(sensor_buffer_count > 0U ? MOVING_SAMPLE_DELAY_MS : IDLE_SAMPLE_DELAY_MS);
 	  }
   }
   /* USER CODE END 3 */
