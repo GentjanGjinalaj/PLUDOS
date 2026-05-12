@@ -145,20 +145,6 @@ PLUDOS/
 │   ├── server.py                    # XGBoost aggregation strategy
 │   ├── alumet/                      # Alumet relay receiver container
 │   └── compose.yaml                 # Podman compose for InfluxDB + Grafana
-├── docs/                            # Architecture, wire protocol, ADRs, backlog
 ├── tools/                           # mock_stm32.py — test packet emitter
 └── pyproject.toml                   # Flower app + server dependencies
 ```
-
----
-
-## 📚 Reference Docs
-
-| Doc | Purpose |
-|---|---|
-| `docs/architecture.md` | Three-tier system, current implementation status |
-| `docs/wire_protocol.md` | Exact byte layouts, CoAP framing, retry rules |
-| `docs/state_machine.md` | STM32 IDLE/MOVING FSM with all thresholds |
-| `docs/decisions.md` | Architecture Decision Records (ADRs) |
-| `docs/current_problems.md` | Active backlog (P0 / P1 / P2) |
-| `docs/ANALYTICS.md` | InfluxDB Flux queries and Grafana setup |

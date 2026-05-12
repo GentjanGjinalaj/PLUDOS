@@ -126,7 +126,7 @@ static uint32_t last_movement_tick = 0;
 
 #define MOVEMENT_THRESHOLD_G2    0.05f    /* deviation from 1g² below which the shuttle is considered still */
 #define MOVEMENT_DWELL_MS        500U     /* continuous movement required before entering STATE_MOVING */
-#define NO_MOVEMENT_TIMEOUT_MS   30000U   /* continuous stillness required before returning to STATE_IDLE */
+#define NO_MOVEMENT_TIMEOUT_MS   10000U   /* continuous stillness required before returning to STATE_IDLE */
 
 #define IDLE_SAMPLE_DELAY_MS     500U     /* 2 Hz sampling in IDLE */
 #define MOVING_SAMPLE_DELAY_MS   20U      /* 50 Hz sampling in MOVING */
@@ -1075,6 +1075,8 @@ int main(void)
 			      if (current_state == STATE_IDLE) {
                       if (continuous_movement_start_tick == 0) {
                           continuous_movement_start_tick = HAL_GetTick();
+                          sprintf(uart_buf, "[STATE] Movement dwell started (IDLE)\r\n");
+                          HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
                       } else if (HAL_GetTick() - continuous_movement_start_tick >= MOVEMENT_DWELL_MS) {
 				          sprintf(uart_buf, "[STATE] Continuous movement for 500ms! Switching to MOVING state.\r\n");
 				          HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
@@ -1151,6 +1153,24 @@ int main(void)
 	      {
 	          reconnect_issued = 0U;
 	          sprintf(uart_buf, "[NETWORK] Reconnected!\r\n");
+	          HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+
+	          /* MXCHIP invalidates all sockets on WiFi drop; recreate so CoAP/UDP resume. */
+	          if (socket_id >= 0)
+	          {
+	              (void)MX_WIFI_Socket_close(wifi_obj, socket_id);
+	              socket_id = -1;
+	          }
+	          socket_id = MX_WIFI_Socket_create(wifi_obj, MX_AF_INET, MX_SOCK_DGRAM, MX_IPPROTO_UDP);
+	          if (socket_id >= 0)
+	          {
+	              NETWORK_ConfigureUdpSocket(socket_id, COAP_ACK_TIMEOUT_MS);
+	              sprintf(uart_buf, "[NETWORK] Socket recreated (ID: %ld)\r\n", (long)socket_id);
+	          }
+	          else
+	          {
+	              sprintf(uart_buf, "[NETWORK] WARNING: socket recreate failed after reconnect\r\n");
+	          }
 	          HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
 	      }
 	  }
