@@ -135,3 +135,36 @@ podman build -f alumet-relay/Containerfile alumet-relay/ -t pludos-alumet-relay
 - `Error validating CNI config file ... plugin firewall` — harmless Podman warning, appears on every command
 - `CoAP RST` in data-engine logs from your own laptop test packets — normal
 - `LPS22HH not found on I2C2` in STM32 serial — non-fatal, pressure field stays 0.0
+
+---
+
+## 12. Enable Auto-Start on Boot (First-Time Setup)
+
+To make the PLUDOS containers start automatically when the Jetson boots, we create a custom user service. Run these commands once on the Jetson:
+
+```bash
+# 1. Allow the warehouse1 user to run services in the background without logging in
+loginctl enable-linger
+
+# 2. Create the systemd user directory
+mkdir -p ~/.config/systemd/user
+
+# 3. Create the service file
+cat <<EOF > ~/.config/systemd/user/pludos.service
+[Unit]
+Description=PLUDOS Gateway Auto-Start
+After=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/home/warehouse1/PLUDOS/client
+ExecStart=/home/warehouse1/.local/bin/podman-compose up -d
+
+[Install]
+WantedBy=default.target
+EOF
+
+# 4. Enable and start it
+systemctl --user enable --now pludos.service
+```

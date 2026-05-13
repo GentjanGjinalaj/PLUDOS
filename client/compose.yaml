@@ -28,6 +28,8 @@ services:
       - .env
     volumes:
       - ./ram_buffer:/app/ram_buffer
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
     restart: unless-stopped
 
   # 2. The AI Worker (Jetson <-> Server relay path via Tailscale)
@@ -49,6 +51,8 @@ services:
               capabilities: [gpu]
     volumes:
       - ./ram_buffer:/app/ram_buffer
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
     depends_on:
       - data-engine
       - tailscale
@@ -71,6 +75,8 @@ services:
     volumes:
       # INA3221 hardware power monitor: read-only sysfs access from host.
       - /sys/bus/i2c/drivers/ina3221:/sys/bus/i2c/drivers/ina3221:ro
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
     restart: unless-stopped
 
 # ram_buffer is a bind-mount on ./ram_buffer so it works in rootless Podman
