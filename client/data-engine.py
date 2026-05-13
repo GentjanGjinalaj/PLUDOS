@@ -111,11 +111,20 @@ STATE_MOVING = 1
 # Wire format — must match wire_protocol.md §1 exactly.
 # ---------------------------------------------------------------------------
 
-# 47-byte PludosTelemetry: shuttle_id, sequence_id, tick_ms, state, accel xyz,
-# temp_c, humidity_pct, pressure_hpa, power_mw.
-TELEMETRY_FMT  = "<12sHIBfffffff"
-TELEMETRY_SIZE = struct.calcsize(TELEMETRY_FMT)
-assert TELEMETRY_SIZE == 47, f"PludosTelemetry must be 47 bytes, got {TELEMETRY_SIZE}"
+# Packed (47 bytes): firmware built with __attribute__((packed)) or #pragma pack(push,1).
+TELEMETRY_FMT_PACKED  = "<12sHIBfffffff"
+TELEMETRY_SIZE_PACKED = struct.calcsize(TELEMETRY_FMT_PACKED)
+assert TELEMETRY_SIZE_PACKED == 47, f"packed fmt must be 47, got {TELEMETRY_SIZE_PACKED}"
+
+# Natural alignment (52 bytes): ARM GCC adds 2 bytes pad before tick_ms and
+# 3 bytes pad before accel_x when pragma pack is not honored by the IDE build.
+TELEMETRY_FMT_NATURAL  = "<12sH2xIB3xfffffff"
+TELEMETRY_SIZE_NATURAL = struct.calcsize(TELEMETRY_FMT_NATURAL)
+assert TELEMETRY_SIZE_NATURAL == 52, f"natural fmt must be 52, got {TELEMETRY_SIZE_NATURAL}"
+
+VALID_TELEMETRY_SIZES = {TELEMETRY_SIZE_PACKED, TELEMETRY_SIZE_NATURAL}
+# Canonical size after firmware is reflashed with __attribute__((packed))
+TELEMETRY_SIZE = TELEMETRY_SIZE_PACKED
 
 # ---------------------------------------------------------------------------
 # Mutable gateway state — per-shuttle dicts, single-threaded asyncio.
@@ -216,10 +225,17 @@ def _write_mission_summary(
 
 
 def _unpack_telemetry(raw: bytes) -> dict:
-    """Unpack a 47-byte PludosTelemetry into a labelled dict; raises struct.error on bad data.
-    Wire sentinels (-999.0 °C, 0.0 hPa) are converted to NaN so downstream ML treats them
-    as missing rather than real readings."""
-    sid, seq, tick, state, ax, ay, az, temp, hum, pres, pwr = struct.unpack(TELEMETRY_FMT, raw)
+    """Unpack a PludosTelemetry packet (47 or 52 bytes) into a labelled dict.
+    52-byte variant: natural ARM alignment without __attribute__((packed)).
+    Wire sentinels (-999.0 °C, 0.0 hPa) are converted to NaN so downstream ML treats
+    them as missing rather than real readings."""
+    if len(raw) == TELEMETRY_SIZE_PACKED:
+        fmt = TELEMETRY_FMT_PACKED
+    elif len(raw) == TELEMETRY_SIZE_NATURAL:
+        fmt = TELEMETRY_FMT_NATURAL
+    else:
+        raise struct.error(f"unexpected size {len(raw)}, expected 47 or 52")
+    sid, seq, tick, state, ax, ay, az, temp, hum, pres, pwr = struct.unpack(fmt, raw)
 
     # Sentinel decoding: see wire_protocol.md §1 field notes.
     temp_out = float("nan") if temp == -999.0 else temp
@@ -283,9 +299,9 @@ class TelemetryProtocol(asyncio.DatagramProtocol):
     """Single-port asyncio datagram handler for PludosTelemetry from all shuttles."""
 
     def datagram_received(self, data: bytes, addr) -> None:
-        if len(data) != TELEMETRY_SIZE:
+        if len(data) not in VALID_TELEMETRY_SIZES:
             logger.debug(
-                "Telemetry: bad size %d from %s (expected %d)", len(data), addr, TELEMETRY_SIZE
+                "Telemetry: bad size %d from %s (expected 47 or 52)", len(data), addr
             )
             return
 

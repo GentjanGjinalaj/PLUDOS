@@ -38,6 +38,8 @@
 
 /* 47-byte unified telemetry payload (ADR-015 / wire_protocol.md §1).
  * Sent as raw UDP to JETSON_IP:5683. Every packet carries the full sensor set.
+ * __attribute__((packed)) eliminates ARM natural-alignment padding (2 bytes before
+ * tick_ms, 3 bytes before accel_x) that would otherwise produce a 52-byte struct.
  * Python unpack: struct.unpack('<12sHIBfffffff', data) */
 #pragma pack(push, 1)
 typedef struct {
@@ -52,7 +54,7 @@ typedef struct {
   float    humidity_pct;    /* HTS221 %RH 0–100; 0.0 if temp sentinel               */
   float    pressure_hpa;    /* LPS22HH hPa; 0.0 = sensor unavailable                */
   float    power_mw;        /* board-level estimate, ±40% (ADR-011 placeholder)     */
-} PludosTelemetry_t;        /* total: 47 bytes                                       */
+} __attribute__((packed)) PludosTelemetry_t;   /* total: 47 bytes                   */
 #pragma pack(pop)
 
 /* USER CODE END PTD */
