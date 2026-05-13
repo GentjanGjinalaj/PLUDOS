@@ -331,33 +331,32 @@ static void WIFI_DelayWithYield(uint32_t delay_ms)
 }
 
 /* Refresh HTS221 and LPS22HH cache values. Cached values stamp every TX so
- * the I²C bus does not block the 50 Hz transmit path. Sentinel on read failure. */
+ * the I²C bus does not block the 50 Hz transmit path.
+ * Cache is only updated on successful read — preserves last-known value when
+ * HTS221 (1 Hz ODR) has no new data ready during a 2 Hz poll. */
 static void TELEMETRY_RefreshEnvCache(void)
 {
-  float new_temp = -999.0f;
-  float new_hum  =    0.0f;
-  float new_pres =    0.0f;
+  float new_temp = 0.0f;
+  float new_hum  = 0.0f;
+  float new_pres = 0.0f;
 
   if (hts221_initialized != 0U)
   {
-    if (SENSOR_Humidity_Read(&hi2c2, &new_temp, &new_hum) != 0)
+    /* Update cache only on success; keep previous value on "not ready" or I2C error. */
+    if (SENSOR_Humidity_Read(&hi2c2, &new_temp, &new_hum) == 0)
     {
-      new_temp = -999.0f;
-      new_hum  =    0.0f;
+      cached_temp_c       = new_temp;
+      cached_humidity_pct = new_hum;
     }
   }
 
   if (lps22hh_initialized != 0U)
   {
-    if (SENSOR_Pressure_Read(&hi2c2, &new_pres) != 0)
+    if (SENSOR_Pressure_Read(&hi2c2, &new_pres) == 0)
     {
-      new_pres = 0.0f;
+      cached_pressure_hpa = new_pres;
     }
   }
-
-  cached_temp_c       = new_temp;
-  cached_humidity_pct = new_hum;
-  cached_pressure_hpa = new_pres;
 }
 
 /* Send one PludosTelemetry packet via raw UDP. Fire-and-forget — no ACK, no retry.
