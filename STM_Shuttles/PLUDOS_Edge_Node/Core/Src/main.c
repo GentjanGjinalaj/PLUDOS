@@ -24,7 +24,8 @@
 #include "wifi_credentials.h"
 #include "sensors.h"
 #include <stdio.h>
-#include <string.h> // Required for the strlen() command
+#include <string.h>
+#include <math.h>            /* fabsf() for FSM threshold check */
 
 #include "mx_wifi.h"
 #include "mx_wifi_io.h"
@@ -34,45 +35,24 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-typedef struct
-{
-  uint16_t sequence_id;
-  uint32_t tick_ms;    /* HAL_GetTick() at sample time */
-  float accel_x;
-  float accel_y;
-  float accel_z;
-  float power_mw;      /* board-level estimate: MCU + WiFi current × 3.3V (P2-2 for real ADC) */
-} SensorSample_t;
 
-/* 39-byte packed binary payload — matches data-engine.py struct '<12sHIBfffff'.
- * Field order and types MUST match wire_protocol.md §1 exactly. */
+/* 47-byte unified telemetry payload (ADR-015 / wire_protocol.md §1).
+ * Sent as raw UDP to JETSON_IP:5683. Every packet carries the full sensor set.
+ * Python unpack: struct.unpack('<12sHIBfffffff', data) */
 #pragma pack(push, 1)
 typedef struct {
-  char     shuttle_id[12];  /* null-padded ASCII, identifies the shuttle */
-  uint16_t sequence_id;     /* monotonic counter; gateway uses it to sort packets */
-  uint32_t tick_ms;         /* HAL_GetTick(); gateway converts to absolute via NTP offset */
-  uint8_t  mission_active;  /* 1 = moving, 0 = mission ended (gateway writes Parquet on 0) */
-  float    ram_usage_pct;   /* SRAM buffer fill % (0–100) */
-  float    accel_x;
-  float    accel_y;
-  float    accel_z;
-  float    power_mw;        /* board-level estimate: MCU + WiFi (P2-2 for real ADC) */
-} CriticalPayload;          /* total: 39 bytes */
-#pragma pack(pop)
-
-/* 30-byte packed UDP payload for non-critical environmental data.
- * shuttle_id identifies the source; gateway correlates to CoAP stream via shuttle_id.
- * Python unpack: struct.unpack('<12sHIfff', data)
- * pressure_hpa = 0.0 is the sentinel for "LPS22HH unavailable or read failed". */
-#pragma pack(push, 1)
-typedef struct {
-  char     shuttle_id[12];  /* null-padded ASCII, same value as CriticalPayload */
-  uint16_t sequence_id;     /* monotonic counter shared with CoAP sequence space */
-  uint32_t tick_ms;         /* HAL_GetTick() at sensor read time */
-  float    temp_c;          /* °C from HTS221 */
-  float    humidity_pct;    /* % RH from HTS221, clamped [0, 100] */
-  float    pressure_hpa;    /* hPa from LPS22HH; 0.0 if sensor unavailable */
-} NonCriticalPayload;       /* total: 30 bytes */
+  char     shuttle_id[12];  /* null-padded ASCII, identifies the shuttle           */
+  uint16_t sequence_id;     /* monotonic per-shuttle, wraps at 65535                */
+  uint32_t tick_ms;         /* HAL_GetTick() at sample time                         */
+  uint8_t  state;           /* 0 = STATE_IDLE, 1 = STATE_MOVING                     */
+  float    accel_x;         /* g, ISM330 X axis                                     */
+  float    accel_y;         /* g, ISM330 Y axis                                     */
+  float    accel_z;         /* g, ISM330 Z axis                                     */
+  float    temp_c;          /* HTS221 °C; -999.0 = sensor unavailable               */
+  float    humidity_pct;    /* HTS221 %RH 0–100; 0.0 if temp sentinel               */
+  float    pressure_hpa;    /* LPS22HH hPa; 0.0 = sensor unavailable                */
+  float    power_mw;        /* board-level estimate, ±40% (ADR-011 placeholder)     */
+} PludosTelemetry_t;        /* total: 47 bytes                                       */
 #pragma pack(pop)
 
 /* USER CODE END PTD */
@@ -115,32 +95,34 @@ UART_HandleTypeDef huart1;
 PCD_HandleTypeDef hpcd_USB_OTG_FS;
 
 /* USER CODE BEGIN PV */
-// --- PLUDOS State Machine ---
+// --- PLUDOS State Machine (ADR-015: unified UDP stream, no SRAM buffer) ---
 typedef enum {
-  STATE_IDLE,
-  STATE_MOVING
+  STATE_IDLE   = 0,
+  STATE_MOVING = 1
 } ShuttleState_t;
 
 static ShuttleState_t current_state = STATE_IDLE;
-static uint32_t last_movement_tick = 0;
+static uint32_t last_movement_tick = 0U;        /* tick of the most recent above-threshold sample */
+static uint32_t last_above_threshold_tick = 0U; /* same value, separate name for debounce clarity */
+static uint32_t continuous_movement_start_tick = 0U; /* tick when the current dwell began */
 
-#define MOVEMENT_THRESHOLD_G2    0.05f    /* deviation from 1g² below which the shuttle is considered still */
-#define MOVEMENT_DWELL_MS        500U     /* continuous movement required before entering STATE_MOVING */
-#define NO_MOVEMENT_TIMEOUT_MS   10000U   /* continuous stillness required before returning to STATE_IDLE */
+#define MOVEMENT_THRESHOLD_G2   0.05f    /* deviation from 1g² — ~0.0247 g, above ISM330 noise floor */
+#define MOVEMENT_DWELL_MS       500U     /* continuous-above duration to enter STATE_MOVING */
+#define MOVEMENT_DEBOUNCE_MS    300U     /* sub-threshold tolerance inside a dwell — survives motion microbreaks */
+#define NO_MOVEMENT_TIMEOUT_MS  20000U   /* no above-threshold sample for this long → STATE_IDLE */
 
-#define IDLE_SAMPLE_DELAY_MS     500U     /* 2 Hz sampling in IDLE */
-#define MOVING_SAMPLE_DELAY_MS   20U      /* 50 Hz sampling in MOVING */
-
+#define SAMPLE_PERIOD_IDLE_MS   100U     /* 10 Hz internal sampling in IDLE (FSM responsiveness) */
+#define SAMPLE_PERIOD_MOVING_MS 20U      /* 50 Hz sampling + transmit in MOVING */
+#define TX_PERIOD_IDLE_MS       1000U    /* 1 Hz UDP transmit in IDLE — every 10th sample */
+#define ENV_READ_PERIOD_MS      500U     /* 2 Hz HTS221/LPS22HH refresh; cached for every TX */
 
 /* ISM330 I2C addr: SA0 tied to VDD on IOT02A → base 0x6B, left-shifted → 0xD6.
  * Confirmed in board schematic; datasheet default (SA0=0) gives 0x6A = 0xD4. */
 #define ISM330_ADDR 0xD6
+#define CTRL1_XL    0x10
+#define OUTX_L_A    0x28
 
-// Sensor Registers
-#define CTRL1_XL 0x10
-#define OUTX_L_A 0x28
-
-// Global physics variables so the Live Watch can see them
+/* Global physics variables so the Live Watch can see them */
 float vib_x = 0.0f;
 float vib_y = 0.0f;
 float vib_z = 0.0f;
@@ -148,55 +130,39 @@ float vib_z = 0.0f;
 static uint16_t current_packet_num = 1U;
 
 // =========================================================================
-// PLUDOS NETWORK CONFIGURATION
+// PLUDOS NETWORK CONFIGURATION (ADR-015)
 // =========================================================================
 /* WIFI_SSID, WIFI_PASSWORD, JETSON_IP, and SHUTTLE_ID are in
  * wifi_credentials.h (gitignored — copy from wifi_credentials.h.example). */
-#define JETSON_PORT    5683U  /* CoAP CON critical packets — owned by aiocoap */
-#define JETSON_NC_PORT 5684U  /* raw UDP non-critical packets — separate socket on gateway */
+#define TELEMETRY_PORT 5683U  /* single UDP port for the unified PludosTelemetry stream */
 
 /* ARM Cortex-M33 is little-endian; mx_sockaddr_in.sin_port is network byte order.
  * No stdlib htons() on bare metal — swap bytes at compile time. */
 #define PLUDOS_HTONS(x) ((uint16_t)(((uint16_t)(x) >> 8U) | ((uint16_t)(x) << 8U)))
 
-#define SENSOR_BUFFER_CAPACITY              256U
-#define SENSOR_BUFFER_TRIGGER_COUNT         ((SENSOR_BUFFER_CAPACITY * 70U) / 100U)
-#define SENSOR_BUFFER_SUSPEND_COUNT         ((SENSOR_BUFFER_CAPACITY * 95U) / 100U)
-#define IDLE_TRANSMIT_JITTER_MAX_MS         2000U   /* uniform window for IDLE-entry delay */
-#define NC_UDP_INTERVAL_MS                  30000U  /* temperature/humidity TX period; temperature changes slowly */
-#define NC_UDP_JITTER_MAX_MS                10000U  /* per-shuttle offset so 100+ shuttles don't burst together */
-#define COAP_URI_PATH                       "vib"
-#define COAP_PAYLOAD_BUFFER_SIZE            64U    /* CriticalPayload is 39 bytes; 64 leaves headroom */
-#define COAP_PACKET_BUFFER_SIZE             1152U
-#define COAP_ACK_BUFFER_SIZE                128U
-#define COAP_ACK_TIMEOUT_MS                 2000U
-#define COAP_MAX_RETRY_COUNT                4U   /* max transmit attempts per packet (RFC 7252 §4.8) */
+static int32_t socket_id = -1;            /* -1 = socket closed */
+static char    uart_buf[120];             /* scratch buffer shared by all UART log messages */
 
-static int32_t socket_id = -1;       /* -1 = socket closed */
-static char    uart_buf[120];         /* scratch buffer shared by all UART log messages */
-
-// Pointer to the MXCHIP driver object owned by the ST WiFi transport layer
+/* Pointer to the MXCHIP driver object owned by the ST WiFi transport layer */
 MX_WIFIObject_t *wifi_obj = NULL;
 static volatile uint8_t wifi_driver_initialized = 0;
 static volatile uint8_t wifi_station_event = 0xFF;
 static volatile uint8_t wifi_station_ready = 0;
-static SensorSample_t sensor_buffer[SENSOR_BUFFER_CAPACITY];
-static uint16_t sensor_buffer_head = 0U;
-static uint16_t sensor_buffer_tail = 0U;
-static uint16_t sensor_buffer_count = 0U;
-static uint8_t sensor_flush_requested = 0U;
-static uint16_t coap_message_id = 1U;
-static uint32_t sensor_buffer_overflow_count = 0U;
-static char     jetson_ip[16]   = {0};   /* populated from JETSON_IP define at init */
-static uint32_t idle_entry_tick = 0U;    /* HAL_GetTick() when MOVING→IDLE transition occurred */
-static uint32_t idle_jitter_ms  = 0U;   /* per-shuttle delay before first IDLE flush */
-static uint8_t  hts221_initialized = 0U; /* set to 1 if SENSOR_Humidity_Init succeeds */
-static uint8_t  lps22hh_initialized = 0U; /* set to 1 if SENSOR_Pressure_Init succeeds */
 
-/* These drive the state machine across loop iterations — file scope keeps them
- * visible to any future helper functions without needing to pass by pointer. */
-static uint32_t continuous_movement_start_tick = 0U; /* tick when unbroken movement began */
-static uint8_t  suspend_sampling = 0U;               /* 1 while buffer ≥ 95% — halts I2C reads */
+static char     jetson_ip[16]      = {0};   /* populated from JETSON_IP define at init */
+static uint8_t  hts221_initialized  = 0U;    /* SENSOR_Humidity_Init succeeded */
+static uint8_t  lps22hh_initialized = 0U;    /* SENSOR_Pressure_Init succeeded */
+
+/* Environmental sensor cache (refreshed every ENV_READ_PERIOD_MS so the I²C bus
+ * stays out of the 50 Hz hot path; cached values stamp every outgoing packet). */
+static float    cached_temp_c       = -999.0f;
+static float    cached_humidity_pct =    0.0f;
+static float    cached_pressure_hpa =    0.0f;
+
+/* TX bookkeeping for periodic per-second status log. */
+static uint32_t last_tx_tick      = 0U;
+static uint32_t tx_count_window   = 0U;
+static uint32_t tx_window_start_tick = 0U;
 
 /* USER CODE END PV */
 
@@ -222,17 +188,8 @@ static uint8_t WIFI_IsIPv4Valid(const uint8_t ip_addr[4]);
 static void WIFI_LogStationEvent(uint8_t event);
 static MX_WIFI_STATUS_T WIFI_WaitForStationIP(uint8_t ip_addr[4], uint32_t timeout_ms);
 static void WIFI_DelayWithYield(uint32_t delay_ms);
-static void SENSOR_BufferPush(const SensorSample_t *sample);
-static void SENSOR_BufferDrop(uint16_t sample_count);
-static int32_t SENSOR_BuildSamplePayload(char *payload, uint32_t payload_size, uint16_t *samples_built);
-static uint16_t COAP_BuildConfirmablePost(uint8_t *packet, uint16_t packet_size,
-                                          const uint8_t *payload, uint16_t payload_len,
-                                          uint16_t message_id, const uint8_t *token, uint8_t token_len);
-static uint8_t COAP_IsAckValid(const uint8_t *packet, int32_t packet_len,
-                               uint16_t expected_message_id, const uint8_t *expected_token, uint8_t expected_token_len);
-static void NETWORK_ConfigureUdpSocket(int32_t sock_fd, uint32_t timeout_ms);
-static int32_t COAP_SendBufferedBatch(void);
-static void NETWORK_ProcessBufferedSamples(void);
+static void TELEMETRY_RefreshEnvCache(void);
+static int32_t TELEMETRY_Send(void);
 static float POWER_EstimateMilliwatts(void);
 
 /* USER CODE END PFP */
@@ -371,381 +328,76 @@ static void WIFI_DelayWithYield(uint32_t delay_ms)
   }
 }
 
-static void SENSOR_BufferPush(const SensorSample_t *sample)
+/* Refresh HTS221 and LPS22HH cache values. Cached values stamp every TX so
+ * the I²C bus does not block the 50 Hz transmit path. Sentinel on read failure. */
+static void TELEMETRY_RefreshEnvCache(void)
 {
-  if (sample == NULL)
-  {
-    return;
-  }
+  float new_temp = -999.0f;
+  float new_hum  =    0.0f;
+  float new_pres =    0.0f;
 
-  if (sensor_buffer_count >= SENSOR_BUFFER_CAPACITY)
+  if (hts221_initialized != 0U)
   {
-    sensor_buffer_tail = (uint16_t)((sensor_buffer_tail + 1U) % SENSOR_BUFFER_CAPACITY);
-    sensor_buffer_count--;
-    sensor_buffer_overflow_count++;
-
-    if ((sensor_buffer_overflow_count % 10U) == 1U)
+    if (SENSOR_Humidity_Read(&hi2c2, &new_temp, &new_hum) != 0)
     {
-      sprintf(uart_buf, "[BUFFER] WARNING: overflow, dropped oldest sample(s): %lu\r\n",
-              (unsigned long)sensor_buffer_overflow_count);
-      HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+      new_temp = -999.0f;
+      new_hum  =    0.0f;
     }
   }
 
-  sensor_buffer[sensor_buffer_head] = *sample;
-  sensor_buffer_head = (uint16_t)((sensor_buffer_head + 1U) % SENSOR_BUFFER_CAPACITY);
-  sensor_buffer_count++;
-
-  if (sensor_buffer_count >= SENSOR_BUFFER_TRIGGER_COUNT)
+  if (lps22hh_initialized != 0U)
   {
-    sensor_flush_requested = 1U;
-  }
-}
-
-static void SENSOR_BufferDrop(uint16_t sample_count)
-{
-  uint16_t drop_count = MIN(sample_count, sensor_buffer_count);
-
-  if (drop_count == 0U)
-  {
-    return;
-  }
-
-  sensor_buffer_tail = (uint16_t)((sensor_buffer_tail + drop_count) % SENSOR_BUFFER_CAPACITY);
-  sensor_buffer_count = (uint16_t)(sensor_buffer_count - drop_count);
-
-  if (sensor_buffer_count == 0U)
-  {
-    sensor_flush_requested = 0U;
-  }
-}
-
-/* Serialise the oldest buffered sample into a packed CriticalPayload; returns byte count or -1. */
-static int32_t SENSOR_BuildSamplePayload(char *payload, uint32_t payload_size, uint16_t *samples_built)
-{
-  const SensorSample_t *sample;
-  CriticalPayload coap_data = {0};
-
-  if ((payload == NULL) || (samples_built == NULL) || (payload_size == 0U) || (sensor_buffer_count == 0U))
-  {
-    return -1;
-  }
-
-  sample = &sensor_buffer[sensor_buffer_tail]; /* oldest sample */
-
-  memcpy(coap_data.shuttle_id, SHUTTLE_ID, sizeof(coap_data.shuttle_id)); /* copies 11 chars + null from literal */
-  coap_data.sequence_id    = sample->sequence_id;
-  coap_data.tick_ms        = sample->tick_ms;
-  /* Send mission_active=0 only on the LAST packet of the IDLE flush so the
-   * gateway writes exactly one Parquet file per mission (it triggers on 0). */
-  coap_data.mission_active = ((current_state == STATE_IDLE) && (sensor_buffer_count <= 1U)) ? 0U : 1U;
-  coap_data.ram_usage_pct  = (float)sensor_buffer_count / (float)SENSOR_BUFFER_CAPACITY * 100.0f;
-  coap_data.accel_x        = sample->accel_x;
-  coap_data.accel_y        = sample->accel_y;
-  coap_data.accel_z        = sample->accel_z;
-  coap_data.power_mw       = sample->power_mw;
-
-  memcpy(payload, &coap_data, sizeof(CriticalPayload));
-  *samples_built = 1U;
-
-  return (int32_t)sizeof(CriticalPayload);
-}
-
-static uint16_t COAP_BuildConfirmablePost(uint8_t *packet, uint16_t packet_size,
-                                          const uint8_t *payload, uint16_t payload_len,
-                                          uint16_t message_id, const uint8_t *token, uint8_t token_len)
-{
-  uint16_t pos = 0U;
-  const uint8_t uri_path_len = (uint8_t)strlen(COAP_URI_PATH);
-
-  if ((packet == NULL) || (token == NULL) || (token_len > 8U) || (uri_path_len >= 13U))
-  {
-    return 0U;
-  }
-
-  if ((uint32_t)packet_size < (uint32_t)(4U + token_len + 1U + uri_path_len + 2U + 1U + payload_len))
-  {
-    return 0U;
-  }
-
-  packet[pos++] = (uint8_t)(0x40U | token_len);  // Ver=1, Type=CON, TKL=token_len
-  packet[pos++] = 0x02U;                         // POST
-  packet[pos++] = (uint8_t)(message_id >> 8);
-  packet[pos++] = (uint8_t)(message_id & 0xFFU);
-
-  (void)memcpy(&packet[pos], token, token_len);
-  pos = (uint16_t)(pos + token_len);
-
-  packet[pos++] = (uint8_t)((11U << 4) | uri_path_len);  // Uri-Path: "vib"
-  (void)memcpy(&packet[pos], COAP_URI_PATH, uri_path_len);
-  pos = (uint16_t)(pos + uri_path_len);
-
-  packet[pos++] = 0x11U;  // Option delta=1 (Content-Format), length=1
-  packet[pos++] = 42U;    // application/octet-stream
-
-  if ((payload != NULL) && (payload_len > 0U))
-  {
-    packet[pos++] = 0xFFU;
-    (void)memcpy(&packet[pos], payload, payload_len);
-    pos = (uint16_t)(pos + payload_len);
-  }
-
-  return pos;
-}
-
-static uint8_t COAP_IsAckValid(const uint8_t *packet, int32_t packet_len,
-                               uint16_t expected_message_id, const uint8_t *expected_token, uint8_t expected_token_len)
-{
-  uint8_t version;
-  uint8_t type;
-  uint8_t token_len;
-  uint8_t code;
-  uint16_t message_id;
-
-  if ((packet == NULL) || (expected_token == NULL) || (packet_len < 4))
-  {
-    return 0U;
-  }
-
-  version = (uint8_t)(packet[0] >> 6);
-  type = (uint8_t)((packet[0] >> 4) & 0x03U);
-  token_len = (uint8_t)(packet[0] & 0x0FU);
-  code = packet[1];
-  message_id = (uint16_t)(((uint16_t)packet[2] << 8) | packet[3]);
-
-  if ((version != 1U) || (type != 2U) || (token_len != expected_token_len) ||
-      (message_id != expected_message_id) || (packet_len < (4 + expected_token_len)))
-  {
-    return 0U;
-  }
-
-  if (memcmp(&packet[4], expected_token, expected_token_len) != 0)
-  {
-    return 0U;
-  }
-
-  if ((code == 0U) || ((code >> 5) == 2U))
-  {
-    return 1U;
-  }
-
-  return 0U;
-}
-
-static void NETWORK_ConfigureUdpSocket(int32_t sock_fd, uint32_t timeout_ms)
-{
-  struct mx_timeval timeout = {0};
-  int32_t status;
-
-  if ((wifi_obj == NULL) || (sock_fd < 0))
-  {
-    return;
-  }
-
-  timeout.tv_sec  = (long)(timeout_ms / 1000U);
-  timeout.tv_usec = (long)((timeout_ms % 1000U) * 1000U);
-
-  status = MX_WIFI_Socket_setsockopt(wifi_obj, sock_fd, MX_SOL_SOCKET, MX_SO_RCVTIMEO,
-                                     &timeout, sizeof(timeout));
-  if (status != 0)
-  {
-    sprintf(uart_buf, "[NETWORK] WARNING: set RX timeout failed on socket %ld\r\n", (long)sock_fd);
-    HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
-  }
-
-  status = MX_WIFI_Socket_setsockopt(wifi_obj, sock_fd, MX_SOL_SOCKET, MX_SO_SNDTIMEO,
-                                     &timeout, sizeof(timeout));
-  if (status != 0)
-  {
-    sprintf(uart_buf, "[NETWORK] WARNING: set TX timeout failed on socket %ld\r\n", (long)sock_fd);
-    HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
-  }
-}
-
-static int32_t COAP_SendBufferedBatch(void)
-{
-  uint8_t token[2];
-  uint8_t coap_packet[COAP_PACKET_BUFFER_SIZE] = {0};
-  uint8_t ack_packet[COAP_ACK_BUFFER_SIZE] = {0};
-  char coap_payload_buf[COAP_PAYLOAD_BUFFER_SIZE] = {0};
-  struct mx_sockaddr_in dest_addr = {0};
-  struct mx_sockaddr_in from_addr = {0};
-  uint32_t from_addr_len = sizeof(from_addr);
-  uint16_t samples_in_batch = 0U;
-  uint16_t packet_len;
-  uint16_t message_id = coap_message_id;
-  int32_t payload_len;
-  uint8_t attempt;
-
-  if ((socket_id < 0) || (wifi_station_ready == 0U) || (sensor_buffer_count == 0U))
-  {
-    return -1;
-  }
-
-  payload_len = SENSOR_BuildSamplePayload(coap_payload_buf, sizeof(coap_payload_buf), &samples_in_batch);
-  if ((payload_len <= 0) || (samples_in_batch == 0U))
-  {
-    return -1;
-  }
-
-  token[0] = (uint8_t)(message_id >> 8);
-  token[1] = (uint8_t)(message_id & 0xFFU);
-
-  packet_len = COAP_BuildConfirmablePost(coap_packet, sizeof(coap_packet),
-                                         (const uint8_t *)coap_payload_buf, (uint16_t)payload_len,
-                                         message_id, token, sizeof(token));
-  if (packet_len == 0U)
-  {
-    return -1;
-  }
-
-  dest_addr.sin_len = sizeof(dest_addr);
-  dest_addr.sin_family = MX_AF_INET;
-  dest_addr.sin_port = PLUDOS_HTONS(JETSON_PORT);
-  dest_addr.sin_addr.s_addr = (uint32_t)mx_aton_r(jetson_ip);
-
-  // RFC 7252 Binary Exponential Backoff
-  uint32_t current_timeout_ms = COAP_ACK_TIMEOUT_MS; // Start at 2000ms
-
-  for (attempt = 1U; attempt <= COAP_MAX_RETRY_COUNT; attempt++)
-  {
-    int32_t sent_result;
-    int32_t recv_result;
-
-    NETWORK_ConfigureUdpSocket(socket_id, current_timeout_ms);
-
-    sent_result = MX_WIFI_Socket_sendto(wifi_obj, socket_id, coap_packet, packet_len,
-                                        0, (struct mx_sockaddr *)&dest_addr, sizeof(dest_addr));
-
-    if (sent_result != packet_len)
+    if (SENSOR_Pressure_Read(&hi2c2, &new_pres) != 0)
     {
-      sprintf(uart_buf, "[COAP] ERROR: send failed on try %u/4\r\n", attempt);
-      HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
-      current_timeout_ms *= 2;
-      continue;
+      new_pres = 0.0f;
     }
-
-    from_addr_len = sizeof(from_addr);
-    recv_result = MX_WIFI_Socket_recvfrom(wifi_obj, socket_id, ack_packet, sizeof(ack_packet),
-                                          0, (struct mx_sockaddr *)&from_addr, &from_addr_len);
-
-    if (COAP_IsAckValid(ack_packet, recv_result, message_id, token, sizeof(token)) != 0U)
-    {
-      SENSOR_BufferDrop(1);  /* caller (NETWORK_ProcessBufferedSamples) logs milestones */
-      coap_message_id++;
-      return 1;
-    }
-
-    sprintf(uart_buf, "[COAP] No valid ACK on try %u/4 for MID=0x%04X. Backoff: %lu ms\r\n",
-            attempt, message_id, (unsigned long)current_timeout_ms);
-    HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
-    
-    current_timeout_ms *= 2; // Exponential backoff
   }
 
-  /* Sample stays in buffer — caller retries on the next loop iteration.
-   * SENSOR_BufferDrop is called only on ACK success above. */
-  coap_message_id++;
-  return -1;
+  cached_temp_c       = new_temp;
+  cached_humidity_pct = new_hum;
+  cached_pressure_hpa = new_pres;
 }
 
-/* Send temperature and humidity over raw UDP during STATE_IDLE; drops packet on sensor error.
- * Throttled to NC_UDP_INTERVAL_MS with a one-time boot jitter so 100+ shuttles
- * don't all transmit simultaneously even when they enter IDLE at the same time. */
-static void UDP_SendNonCritical(void)
+/* Send one PludosTelemetry packet via raw UDP. Fire-and-forget — no ACK, no retry.
+ * Returns the byte count written by sendto, or -1 if socket/WiFi is not ready. */
+static int32_t TELEMETRY_Send(void)
 {
-  static uint32_t nc_last_tx_tick  = 0U;
-  static uint32_t nc_interval_ms   = 0U;  /* personalised interval, set once on first call */
-  NonCriticalPayload payload = {0};
-  struct mx_sockaddr_in dest_addr = {0};
-
-  /* Set a per-shuttle interval once: base + a jitter derived from the boot tick counter. */
-  if (nc_interval_ms == 0U)
-  {
-    nc_interval_ms = NC_UDP_INTERVAL_MS + (HAL_GetTick() % NC_UDP_JITTER_MAX_MS);
-    nc_last_tx_tick = HAL_GetTick(); /* don't send immediately on first IDLE entry */
-  }
-
-  /* Rate-limit: only transmit once per personalised interval. */
-  if (HAL_GetTick() - nc_last_tx_tick < nc_interval_ms)
-  {
-    return;
-  }
-  nc_last_tx_tick = HAL_GetTick();
+  PludosTelemetry_t pkt = {0};
+  struct mx_sockaddr_in dest = {0};
+  int32_t sent;
 
   if ((socket_id < 0) || (wifi_station_ready == 0U) || (jetson_ip[0] == 0))
   {
-    return;
+    return -1;
   }
-  if (hts221_initialized == 0U)
+
+  memcpy(pkt.shuttle_id, SHUTTLE_ID, sizeof(pkt.shuttle_id));
+  pkt.sequence_id   = current_packet_num;
+  pkt.tick_ms       = HAL_GetTick();
+  pkt.state         = (uint8_t)current_state;
+  pkt.accel_x       = vib_x;
+  pkt.accel_y       = vib_y;
+  pkt.accel_z       = vib_z;
+  pkt.temp_c        = cached_temp_c;
+  pkt.humidity_pct  = cached_humidity_pct;
+  pkt.pressure_hpa  = cached_pressure_hpa;
+  pkt.power_mw      = POWER_EstimateMilliwatts();
+
+  dest.sin_len         = sizeof(dest);
+  dest.sin_family      = MX_AF_INET;
+  dest.sin_port        = PLUDOS_HTONS(TELEMETRY_PORT);
+  dest.sin_addr.s_addr = (uint32_t)mx_aton_r(jetson_ip);
+
+  sent = MX_WIFI_Socket_sendto(wifi_obj, socket_id, (uint8_t *)&pkt, sizeof(pkt),
+                               0, (struct mx_sockaddr *)&dest, sizeof(dest));
+
+  if (sent == (int32_t)sizeof(pkt))
   {
-    return; /* sensor not available — drop rather than send stale placeholder */
+    current_packet_num++;
+    tx_count_window++;
   }
 
-  if (SENSOR_Humidity_Read(&hi2c2, &payload.temp_c, &payload.humidity_pct) != 0)
-  {
-    return; /* data not ready or I2C error — skip this cycle */
-  }
-
-  /* Identify the source shuttle so the gateway can correlate env data to a shuttle */
-  memcpy(payload.shuttle_id, SHUTTLE_ID, sizeof(payload.shuttle_id));
-  payload.sequence_id = current_packet_num;
-  payload.tick_ms     = HAL_GetTick();
-
-  /* Read pressure; stays 0.0f (sentinel = unavailable) if sensor not initialised or times out */
-  if (lps22hh_initialized != 0U)
-  {
-    (void)SENSOR_Pressure_Read(&hi2c2, &payload.pressure_hpa);
-  }
-
-  dest_addr.sin_len    = sizeof(dest_addr);
-  dest_addr.sin_family = MX_AF_INET;
-  dest_addr.sin_port   = PLUDOS_HTONS(JETSON_NC_PORT);  /* separate port — avoids collision with aiocoap on 5683 */
-  dest_addr.sin_addr.s_addr = (uint32_t)mx_aton_r(jetson_ip);
-
-  MX_WIFI_Socket_sendto(wifi_obj, socket_id, (uint8_t *)&payload, sizeof(payload),
-                        0, (struct mx_sockaddr *)&dest_addr, sizeof(dest_addr));
-
-  /* Confirm temperature transmission in the terminal so it is visible alongside /vib CoAP. */
-  sprintf(uart_buf, "[TX/NC-UDP] temp=%.1fC rh=%.1f%% pres=%.0fhPa → /temperature\r\n",
-          payload.temp_c, payload.humidity_pct, payload.pressure_hpa);
-  HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
-}
-
-static void NETWORK_ProcessBufferedSamples(void)
-{
-  /* Tracks how many samples were queued when this flush started — reset when done or WiFi drops. */
-  static uint16_t flush_start_count = 0U;
-  int32_t send_result;
-
-  if ((socket_id < 0) || (wifi_station_ready == 0U) || (sensor_buffer_count == 0U))
-  {
-    flush_start_count = 0U;
-    return;
-  }
-
-  if ((sensor_flush_requested == 0U) && (sensor_buffer_count < SENSOR_BUFFER_TRIGGER_COUNT))
-  {
-    return;
-  }
-
-  /* Log once at flush start so the terminal shows what triggered and how many samples. */
-  if (flush_start_count == 0U)
-  {
-    flush_start_count = sensor_buffer_count;
-    sprintf(uart_buf, "[TX/CoAP] Flushing %u samples → /vib\r\n", flush_start_count);
-    HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
-  }
-
-  send_result = COAP_SendBufferedBatch();
-
-  if ((send_result > 0) && (sensor_buffer_count == 0U))
-  {
-    /* Buffer fully drained — log once so the terminal shows mission-end clearly. */
-    flush_start_count = 0U;
-    sprintf(uart_buf, "[TX/CoAP] Flush done — /vib buffer empty\r\n");
-    HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
-  }
+  return sent;
 }
 
 /* Estimate total board power from datasheet current figures — no ADC wired (P2-2).
@@ -757,7 +409,7 @@ static float POWER_EstimateMilliwatts(void)
 
   if (wifi_station_ready != 0U)
   {
-    /* MOVING = 50 Hz CoAP burst TX; IDLE = occasional UDP only */
+    /* MOVING = 50 Hz UDP burst TX; IDLE = 1 Hz unified packet */
     current_ma += (current_state == STATE_MOVING) ? POWER_EST_WIFI_TX_MA
                                                   : POWER_EST_WIFI_ASSOC_MA;
   }
@@ -961,9 +613,8 @@ int main(void)
             {
               sprintf(uart_buf, "[NETWORK] UDP Socket created (ID: %ld)\r\n", (long)socket_id);
               HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
-              NETWORK_ConfigureUdpSocket(socket_id, COAP_ACK_TIMEOUT_MS);
-              sprintf(uart_buf, "[NETWORK] CoAP confirmable mode armed on udp://%s:%u/%s\r\n",
-                      jetson_ip, JETSON_PORT, COAP_URI_PATH);
+              sprintf(uart_buf, "[NETWORK] PludosTelemetry stream armed → udp://%s:%u\r\n",
+                      jetson_ip, (unsigned)TELEMETRY_PORT);
             }
             else
             {
@@ -1018,187 +669,183 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-      if ((wifi_obj != NULL) && (wifi_driver_initialized != 0U))
+
+    /* Drive MXCHIP IO so async events (STA_UP / STA_DOWN / IP changes) are processed. */
+    if ((wifi_obj != NULL) && (wifi_driver_initialized != 0U))
+    {
+      (void)MX_WIFI_IO_YIELD(wifi_obj, 1);
+    }
+
+    /* -----------------------------------------------------------------
+     * PHASE 1: refresh environmental cache (2 Hz, off the hot path)
+     * --------------------------------------------------------------- */
+    {
+      static uint32_t last_env_tick = 0U;
+      if ((HAL_GetTick() - last_env_tick) >= ENV_READ_PERIOD_MS)
       {
-        (void)MX_WIFI_IO_YIELD(wifi_obj, 1);
+        last_env_tick = HAL_GetTick();
+        TELEMETRY_RefreshEnvCache();
       }
+    }
 
-      // Memory Protection Logic
-      if (current_state == STATE_MOVING && sensor_buffer_count >= SENSOR_BUFFER_SUSPEND_COUNT) {
-          if (!suspend_sampling) {
-              suspend_sampling = 1U;
-              sprintf(uart_buf, "[BUFFER] CRITICAL: SRAM at 95%%! Suspending ADC/I2C sampling.\r\n");
-              HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
+    /* -----------------------------------------------------------------
+     * PHASE 2: read accelerometer, update FSM with debounce
+     * --------------------------------------------------------------- */
+    {
+      uint8_t raw[6] = {0};
+      float a_mag_g2 = 0.0f;
+      float deviation = 0.0f;
+
+      if (HAL_I2C_Mem_Read(&hi2c2, ISM330_ADDR, OUTX_L_A, 1, raw, 6, 100) == HAL_OK)
+      {
+        int16_t raw_x = (int16_t)((raw[1] << 8) | raw[0]);
+        int16_t raw_y = (int16_t)((raw[3] << 8) | raw[2]);
+        int16_t raw_z = (int16_t)((raw[5] << 8) | raw[4]);
+
+        vib_x = (raw_x * 0.061f) / 1000.0f;
+        vib_y = (raw_y * 0.061f) / 1000.0f;
+        vib_z = (raw_z * 0.061f) / 1000.0f;
+
+        a_mag_g2 = (vib_x * vib_x) + (vib_y * vib_y) + (vib_z * vib_z);
+        deviation = fabsf(a_mag_g2 - 1.0f);
+
+        /* Above threshold: refresh timestamps, advance dwell if in IDLE. */
+        if (deviation > MOVEMENT_THRESHOLD_G2)
+        {
+          last_above_threshold_tick = HAL_GetTick();
+          last_movement_tick        = HAL_GetTick();
+
+          if (current_state == STATE_IDLE)
+          {
+            if (continuous_movement_start_tick == 0U)
+            {
+              continuous_movement_start_tick = HAL_GetTick();
+              sprintf(uart_buf, "[FSM] Dwell start (IDLE) dev=%.3f\r\n", deviation);
+              HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+            }
+            else if ((HAL_GetTick() - continuous_movement_start_tick) >= MOVEMENT_DWELL_MS)
+            {
+              current_state                  = STATE_MOVING;
+              continuous_movement_start_tick = 0U;
+              sprintf(uart_buf, "[FSM] IDLE -> MOVING  (dwell %ums reached)\r\n",
+                      (unsigned)MOVEMENT_DWELL_MS);
+              HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+            }
           }
-      }
-
-      if (suspend_sampling) {
-          /* Buffer drains only on successful CoAP ACK (via SENSOR_BufferDrop),
-           * so empty-in-IDLE is equivalent to "IDLE + ACK received". */
-          /* Clearing only in IDLE caused a deadlock: the state machine is
-           * skipped while suspended, so it could never reach IDLE.
-           * Clear as soon as the buffer drains regardless of state. */
-          if (sensor_buffer_count == 0U) {
-              suspend_sampling = 0U;
-              sprintf(uart_buf, "[BUFFER] Buffer cleared. Resuming sampling.\r\n");
-              HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
+        }
+        else
+        {
+          /* Below threshold: only reset the dwell after MOVEMENT_DEBOUNCE_MS of quiet.
+           * A single noisy sample does not erase progress toward MOVING. */
+          if ((continuous_movement_start_tick != 0U) &&
+              ((HAL_GetTick() - last_above_threshold_tick) > MOVEMENT_DEBOUNCE_MS))
+          {
+            continuous_movement_start_tick = 0U;
           }
+
+          /* MOVING -> IDLE when no above-threshold sample for NO_MOVEMENT_TIMEOUT_MS. */
+          if (current_state == STATE_MOVING)
+          {
+            if ((HAL_GetTick() - last_movement_tick) > NO_MOVEMENT_TIMEOUT_MS)
+            {
+              current_state = STATE_IDLE;
+              sprintf(uart_buf, "[FSM] MOVING -> IDLE  (no movement %us)\r\n",
+                      (unsigned)(NO_MOVEMENT_TIMEOUT_MS / 1000U));
+              HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+            }
+          }
+        }
+      }
+      else
+      {
+        vib_x = 99.0f; vib_y = 99.0f; vib_z = 99.0f; /* sentinel; gateway can detect */
+        sprintf(uart_buf, "[SENSOR] ERROR: I2C accel read failed\r\n");
+        HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+      }
+      (void)a_mag_g2; /* suppress unused-warning when FSM branches don't read it directly */
+    }
+
+    /* -----------------------------------------------------------------
+     * PHASE 3: WiFi reconnect handling (non-blocking)
+     * --------------------------------------------------------------- */
+    {
+      static uint8_t reconnect_issued = 0U;
+
+      if ((wifi_station_ready == 0U) && (wifi_driver_initialized != 0U))
+      {
+        if (!reconnect_issued)
+        {
+          sprintf(uart_buf, "[NETWORK] STA_DOWN — reconnecting to '%s'\r\n", WIFI_SSID);
+          HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+          MX_WIFI_Connect(wifi_obj, WIFI_SSID, WIFI_PASSWORD, MX_WIFI_SEC_AUTO);
+          reconnect_issued = 1U;
+        }
+      }
+      else if (reconnect_issued)
+      {
+        reconnect_issued = 0U;
+        sprintf(uart_buf, "[NETWORK] Reconnected — recreating UDP socket\r\n");
+        HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+
+        /* MXCHIP invalidates all sockets on WiFi drop; recreate so telemetry resumes. */
+        if (socket_id >= 0)
+        {
+          (void)MX_WIFI_Socket_close(wifi_obj, socket_id);
+          socket_id = -1;
+        }
+        socket_id = MX_WIFI_Socket_create(wifi_obj, MX_AF_INET, MX_SOCK_DGRAM, MX_IPPROTO_UDP);
+        sprintf(uart_buf, socket_id >= 0
+                ? "[NETWORK] Socket recreated (ID: %ld)\r\n"
+                : "[NETWORK] WARNING: socket recreate failed (%ld)\r\n", (long)socket_id);
+        HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+      }
+    }
+
+    /* -----------------------------------------------------------------
+     * PHASE 4: transmit telemetry at the state-appropriate rate
+     *   MOVING: every loop iteration  (50 Hz)
+     *   IDLE:   every TX_PERIOD_IDLE_MS (1 Hz)
+     * --------------------------------------------------------------- */
+    {
+      uint8_t should_tx = 0U;
+      if (current_state == STATE_MOVING)
+      {
+        should_tx = 1U;
+      }
+      else if ((HAL_GetTick() - last_tx_tick) >= TX_PERIOD_IDLE_MS)
+      {
+        should_tx = 1U;
       }
 
-      /* In IDLE the state machine must run even when suspend_sampling=1
-       * (buffer was >=95% during MOVING). Without this, shakes after a
-       * long MOVING phase are missed until the buffer fully drains.
-       * Buffering is gated on STATE_MOVING && !suspend_sampling inside. */
-      if (!suspend_sampling || current_state == STATE_IDLE) {
-	      // -----------------------------------------------------------------
-	      // PHASE 1: SENSOR ACQUISITION
-	      // -----------------------------------------------------------------
-	      uint8_t raw_data[6] = {0};
-          float a_mag_g2 = 0.0f; // Acceleration magnitude squared in g
+      if (should_tx)
+      {
+        (void)TELEMETRY_Send();
+        last_tx_tick = HAL_GetTick();
+      }
+    }
 
-	      // Read accelerometer. Only update floats if I2C returns HAL_OK.
-	      if (HAL_I2C_Mem_Read(&hi2c2, ISM330_ADDR, OUTX_L_A, 1, raw_data, 6, 100) == HAL_OK)
-	      {
-		      int16_t raw_x = (int16_t)((raw_data[1] << 8) | raw_data[0]);
-		      int16_t raw_y = (int16_t)((raw_data[3] << 8) | raw_data[2]);
-		      int16_t raw_z = (int16_t)((raw_data[5] << 8) | raw_data[4]);
+    /* -----------------------------------------------------------------
+     * PHASE 5: per-second status log so the terminal shows live activity
+     * --------------------------------------------------------------- */
+    if ((HAL_GetTick() - tx_window_start_tick) >= 1000U)
+    {
+      const char *state_name = (current_state == STATE_MOVING) ? "MOVING" : "IDLE";
+      sprintf(uart_buf,
+              "[STREAM] %s tx=%lu/s accel=(%.2f,%.2f,%.2f)g temp=%.1fC hum=%.0f%% pres=%.1fhPa\r\n",
+              state_name, (unsigned long)tx_count_window,
+              vib_x, vib_y, vib_z,
+              cached_temp_c, cached_humidity_pct, cached_pressure_hpa);
+      HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+      tx_count_window      = 0U;
+      tx_window_start_tick = HAL_GetTick();
+    }
 
-		      vib_x = (raw_x * 0.061f) / 1000.0f;
-		      vib_y = (raw_y * 0.061f) / 1000.0f;
-		      vib_z = (raw_z * 0.061f) / 1000.0f;
-
-		      // --- STATE MACHINE LOGIC ---
-		      a_mag_g2 = (vib_x * vib_x) + (vib_y * vib_y) + (vib_z * vib_z);
-		      float deviation = fabsf(a_mag_g2 - 1.0f); // Deviation from 1g (gravity)
-
-		      if (deviation > MOVEMENT_THRESHOLD_G2) {
-			      if (current_state == STATE_IDLE) {
-                      if (continuous_movement_start_tick == 0) {
-                          continuous_movement_start_tick = HAL_GetTick();
-                          sprintf(uart_buf, "[STATE] Movement dwell started (IDLE)\r\n");
-                          HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
-                      } else if (HAL_GetTick() - continuous_movement_start_tick >= MOVEMENT_DWELL_MS) {
-				          sprintf(uart_buf, "[STATE] Continuous movement for 500ms! Switching to MOVING state.\r\n");
-				          HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
-				          current_state = STATE_MOVING;
-                          continuous_movement_start_tick = 0; // Reset
-			          }
-                  }
-			      last_movement_tick = HAL_GetTick();
-		      } else {
-                  continuous_movement_start_tick = 0; // Reset immediately if threshold drops
-			      if (current_state == STATE_MOVING) {
-				      if (HAL_GetTick() - last_movement_tick > NO_MOVEMENT_TIMEOUT_MS) {
-					      sprintf(uart_buf, "[STATE] No movement for %d seconds. Switching to IDLE state.\r\n", NO_MOVEMENT_TIMEOUT_MS / 1000);
-					      HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
-					      current_state   = STATE_IDLE;
-                          idle_entry_tick = HAL_GetTick();
-                          /* Jitter window: spread flushes across shuttles entering IDLE simultaneously */
-                          idle_jitter_ms  = HAL_GetTick() % IDLE_TRANSMIT_JITTER_MAX_MS;
-                          /* sensor_flush_requested armed by jitter check in PHASE 3 */
-				      }
-			      }
-		      }
-
-		      // -----------------------------------------------------------------
-		      // PHASE 2: RAM BUFFERING (only if sensor read was successful)
-		      // -----------------------------------------------------------------
-		      SensorSample_t sample = {0};
-
-		      sample.sequence_id = current_packet_num;
-		      sample.tick_ms     = HAL_GetTick();
-		      sample.power_mw    = POWER_EstimateMilliwatts(); /* datasheet estimate; real ADC in P2-2 */
-		      sample.accel_x     = vib_x;
-		      sample.accel_y     = vib_y;
-		      sample.accel_z     = vib_z;
-
-		      /* Only buffer during active missions — IDLE samples have no
-		       * mission value and cause a drip-CoAP loop blocking the sensor loop. */
-		      if ((current_state == STATE_MOVING) && (!suspend_sampling))
-		      {
-		          SENSOR_BufferPush(&sample);
-		          current_packet_num++;
-		      }
-	      }
-	      else
-	      {
-		      vib_x = 99.0f; vib_y = 99.0f; vib_z = 99.0f; // Hardware fault state
-		      sprintf(uart_buf, "[SENSOR] ERROR: I2C read failed\r\n");
-		      HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
-	      }
-      } // End of if (!suspend_sampling)
-
-	  // -----------------------------------------------------------------
-	  // PHASE 2.5: WIFI RECONNECT ON STA_DOWN (non-blocking)
-	  // -----------------------------------------------------------------
-	  /* Issue MX_WIFI_Connect once, then return immediately.  WIFI_StatusCallback
-	   * sets wifi_station_ready = 1 on MWIFI_EVENT_STA_GOT_IP; the event is
-	   * processed by MX_WIFI_IO_YIELD inside WIFI_DelayWithYield (10 ms slices)
-	   * so reconnect completes without blocking the sensor loop. */
-	  {
-	      static uint8_t reconnect_issued = 0U;
-
-	      if ((wifi_station_ready == 0U) && (wifi_driver_initialized != 0U))
-	      {
-	          if (!reconnect_issued)
-	          {
-	              sprintf(uart_buf, "[NETWORK] STA_DOWN — reconnecting to '%s'\r\n", WIFI_SSID);
-	              HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
-	              MX_WIFI_Connect(wifi_obj, WIFI_SSID, WIFI_PASSWORD, MX_WIFI_SEC_AUTO);
-	              reconnect_issued = 1U;
-	          }
-	          /* yield loop in PHASE 4 processes MXCHIP events; callback fires when IP is ready */
-	      }
-	      else if (reconnect_issued)
-	      {
-	          reconnect_issued = 0U;
-	          sprintf(uart_buf, "[NETWORK] Reconnected!\r\n");
-	          HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
-
-	          /* MXCHIP invalidates all sockets on WiFi drop; recreate so CoAP/UDP resume. */
-	          if (socket_id >= 0)
-	          {
-	              (void)MX_WIFI_Socket_close(wifi_obj, socket_id);
-	              socket_id = -1;
-	          }
-	          socket_id = MX_WIFI_Socket_create(wifi_obj, MX_AF_INET, MX_SOCK_DGRAM, MX_IPPROTO_UDP);
-	          if (socket_id >= 0)
-	          {
-	              NETWORK_ConfigureUdpSocket(socket_id, COAP_ACK_TIMEOUT_MS);
-	              sprintf(uart_buf, "[NETWORK] Socket recreated (ID: %ld)\r\n", (long)socket_id);
-	          }
-	          else
-	          {
-	              sprintf(uart_buf, "[NETWORK] WARNING: socket recreate failed after reconnect\r\n");
-	          }
-	          HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
-	      }
-	  }
-
-	  // -----------------------------------------------------------------
-	  // PHASE 3: COAP FLUSH WHEN BUFFER REACHES 70%
-	  // -----------------------------------------------------------------
-	  /* Arm the IDLE flush only once the per-shuttle jitter window has elapsed.
-	   * If MOVING is re-entered before the window expires, flush stays disarmed. */
-	  if ((current_state == STATE_IDLE) && (sensor_flush_requested == 0U) &&
-	      (sensor_buffer_count > 0U) &&
-	      (HAL_GetTick() - idle_entry_tick >= idle_jitter_ms))
-	  {
-	      sensor_flush_requested = 1U;
-	  }
-	  NETWORK_ProcessBufferedSamples();
-
-	  // -----------------------------------------------------------------
-	  // PHASE 4: STATE-BASED DELAY
-	  // -----------------------------------------------------------------
-	  if (current_state == STATE_MOVING) {
-		  WIFI_DelayWithYield(MOVING_SAMPLE_DELAY_MS);
-	  } else {
-          UDP_SendNonCritical();
-          /* Drain at 50 Hz while buffer is non-empty (recover from near-full
-           * MOVING phase in seconds not minutes). 2 Hz once buffer is clear. */
-		  WIFI_DelayWithYield(sensor_buffer_count > 0U ? MOVING_SAMPLE_DELAY_MS : IDLE_SAMPLE_DELAY_MS);
-	  }
+    /* -----------------------------------------------------------------
+     * PHASE 6: state-appropriate loop delay
+     * --------------------------------------------------------------- */
+    WIFI_DelayWithYield(current_state == STATE_MOVING
+                        ? SAMPLE_PERIOD_MOVING_MS
+                        : SAMPLE_PERIOD_IDLE_MS);
   }
   /* USER CODE END 3 */
 }

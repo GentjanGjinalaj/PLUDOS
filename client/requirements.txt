@@ -2,10 +2,9 @@
 # Use loose pins (>=) so pip resolves the latest wheel available for aarch64/py3.10.
 # To regenerate a locked file: pip freeze > requirements.txt  (with Jetson venv active)
 #
-# data-engine.py needs: aiocoap, influxdb-client, pandas, pyarrow
+# data-engine.py needs: influxdb-client, pandas, pyarrow (raw UDP only since ADR-015)
 # client.py needs:      flwr, xgboost, numpy, scikit-learn, grpcio
 #
-aiocoap>=0.4,<0.5
 influxdb-client>=1.36
 pandas>=2.1
 pyarrow>=14.0
