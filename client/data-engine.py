@@ -1,10 +1,15 @@
 """
-PLUDOS Edge Gateway: Data Engine (ADR-015 unified-stream rewrite)
------------------------------------------------------------------
+PLUDOS Edge Gateway: Data Engine (ADR-015 v2 — compact 28-byte stream)
+-----------------------------------------------------------------------
 Listens on a single raw UDP socket:
   - UDP 5683: PludosTelemetry packets from each STM32 shuttle
-    (47 bytes — accel xyz + temp/humidity/pressure + power_mw + state)
+    (28 bytes — uint8 id + seq + tick + state + accel xyz + temp + humidity)
     See `docs/wire_protocol.md §1`.
+
+pressure_hpa and power_mw are no longer on the wire. Power is derived from
+state (POWER_IDLE_MW / POWER_MOVING_MW env vars). Parquet files are enriched
+at flush time with power_mw, accel_magnitude_g, and shuttle_name — zero
+per-packet overhead for the enrichment.
 
 Every incoming packet is appended to that shuttle's in-memory buffer. A
 mission is delimited by the `state` field: when a shuttle has been
@@ -48,13 +53,13 @@ TEST_MODE       = os.getenv("TEST_MODE") == "1"
 TELEMETRY_PORT  = int(os.getenv("TELEMETRY_PORT", os.getenv("COAP_PORT", "5683")))
 
 # Per-shuttle buffer limits (independent of other shuttles).
-# At 50 Hz MOVING: SHUTTLE_SOFT_LIMIT=400 → proactive flush after 8 s,
-# SHUTTLE_HARD_LIMIT=600 → emergency flush after 12 s.
-SHUTTLE_SOFT_LIMIT = int(os.getenv("SHUTTLE_SOFT_LIMIT", "400"))
-SHUTTLE_HARD_LIMIT = int(os.getenv("SHUTTLE_HARD_LIMIT", "600"))
+# At 50 Hz MOVING: SHUTTLE_SOFT_LIMIT=1000 → proactive flush after 20 s,
+# SHUTTLE_HARD_LIMIT=1500 → emergency flush after 30 s.
+SHUTTLE_SOFT_LIMIT = int(os.getenv("SHUTTLE_SOFT_LIMIT", "1000"))
+SHUTTLE_HARD_LIMIT = int(os.getenv("SHUTTLE_HARD_LIMIT", "1500"))
 
 # Emergency safety ceiling across the entire gateway (all shuttles combined).
-# At 47 bytes/packet and 8 GB Jetson RAM, 50 000 packets ≈ 2.4 MB.
+# At 28 bytes/packet and 8 GB Jetson RAM, 50 000 packets ≈ 1.4 MB.
 GATEWAY_HARD_LIMIT = int(os.getenv("GATEWAY_HARD_LIMIT", "50000"))
 
 if SHUTTLE_HARD_LIMIT <= SHUTTLE_SOFT_LIMIT:
@@ -111,20 +116,42 @@ STATE_MOVING = 1
 # Wire format — must match wire_protocol.md §1 exactly.
 # ---------------------------------------------------------------------------
 
-# Packed (47 bytes): firmware built with __attribute__((packed)) or #pragma pack(push,1).
-TELEMETRY_FMT_PACKED  = "<12sHIBfffffff"
-TELEMETRY_SIZE_PACKED = struct.calcsize(TELEMETRY_FMT_PACKED)
-assert TELEMETRY_SIZE_PACKED == 47, f"packed fmt must be 47, got {TELEMETRY_SIZE_PACKED}"
+# 28-byte compact format (ADR-015 v2): id(1)+seq(2)+tick(4)+state(1)+ax/ay/az/temp/hum(5×4=20)
+TELEMETRY_FMT  = "<BHIBfffff"
+TELEMETRY_SIZE = struct.calcsize(TELEMETRY_FMT)
+assert TELEMETRY_SIZE == 28, f"telemetry fmt must be 28 bytes, got {TELEMETRY_SIZE}"
 
-# Natural alignment (52 bytes): ARM GCC adds 2 bytes pad before tick_ms and
-# 3 bytes pad before accel_x when pragma pack is not honored by the IDE build.
-TELEMETRY_FMT_NATURAL  = "<12sH2xIB3xfffffff"
-TELEMETRY_SIZE_NATURAL = struct.calcsize(TELEMETRY_FMT_NATURAL)
-assert TELEMETRY_SIZE_NATURAL == 52, f"natural fmt must be 52, got {TELEMETRY_SIZE_NATURAL}"
+# ---------------------------------------------------------------------------
+# Shuttle identity — maps the 1-byte wire ID to a human-readable name.
+# Set SHUTTLE_NAMES="1:STM32-Alpha,2:STM32-Beta" in .env to override.
+# ---------------------------------------------------------------------------
 
-VALID_TELEMETRY_SIZES = {TELEMETRY_SIZE_PACKED, TELEMETRY_SIZE_NATURAL}
-# Canonical size after firmware is reflashed with __attribute__((packed))
-TELEMETRY_SIZE = TELEMETRY_SIZE_PACKED
+def _parse_shuttle_names(env_val: str) -> dict[int, str]:
+    # Parse "1:Name-A,2:Name-B" → {1: "Name-A", 2: "Name-B"}
+    result: dict[int, str] = {}
+    for entry in env_val.split(","):
+        entry = entry.strip()
+        if ":" in entry:
+            num, name = entry.split(":", 1)
+            try:
+                result[int(num)] = name.strip()
+            except ValueError:
+                pass
+    return result
+
+SHUTTLE_NAMES: dict[int, str] = _parse_shuttle_names(
+    os.getenv("SHUTTLE_NAMES", "1:STM32-Alpha,2:STM32-Beta")
+)
+
+# ---------------------------------------------------------------------------
+# Power constants — used to derive power_mw and integrate energy on gateway.
+# Firmware no longer transmits power. Calibrate with a bench ammeter.
+# IDLE  ≈ (MCU 15mA + sensors 2mA + WiFi assoc 10mA) × 3.3V = 89 mW (confirmed).
+# MOVING ≈ depends on WiFi TX duty at 50 Hz; needs measurement. Default is a rough estimate.
+# ---------------------------------------------------------------------------
+
+POWER_IDLE_MW   = float(os.getenv("POWER_IDLE_MW",   "89"))
+POWER_MOVING_MW = float(os.getenv("POWER_MOVING_MW", "260"))
 
 # ---------------------------------------------------------------------------
 # Mutable gateway state — per-shuttle dicts, single-threaded asyncio.
@@ -169,7 +196,7 @@ _tx_rate_window: dict[str, int] = {}
 # ---------------------------------------------------------------------------
 
 def _flush(buf: list[dict], prefix: str) -> None:
-    """Sort by (shuttle_id, sequence_monotonic) and write atomic Parquet; clears buf."""
+    """Sort by (shuttle_id, sequence_monotonic), enrich with derived columns, write atomic Parquet."""
     if not buf:
         return
     df = pd.json_normalize(buf)
@@ -179,6 +206,22 @@ def _flush(buf: list[dict], prefix: str) -> None:
         df.sort_values(by=sort_cols, inplace=True)
     else:
         df.sort_values(by=["header.shuttle_id", "header.sequence_id"], inplace=True)
+
+    # Enrich once at flush — no per-packet overhead on the hot path.
+    if "status.state" in df.columns:
+        # Derive power from state so Parquet consumers don't need the env constants.
+        df["energy.power_mw"] = df["status.state"].apply(
+            lambda s: POWER_MOVING_MW if s == STATE_MOVING else POWER_IDLE_MW
+        )
+    if all(c in df.columns for c in ("sensors.accel_x", "sensors.accel_y", "sensors.accel_z")):
+        # Scalar vibration proxy: |a| includes gravity DC; subtract 1g on dominant axis
+        # for a cleaner estimate, but that requires orientation calibration.
+        # For now, magnitude gives a useful anomaly indicator without calibration.
+        df["sensors.accel_magnitude_g"] = (
+            df["sensors.accel_x"] ** 2
+            + df["sensors.accel_y"] ** 2
+            + df["sensors.accel_z"] ** 2
+        ).pow(0.5)
 
     ts        = int(time.time())
     file_path = os.path.join(BUFFER_DIR, f"{prefix}_{ts}.parquet")
@@ -225,36 +268,27 @@ def _write_mission_summary(
 
 
 def _unpack_telemetry(raw: bytes) -> dict:
-    """Unpack a PludosTelemetry packet (47 or 52 bytes) into a labelled dict.
-    52-byte variant: natural ARM alignment without __attribute__((packed)).
-    Wire sentinels (-999.0 °C, 0.0 hPa) are converted to NaN so downstream ML treats
-    them as missing rather than real readings."""
-    if len(raw) == TELEMETRY_SIZE_PACKED:
-        fmt = TELEMETRY_FMT_PACKED
-    elif len(raw) == TELEMETRY_SIZE_NATURAL:
-        fmt = TELEMETRY_FMT_NATURAL
-    else:
-        raise struct.error(f"unexpected size {len(raw)}, expected 47 or 52")
-    sid, seq, tick, state, ax, ay, az, temp, hum, pres, pwr = struct.unpack(fmt, raw)
+    """Unpack a 28-byte PludosTelemetry packet into a labelled dict.
+    Wire sentinel -999.0 °C converted to NaN so downstream ML treats it as missing."""
+    sid_int, seq, tick, state, ax, ay, az, temp, hum = struct.unpack(TELEMETRY_FMT, raw)
 
-    # Sentinel decoding: see wire_protocol.md §1 field notes.
+    shuttle_name = SHUTTLE_NAMES.get(sid_int, f"shuttle-{sid_int}")
+    # Sentinel decoding: -999.0 °C means HTS221 unavailable; humidity is also invalid then.
     temp_out = float("nan") if temp == -999.0 else temp
     hum_out  = float("nan") if temp == -999.0 else hum
-    pres_out = float("nan") if pres ==    0.0 else pres
 
     return {
-        "header.shuttle_id":  sid.decode("utf-8").rstrip("\x00"),
-        "header.sequence_id": seq,
-        "status.tick_ms":     tick,
-        "status.state":       int(state),         # 0 = IDLE, 1 = MOVING
-        "status.is_moving":   bool(state == STATE_MOVING),
-        "sensors.accel_x":    ax,
-        "sensors.accel_y":    ay,
-        "sensors.accel_z":    az,
-        "env.temp_c":         temp_out,
-        "env.humidity_pct":   hum_out,
-        "env.pressure_hpa":   pres_out,
-        "energy.power_mw":    pwr,
+        "header.shuttle_id":   sid_int,       # raw integer (1, 2, …) — compact sort key
+        "header.shuttle_name": shuttle_name,  # human-readable; used as per-shuttle dict key
+        "header.sequence_id":  seq,
+        "status.tick_ms":      tick,
+        "status.state":        int(state),    # 0 = IDLE, 1 = MOVING
+        "status.is_moving":    bool(state == STATE_MOVING),
+        "sensors.accel_x":     ax,
+        "sensors.accel_y":     ay,
+        "sensors.accel_z":     az,
+        "env.temp_c":          temp_out,
+        "env.humidity_pct":    hum_out,
     }
 
 
@@ -299,9 +333,9 @@ class TelemetryProtocol(asyncio.DatagramProtocol):
     """Single-port asyncio datagram handler for PludosTelemetry from all shuttles."""
 
     def datagram_received(self, data: bytes, addr) -> None:
-        if len(data) not in VALID_TELEMETRY_SIZES:
+        if len(data) != TELEMETRY_SIZE:
             logger.debug(
-                "Telemetry: bad size %d from %s (expected 47 or 52)", len(data), addr
+                "Telemetry: bad size %d from %s (expected %d)", len(data), addr, TELEMETRY_SIZE
             )
             return
 
@@ -311,11 +345,12 @@ class TelemetryProtocol(asyncio.DatagramProtocol):
             logger.warning("Telemetry unpack error from %s: %s", addr, exc)
             return
 
-        shuttle_id  = pkt["header.shuttle_id"]
+        shuttle_id  = pkt["header.shuttle_name"]  # string key for all per-shuttle dicts
         sequence_id = pkt["header.sequence_id"]
         tick_ms     = pkt["status.tick_ms"]
         state       = pkt["status.state"]
-        power_mw    = pkt["energy.power_mw"]
+        # Derive power from state — not transmitted on the wire (ADR-015 v2).
+        power_mw    = POWER_MOVING_MW if state == STATE_MOVING else POWER_IDLE_MW
 
         receipt_ms = int(time.time() * 1000)
         now        = time.monotonic()
@@ -433,20 +468,19 @@ async def _status_log_task() -> None:
             _tx_rate_window[sid] = 0
             state_name = "MOVING" if sample["status.state"] == STATE_MOVING else "IDLE"
 
-            temp = sample["env.temp_c"]
-            hum  = sample["env.humidity_pct"]
-            pres = sample["env.pressure_hpa"]
+            temp   = sample["env.temp_c"]
+            hum    = sample["env.humidity_pct"]
             energy = _mission_energy_j.get(sid, 0.0)
+            pwr    = POWER_MOVING_MW if sample["status.state"] == STATE_MOVING else POWER_IDLE_MW
 
             logger.info(
                 "[%s] %s %.1fHz seq=%d accel=(%.2f,%.2f,%.2f)g "
-                "temp=%s°C hum=%s%% pres=%s hPa pwr=%.0fmW e=%.2fJ",
+                "temp=%s°C hum=%s%% pwr=%.0fmW e=%.2fJ",
                 sid, state_name, rate, sample["header.sequence_id"],
                 sample["sensors.accel_x"], sample["sensors.accel_y"], sample["sensors.accel_z"],
                 "n/a" if math.isnan(temp) else f"{temp:.1f}",
                 "n/a" if math.isnan(hum)  else f"{hum:.0f}",
-                "n/a" if math.isnan(pres) else f"{pres:.1f}",
-                sample["energy.power_mw"], energy,
+                pwr, energy,
             )
 
 
@@ -503,9 +537,9 @@ async def _broadcast_beacon() -> None:
 
 async def main() -> None:
     logger.info(
-        "PLUDOS Data Engine (ADR-015) starting | TEST_MODE=%s | UDP=%d | "
-        "shuttle soft=%d hard=%d | gateway hard=%d | mission_end_idle=%.0fs | dir=%s",
-        TEST_MODE, TELEMETRY_PORT,
+        "PLUDOS Data Engine (ADR-015 v2) starting | TEST_MODE=%s | UDP=%d | "
+        "pkt=%dB | shuttle soft=%d hard=%d | gateway hard=%d | mission_end_idle=%.0fs | dir=%s",
+        TEST_MODE, TELEMETRY_PORT, TELEMETRY_SIZE,
         SHUTTLE_SOFT_LIMIT, SHUTTLE_HARD_LIMIT, GATEWAY_HARD_LIMIT,
         MISSION_END_IDLE_S, BUFFER_DIR,
     )
