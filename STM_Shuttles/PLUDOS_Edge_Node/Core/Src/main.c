@@ -69,9 +69,11 @@ typedef struct {
 /* Beacon discovery — STM32 listens for "PLUDOS-GW:<ip>" UDP broadcasts from the gateway.
  * BEACON_TIMEOUT_MS: per-attempt recv timeout passed to MX_SO_RCVTIMEO (milliseconds).
  * BEACON_MAX_RETRIES x BEACON_TIMEOUT_MS gives the total wait ceiling before fallback. */
-#define BEACON_PORT        5000U  /* must match BEACON_PORT in data-engine.py / .env */
-#define BEACON_TIMEOUT_MS  3000   /* ms per recvfrom attempt */
-#define BEACON_MAX_RETRIES 10U    /* 10 x 3 s = 30 s max; gateway beacons every 10 s */
+#define BEACON_PORT             5000U  /* must match BEACON_PORT in data-engine.py / .env */
+#define BEACON_TIMEOUT_MS       3000   /* per-attempt timeout at boot (patient) */
+#define BEACON_MAX_RETRIES      10U    /* 10 x 3 s = 30 s max; gateway beacons every 10 s */
+#define BEACON_RETRY_TIMEOUT_MS  500   /* per-attempt timeout for in-loop quick checks */
+#define BEACON_RETRY_PERIOD_MS  30000U /* how often the main loop re-checks for a beacon */
 
 /* USER CODE END PD */
 
@@ -359,17 +361,17 @@ static void TELEMETRY_RefreshEnvCache(void)
   }
 }
 
-/* Listen on BEACON_PORT for a "PLUDOS-GW:<ip>" UDP broadcast from the gateway.
- * Opens a temporary socket, waits up to BEACON_MAX_RETRIES x BEACON_TIMEOUT_MS ms.
- * Returns 1 and sets jetson_ip on success; 0 on timeout (caller falls back to JETSON_IP). */
-static uint8_t BEACON_Discover(void)
+/* Listen on BEACON_PORT for a "PLUDOS-GW:<ip>" broadcast from the gateway.
+ * retries: how many recvfrom attempts before giving up.
+ * timeout_ms: per-attempt recv timeout (passed to MX_SO_RCVTIMEO).
+ * On success, sets jetson_ip and returns 1. On timeout, returns 0 without touching jetson_ip. */
+static uint8_t BEACON_Run(uint8_t retries, int32_t timeout_ms)
 {
   int32_t               bsock;
   struct mx_sockaddr_in baddr  = {0};
   struct mx_sockaddr_in sender = {0};
   uint32_t              fromlen;
   uint8_t               buf[32] = {0};
-  int32_t               timeout  = BEACON_TIMEOUT_MS;
   int32_t               n;
   uint8_t               attempt;
 
@@ -394,15 +396,14 @@ static uint8_t BEACON_Discover(void)
     return 0U;
   }
 
-  /* Per-attempt recv timeout so we can log progress without blocking forever. */
   (void)MX_WIFI_Socket_setsockopt(wifi_obj, bsock, MX_SOL_SOCKET, MX_SO_RCVTIMEO,
-                                  &timeout, sizeof(timeout));
+                                  &timeout_ms, sizeof(timeout_ms));
 
-  sprintf(uart_buf, "[BEACON] Waiting for gateway on UDP %u (max %u x %d ms)...\r\n",
-          (unsigned)BEACON_PORT, (unsigned)BEACON_MAX_RETRIES, BEACON_TIMEOUT_MS);
+  sprintf(uart_buf, "[BEACON] Listening on UDP %u (%u x %ld ms)...\r\n",
+          (unsigned)BEACON_PORT, (unsigned)retries, (long)timeout_ms);
   HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
 
-  for (attempt = 0U; attempt < BEACON_MAX_RETRIES; attempt++)
+  for (attempt = 0U; attempt < retries; attempt++)
   {
     fromlen = sizeof(sender);
     memset(buf, 0, sizeof(buf));
@@ -421,9 +422,12 @@ static uint8_t BEACON_Discover(void)
       return 1U;
     }
 
-    sprintf(uart_buf, "[BEACON] No beacon yet (attempt %u/%u)\r\n",
-            (unsigned)(attempt + 1U), (unsigned)BEACON_MAX_RETRIES);
-    HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+    if (retries > 1U) /* suppress noisy log on single-shot quick checks */
+    {
+      sprintf(uart_buf, "[BEACON] No beacon yet (attempt %u/%u)\r\n",
+              (unsigned)(attempt + 1U), (unsigned)retries);
+      HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+    }
   }
 
   (void)MX_WIFI_Socket_close(wifi_obj, bsock);
@@ -655,9 +659,10 @@ int main(void)
                     ip_addr[0], ip_addr[1], ip_addr[2], ip_addr[3]);
             HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
 
-            /* Zero-touch provisioning: discover the gateway IP from its UDP beacon.
-             * Falls back to JETSON_IP (wifi_credentials.h) if no beacon arrives. */
-            if (BEACON_Discover() == 0U)
+            /* Try beacon first; fall back to JETSON_IP if the Jetson is not yet reachable.
+             * The main loop retries the beacon every BEACON_RETRY_PERIOD_MS (IDLE only),
+             * so a late-starting Jetson is picked up automatically without a reflash. */
+            if (BEACON_Run(BEACON_MAX_RETRIES, BEACON_TIMEOUT_MS) == 0U)
             {
               strcpy(jetson_ip, JETSON_IP);
               sprintf(uart_buf, "[BEACON] Timed out — fallback IP: %s\r\n", JETSON_IP);
@@ -854,6 +859,32 @@ int main(void)
                 ? "[NETWORK] Socket recreated (ID: %ld)\r\n"
                 : "[NETWORK] WARNING: socket recreate failed (%ld)\r\n", (long)socket_id);
         HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+
+        /* Network may have changed (different AP, new DHCP lease) — rediscover Jetson IP.
+         * Clear jetson_ip first so TELEMETRY_Send suppresses TX during the search. */
+        jetson_ip[0] = 0;
+        if (BEACON_Run(BEACON_MAX_RETRIES, BEACON_TIMEOUT_MS) == 0U)
+        {
+          strcpy(jetson_ip, JETSON_IP);
+          sprintf(uart_buf, "[BEACON] No beacon after reconnect — fallback IP: %s\r\n", JETSON_IP);
+          HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+        }
+      }
+    }
+
+    /* -----------------------------------------------------------------
+     * PHASE 3b: periodic beacon re-check (IDLE only, every BEACON_RETRY_PERIOD_MS)
+     * Picks up a late-starting Jetson or an IP change without requiring a reflash.
+     * Skipped during MOVING to avoid a 500 ms pause in the 50 Hz stream.
+     * On success: jetson_ip updated immediately. On miss: existing IP kept as-is.
+     * --------------------------------------------------------------- */
+    if (current_state == STATE_IDLE)
+    {
+      static uint32_t last_beacon_retry_tick = 0U;
+      if ((HAL_GetTick() - last_beacon_retry_tick) >= BEACON_RETRY_PERIOD_MS)
+      {
+        last_beacon_retry_tick = HAL_GetTick();
+        (void)BEACON_Run(1U, BEACON_RETRY_TIMEOUT_MS);
       }
     }
 
