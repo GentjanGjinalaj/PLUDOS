@@ -36,25 +36,23 @@
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 
-/* 47-byte unified telemetry payload (ADR-015 / wire_protocol.md §1).
- * Sent as raw UDP to JETSON_IP:5683. Every packet carries the full sensor set.
- * __attribute__((packed)) eliminates ARM natural-alignment padding (2 bytes before
- * tick_ms, 3 bytes before accel_x) that would otherwise produce a 52-byte struct.
- * Python unpack: struct.unpack('<12sHIBfffffff', data) */
+/* 28-byte unified telemetry payload (ADR-015 v2 / wire_protocol.md §1).
+ * pressure_hpa removed — LPS22HH absent on this board; power_mw removed — gateway
+ * derives it from state using POWER_IDLE_MW / POWER_MOVING_MW env vars.
+ * shuttle_id shrunk from char[12] to uint8_t: 1 = STM32-Alpha, 2 = STM32-Beta, …
+ * Python unpack: struct.unpack('<BHIBfffff', data) */
 #pragma pack(push, 1)
 typedef struct {
-  char     shuttle_id[12];  /* null-padded ASCII, identifies the shuttle           */
-  uint16_t sequence_id;     /* monotonic per-shuttle, wraps at 65535                */
-  uint32_t tick_ms;         /* HAL_GetTick() at sample time                         */
-  uint8_t  state;           /* 0 = STATE_IDLE, 1 = STATE_MOVING                     */
-  float    accel_x;         /* g, ISM330 X axis                                     */
-  float    accel_y;         /* g, ISM330 Y axis                                     */
-  float    accel_z;         /* g, ISM330 Z axis                                     */
-  float    temp_c;          /* HTS221 °C; -999.0 = sensor unavailable               */
-  float    humidity_pct;    /* HTS221 %RH 0–100; 0.0 if temp sentinel               */
-  float    pressure_hpa;    /* LPS22HH hPa; 0.0 = sensor unavailable                */
-  float    power_mw;        /* board-level estimate, ±40% (ADR-011 placeholder)     */
-} __attribute__((packed)) PludosTelemetry_t;   /* total: 47 bytes                   */
+  uint8_t  shuttle_id;      /* 1-based integer; gateway maps to name via SHUTTLE_NAMES */
+  uint16_t sequence_id;     /* monotonic per-shuttle, wraps at 65535                    */
+  uint32_t tick_ms;         /* HAL_GetTick() at sample time                             */
+  uint8_t  state;           /* 0 = STATE_IDLE, 1 = STATE_MOVING                         */
+  float    accel_x;         /* g, ISM330 X axis — raw signal; AC content = vibration    */
+  float    accel_y;         /* g, ISM330 Y axis                                          */
+  float    accel_z;         /* g, ISM330 Z axis                                          */
+  float    temp_c;          /* HTS221 °C; -999.0 = sensor unavailable                   */
+  float    humidity_pct;    /* HTS221 %RH 0–100; 0.0 if temp sentinel                   */
+} __attribute__((packed)) PludosTelemetry_t;   /* total: 28 bytes                        */
 #pragma pack(pop)
 
 /* USER CODE END PTD */
@@ -62,15 +60,18 @@ typedef struct {
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 
-/* State-based power estimation constants for POWER_EstimateMilliwatts().
- * Source: STM32U585 DS13259 §6.3.7 Table 31 (160 MHz LDO run, 3.3V, 25°C).
- *         MXCHIP EMW3080 datasheet §5.2 (802.11n HT20, 3.3V supply).
- * These are conservative mid-range figures. Calibrate with a bench ammeter if precision matters. */
-#define POWER_EST_MCU_RUN_MA        15.0f   /* STM32U585 run mode @ 160 MHz */
-#define POWER_EST_SENSORS_MA         2.0f   /* ISM330 + HTS221 + LPS22HH on I2C2 */
-#define POWER_EST_WIFI_ASSOC_MA     10.0f   /* MXCHIP associated, no active TX */
-#define POWER_EST_WIFI_TX_MA       200.0f   /* MXCHIP burst TX (802.11n MCS5) */
-#define POWER_EST_VDD_MV          3300.0f   /* 3.3V board rail */
+/* Power figures have moved to the gateway (POWER_IDLE_MW / POWER_MOVING_MW env vars).
+ * Reference values for calibration (STM32U585 DS13259 §6.3.7 + EMW3080 §5.2):
+ *   IDLE  = (MCU 15mA + sensors 2mA + WiFi assoc 10mA) × 3.3V ≈  89 mW
+ *   MOVING = (MCU 15mA + sensors 2mA + WiFi TX ~200mA) × 3.3V ≈ 716 mW (peak burst)
+ * Actual average MOVING power depends on 50 Hz TX duty cycle; measure with bench ammeter. */
+
+/* Beacon discovery — STM32 listens for "PLUDOS-GW:<ip>" UDP broadcasts from the gateway.
+ * BEACON_TIMEOUT_MS: per-attempt recv timeout passed to MX_SO_RCVTIMEO (milliseconds).
+ * BEACON_MAX_RETRIES x BEACON_TIMEOUT_MS gives the total wait ceiling before fallback. */
+#define BEACON_PORT        5000U  /* must match BEACON_PORT in data-engine.py / .env */
+#define BEACON_TIMEOUT_MS  3000   /* ms per recvfrom attempt */
+#define BEACON_MAX_RETRIES 10U    /* 10 x 3 s = 30 s max; gateway beacons every 10 s */
 
 /* USER CODE END PD */
 
@@ -192,7 +193,6 @@ static MX_WIFI_STATUS_T WIFI_WaitForStationIP(uint8_t ip_addr[4], uint32_t timeo
 static void WIFI_DelayWithYield(uint32_t delay_ms);
 static void TELEMETRY_RefreshEnvCache(void);
 static int32_t TELEMETRY_Send(void);
-static float POWER_EstimateMilliwatts(void);
 
 /* USER CODE END PFP */
 
@@ -359,6 +359,77 @@ static void TELEMETRY_RefreshEnvCache(void)
   }
 }
 
+/* Listen on BEACON_PORT for a "PLUDOS-GW:<ip>" UDP broadcast from the gateway.
+ * Opens a temporary socket, waits up to BEACON_MAX_RETRIES x BEACON_TIMEOUT_MS ms.
+ * Returns 1 and sets jetson_ip on success; 0 on timeout (caller falls back to JETSON_IP). */
+static uint8_t BEACON_Discover(void)
+{
+  int32_t               bsock;
+  struct mx_sockaddr_in baddr  = {0};
+  struct mx_sockaddr_in sender = {0};
+  uint32_t              fromlen;
+  uint8_t               buf[32] = {0};
+  int32_t               timeout  = BEACON_TIMEOUT_MS;
+  int32_t               n;
+  uint8_t               attempt;
+
+  bsock = MX_WIFI_Socket_create(wifi_obj, MX_AF_INET, MX_SOCK_DGRAM, MX_IPPROTO_UDP);
+  if (bsock < 0)
+  {
+    sprintf(uart_buf, "[BEACON] Socket create failed\r\n");
+    HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+    return 0U;
+  }
+
+  baddr.sin_len         = sizeof(baddr);
+  baddr.sin_family      = MX_AF_INET;
+  baddr.sin_port        = PLUDOS_HTONS(BEACON_PORT);
+  baddr.sin_addr.s_addr = 0U; /* INADDR_ANY */
+
+  if (MX_WIFI_Socket_bind(wifi_obj, bsock, (struct mx_sockaddr *)&baddr, sizeof(baddr)) != MX_WIFI_STATUS_OK)
+  {
+    sprintf(uart_buf, "[BEACON] Bind on port %u failed\r\n", (unsigned)BEACON_PORT);
+    HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+    (void)MX_WIFI_Socket_close(wifi_obj, bsock);
+    return 0U;
+  }
+
+  /* Per-attempt recv timeout so we can log progress without blocking forever. */
+  (void)MX_WIFI_Socket_setsockopt(wifi_obj, bsock, MX_SOL_SOCKET, MX_SO_RCVTIMEO,
+                                  &timeout, sizeof(timeout));
+
+  sprintf(uart_buf, "[BEACON] Waiting for gateway on UDP %u (max %u x %d ms)...\r\n",
+          (unsigned)BEACON_PORT, (unsigned)BEACON_MAX_RETRIES, BEACON_TIMEOUT_MS);
+  HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+
+  for (attempt = 0U; attempt < BEACON_MAX_RETRIES; attempt++)
+  {
+    fromlen = sizeof(sender);
+    memset(buf, 0, sizeof(buf));
+    n = MX_WIFI_Socket_recvfrom(wifi_obj, bsock, buf, (int32_t)(sizeof(buf) - 1U),
+                                0, (struct mx_sockaddr *)&sender, &fromlen);
+
+    /* "PLUDOS-GW:" prefix is 10 chars; shortest valid IP suffix is 7 ("1.2.3.4"). */
+    if ((n > 10) && (strncmp((char *)buf, "PLUDOS-GW:", 10) == 0))
+    {
+      buf[n] = 0U; /* null-terminate after the IP portion */
+      strncpy(jetson_ip, (char *)buf + 10, sizeof(jetson_ip) - 1U);
+      jetson_ip[sizeof(jetson_ip) - 1U] = 0;
+      sprintf(uart_buf, "[BEACON] Gateway found: %s\r\n", jetson_ip);
+      HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+      (void)MX_WIFI_Socket_close(wifi_obj, bsock);
+      return 1U;
+    }
+
+    sprintf(uart_buf, "[BEACON] No beacon yet (attempt %u/%u)\r\n",
+            (unsigned)(attempt + 1U), (unsigned)BEACON_MAX_RETRIES);
+    HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+  }
+
+  (void)MX_WIFI_Socket_close(wifi_obj, bsock);
+  return 0U;
+}
+
 /* Send one PludosTelemetry packet via raw UDP. Fire-and-forget — no ACK, no retry.
  * Returns the byte count written by sendto, or -1 if socket/WiFi is not ready. */
 static int32_t TELEMETRY_Send(void)
@@ -372,7 +443,7 @@ static int32_t TELEMETRY_Send(void)
     return -1;
   }
 
-  memcpy(pkt.shuttle_id, SHUTTLE_ID, sizeof(pkt.shuttle_id));
+  pkt.shuttle_id    = SHUTTLE_ID;
   pkt.sequence_id   = current_packet_num;
   pkt.tick_ms       = HAL_GetTick();
   pkt.state         = (uint8_t)current_state;
@@ -381,8 +452,6 @@ static int32_t TELEMETRY_Send(void)
   pkt.accel_z       = vib_z;
   pkt.temp_c        = cached_temp_c;
   pkt.humidity_pct  = cached_humidity_pct;
-  pkt.pressure_hpa  = cached_pressure_hpa;
-  pkt.power_mw      = POWER_EstimateMilliwatts();
 
   dest.sin_len         = sizeof(dest);
   dest.sin_family      = MX_AF_INET;
@@ -401,22 +470,6 @@ static int32_t TELEMETRY_Send(void)
   return sent;
 }
 
-/* Estimate total board power from datasheet current figures — no ADC wired (P2-2).
- * MCU run mode + I2C sensors are constant; WiFi TX dominates in STATE_MOVING.
- * Accuracy: ±40%. Replace with real ADC reading once a shunt + CubeMX path is added. */
-static float POWER_EstimateMilliwatts(void)
-{
-  float current_ma = POWER_EST_MCU_RUN_MA + POWER_EST_SENSORS_MA;
-
-  if (wifi_station_ready != 0U)
-  {
-    /* MOVING = 50 Hz UDP burst TX; IDLE = 1 Hz unified packet */
-    current_ma += (current_state == STATE_MOVING) ? POWER_EST_WIFI_TX_MA
-                                                  : POWER_EST_WIFI_ASSOC_MA;
-  }
-
-  return current_ma * (POWER_EST_VDD_MV / 1000.0f); /* I(mA) × V(V) = P(mW) */
-}
 /* USER CODE END 0 */
 
 /**
@@ -602,12 +655,14 @@ int main(void)
                     ip_addr[0], ip_addr[1], ip_addr[2], ip_addr[3]);
             HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
 
-            // --- ZERO-TOUCH PROVISIONING: DYNAMIC IP DISCOVERY ---
-            sprintf(uart_buf, "[NETWORK] Skipping beacon discovery, using hardcoded IP\r\n");
-            HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
-
-            // Skip discovery, use hardcoded IP
-            strcpy(jetson_ip, JETSON_IP);
+            /* Zero-touch provisioning: discover the gateway IP from its UDP beacon.
+             * Falls back to JETSON_IP (wifi_credentials.h) if no beacon arrives. */
+            if (BEACON_Discover() == 0U)
+            {
+              strcpy(jetson_ip, JETSON_IP);
+              sprintf(uart_buf, "[BEACON] Timed out — fallback IP: %s\r\n", JETSON_IP);
+              HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+            }
 
             socket_id = MX_WIFI_Socket_create(wifi_obj, MX_AF_INET, MX_SOCK_DGRAM, MX_IPPROTO_UDP);
             if (socket_id >= 0)
