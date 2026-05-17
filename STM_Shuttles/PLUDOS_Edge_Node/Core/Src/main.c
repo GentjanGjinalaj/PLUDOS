@@ -664,7 +664,10 @@ int main(void)
              * so a late-starting Jetson is picked up automatically without a reflash. */
             if (BEACON_Run(BEACON_MAX_RETRIES, BEACON_TIMEOUT_MS) == 0U)
             {
-              strcpy(jetson_ip, JETSON_IP);
+              /* Bounded copy: JETSON_IP comes from wifi_credentials.h; if a misconfigured
+               * value is longer than the 16-byte jetson_ip buffer, strncpy clamps safely. */
+              strncpy(jetson_ip, JETSON_IP, sizeof(jetson_ip) - 1U);
+              jetson_ip[sizeof(jetson_ip) - 1U] = 0;
               sprintf(uart_buf, "[BEACON] Timed out — fallback IP: %s\r\n", JETSON_IP);
               HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
             }
