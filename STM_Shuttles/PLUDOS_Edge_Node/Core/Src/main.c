@@ -361,17 +361,43 @@ static void TELEMETRY_RefreshEnvCache(void)
   }
 }
 
-/* Listen on BEACON_PORT for a "PLUDOS-GW:<ip>" broadcast from the gateway.
+/* Tiny base-10 parser for a uint8 prefix of `s`. Stops at the first
+ * non-digit; returns 0 on empty input. Used only for beacon shuttle-list
+ * parsing — kept local to avoid pulling stdlib atoi/strtol into the image. */
+static uint8_t BEACON_ParseUint8(const char *s)
+{
+  uint8_t v = 0U;
+  while ((*s >= '0') && (*s <= '9'))
+  {
+    v = (uint8_t)((v * 10U) + (uint8_t)(*s - '0'));
+    s++;
+  }
+  return v;
+}
+
+/* Listen on BEACON_PORT for a "PLUDOS-GW:<ip>[:csv-ids]" broadcast from the gateway.
+ *
+ * Two beacon dialects are accepted:
+ *   "PLUDOS-GW:<ip>"           — legacy / single-Jetson dev: any shuttle bonds.
+ *   "PLUDOS-GW:<ip>:<csv-ids>" — multi-Jetson: only bond if SHUTTLE_ID is in the
+ *                                comma-separated list (e.g. "1,2" or "3,4").
+ *
  * retries: how many recvfrom attempts before giving up.
  * timeout_ms: per-attempt recv timeout (passed to MX_SO_RCVTIMEO).
- * On success, sets jetson_ip and returns 1. On timeout, returns 0 without touching jetson_ip. */
+ *
+ * On success, sets jetson_ip and returns 1. A beacon whose shuttle-list does
+ * not include SHUTTLE_ID is silently skipped — the loop continues listening
+ * within the retry budget so a same-WiFi beacon from this shuttle's own Jetson
+ * can still be caught in a later attempt.
+ *
+ * On timeout, returns 0 without touching jetson_ip. */
 static uint8_t BEACON_Run(uint8_t retries, int32_t timeout_ms)
 {
   int32_t               bsock;
   struct mx_sockaddr_in baddr  = {0};
   struct mx_sockaddr_in sender = {0};
   uint32_t              fromlen;
-  uint8_t               buf[32] = {0};
+  uint8_t               buf[40] = {0};
   int32_t               n;
   uint8_t               attempt;
 
@@ -413,8 +439,55 @@ static uint8_t BEACON_Run(uint8_t retries, int32_t timeout_ms)
     /* "PLUDOS-GW:" prefix is 10 chars; shortest valid IP suffix is 7 ("1.2.3.4"). */
     if ((n > 10) && (strncmp((char *)buf, "PLUDOS-GW:", 10) == 0))
     {
-      buf[n] = 0U; /* null-terminate after the IP portion */
-      strncpy(jetson_ip, (char *)buf + 10, sizeof(jetson_ip) - 1U);
+      char    *ip_start;
+      char    *id_sep;
+      uint8_t  group_match;
+
+      buf[n] = 0U; /* safe: buf is 40 B and recvfrom is capped at sizeof(buf)-1 */
+
+      /* Split optional ":<csv-ids>" suffix from the IP. The first ':' belongs
+       * to "PLUDOS-GW:" (already past); the next one, if present, starts the
+       * comma-separated shuttle-id list. */
+      ip_start = (char *)buf + 10;
+      id_sep   = strchr(ip_start, ':');
+
+      group_match = 1U;
+      if (id_sep != NULL)
+      {
+        char *cursor;
+        *id_sep = 0;          /* terminate the IP portion in place */
+        cursor  = id_sep + 1;
+
+        group_match = 0U;
+        while (*cursor != 0)
+        {
+          if (BEACON_ParseUint8(cursor) == (uint8_t)SHUTTLE_ID)
+          {
+            group_match = 1U;
+            break;
+          }
+          /* Skip to the character after the next comma. */
+          while ((*cursor != 0) && (*cursor != ','))
+          {
+            cursor++;
+          }
+          if (*cursor == ',')
+          {
+            cursor++;
+          }
+        }
+      }
+
+      if (group_match == 0U)
+      {
+        /* Beacon is for a different shuttle group — keep listening within budget. */
+        sprintf(uart_buf, "[BEACON] Ignored beacon (different group): %s:%s\r\n",
+                ip_start, id_sep + 1);
+        HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+        continue;
+      }
+
+      strncpy(jetson_ip, ip_start, sizeof(jetson_ip) - 1U);
       jetson_ip[sizeof(jetson_ip) - 1U] = 0;
       sprintf(uart_buf, "[BEACON] Gateway found: %s\r\n", jetson_ip);
       HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
