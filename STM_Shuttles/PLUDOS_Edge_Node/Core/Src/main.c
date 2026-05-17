@@ -863,15 +863,13 @@ int main(void)
                 : "[NETWORK] WARNING: socket recreate failed (%ld)\r\n", (long)socket_id);
         HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
 
-        /* Network may have changed (different AP, new DHCP lease) — rediscover Jetson IP.
-         * Clear jetson_ip first so TELEMETRY_Send suppresses TX during the search. */
-        jetson_ip[0] = 0;
-        if (BEACON_Run(BEACON_MAX_RETRIES, BEACON_TIMEOUT_MS) == 0U)
-        {
-          strcpy(jetson_ip, JETSON_IP);
-          sprintf(uart_buf, "[BEACON] No beacon after reconnect — fallback IP: %s\r\n", JETSON_IP);
-          HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
-        }
+        /* Network may have changed (different AP, new DHCP lease). Do a short beacon
+         * probe so the loop is back in business in ≤BEACON_RETRY_TIMEOUT_MS ms — the FSM
+         * cannot tolerate a 30 s pause here (last_movement_tick would go stale and trigger
+         * a spurious MOVING→IDLE on resume). The previous jetson_ip is kept; if the
+         * network actually changed, the IDLE-only PHASE 3b periodic retry reconverges
+         * within BEACON_RETRY_PERIOD_MS. */
+        (void)BEACON_Run(1U, BEACON_RETRY_TIMEOUT_MS);
       }
     }
 
