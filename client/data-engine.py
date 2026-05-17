@@ -84,6 +84,18 @@ BEACON_PORT       = int(os.getenv("BEACON_PORT", "5000"))
 BEACON_INTERVAL_S = float(os.getenv("BEACON_INTERVAL_S", "10"))
 GATEWAY_IP        = os.getenv("GATEWAY_IP", "")
 
+# Multi-Jetson deployment: SHUTTLE_GROUP pins this gateway to a specific subset of
+# shuttle IDs so STMs from another Jetson's group don't accidentally bond here
+# when multiple Jetsons beacon on the same WiFi. Comma-separated list of 1-based
+# IDs (e.g., "1,2"). Empty string = accept all (single-Jetson dev default).
+_SHUTTLE_GROUP_RAW = os.getenv("SHUTTLE_GROUP", "").strip()
+SHUTTLE_GROUP: set[int] = set()
+if _SHUTTLE_GROUP_RAW:
+    for tok in _SHUTTLE_GROUP_RAW.split(","):
+        tok = tok.strip()
+        if tok.isdigit():
+            SHUTTLE_GROUP.add(int(tok))
+
 # Parquet output directory: use tmpfs mount when inside container, local dir in test.
 _DEFAULT_BUFFER_DIR   = "./ram_buffer"
 _CONTAINER_BUFFER_DIR = "/app/ram_buffer"
@@ -140,7 +152,13 @@ def _parse_shuttle_names(env_val: str) -> dict[int, str]:
     return result
 
 SHUTTLE_NAMES: dict[int, str] = _parse_shuttle_names(
-    os.getenv("SHUTTLE_NAMES", "1:STM32-Alpha,2:STM32-Beta")
+    os.getenv(
+        "SHUTTLE_NAMES",
+        # Default covers the 3-Jetson × 2-STM deployment so unmapped IDs don't
+        # surface as "shuttle-3"/"shuttle-4" in Grafana on Jetson 2 or 3.
+        "1:STM32-Alpha,2:STM32-Beta,3:STM32-Charlie,4:STM32-Delta,"
+        "5:STM32-Echo,6:STM32-Foxtrot",
+    )
 )
 
 # ---------------------------------------------------------------------------
@@ -345,6 +363,17 @@ class TelemetryProtocol(asyncio.DatagramProtocol):
             logger.warning("Telemetry unpack error from %s: %s", addr, exc)
             return
 
+        # SHUTTLE_GROUP filter: defence-in-depth in case an STM32 bonded to the
+        # wrong Jetson (or multiple Jetsons beacon on the same WiFi). Empty group
+        # = accept all (single-Jetson dev default).
+        sid_int = pkt["header.shuttle_id"]
+        if SHUTTLE_GROUP and sid_int not in SHUTTLE_GROUP:
+            logger.debug(
+                "Telemetry: shuttle_id=%d not in SHUTTLE_GROUP=%s — dropping pkt from %s",
+                sid_int, sorted(SHUTTLE_GROUP), addr,
+            )
+            return
+
         shuttle_id  = pkt["header.shuttle_name"]  # string key for all per-shuttle dicts
         sequence_id = pkt["header.sequence_id"]
         tick_ms     = pkt["status.tick_ms"]
@@ -510,14 +539,26 @@ def _detect_local_ip() -> str:
 
 
 async def _broadcast_beacon() -> None:
-    # Sends "PLUDOS-GW:<ip>" to 255.255.255.255 so STM32s can read the source IP
-    # and skip the hardcoded JETSON_IP. Requires host networking on the Jetson.
+    # Broadcasts "PLUDOS-GW:<ip>" — or "PLUDOS-GW:<ip>:<csv-ids>" when SHUTTLE_GROUP
+    # is set — so STM32s on the same WiFi can discover this gateway and (when the
+    # suffix is present) bond only if their SHUTTLE_ID is in the served group.
+    # Requires host networking on the Jetson for the broadcast to escape the
+    # container bridge.
     ip = GATEWAY_IP or _detect_local_ip()
-    payload = f"PLUDOS-GW:{ip}".encode()
+    if SHUTTLE_GROUP:
+        suffix = ",".join(str(i) for i in sorted(SHUTTLE_GROUP))
+        payload = f"PLUDOS-GW:{ip}:{suffix}".encode()
+        group_log = f"group={suffix}"
+    else:
+        payload = f"PLUDOS-GW:{ip}".encode()
+        group_log = "group=any"
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
     loop = asyncio.get_running_loop()
-    logger.info("[BEACON] announcing %s on UDP port %d every %.0f s", ip, BEACON_PORT, BEACON_INTERVAL_S)
+    logger.info(
+        "[BEACON] announcing %s on UDP port %d every %.0f s (%s)",
+        ip, BEACON_PORT, BEACON_INTERVAL_S, group_log,
+    )
     try:
         while True:
             try:
@@ -538,10 +579,13 @@ async def _broadcast_beacon() -> None:
 async def main() -> None:
     logger.info(
         "PLUDOS Data Engine (ADR-015 v2) starting | TEST_MODE=%s | UDP=%d | "
-        "pkt=%dB | shuttle soft=%d hard=%d | gateway hard=%d | mission_end_idle=%.0fs | dir=%s",
+        "pkt=%dB | shuttle soft=%d hard=%d | gateway hard=%d | mission_end_idle=%.0fs | "
+        "group=%s | dir=%s",
         TEST_MODE, TELEMETRY_PORT, TELEMETRY_SIZE,
         SHUTTLE_SOFT_LIMIT, SHUTTLE_HARD_LIMIT, GATEWAY_HARD_LIMIT,
-        MISSION_END_IDLE_S, BUFFER_DIR,
+        MISSION_END_IDLE_S,
+        ",".join(str(i) for i in sorted(SHUTTLE_GROUP)) if SHUTTLE_GROUP else "any",
+        BUFFER_DIR,
     )
 
     # Single UDP listener — replaces both the aiocoap /vib server and the
