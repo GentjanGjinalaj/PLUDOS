@@ -72,6 +72,7 @@ services:
       - .env
     environment:
       - ALUMET_SERVER_ADDR=${ALUMET_SERVER_ADDR:-}
+    privileged: true
     volumes:
       # INA3221 hardware power monitor: read-only sysfs access from host.
       - /sys:/sys:ro
