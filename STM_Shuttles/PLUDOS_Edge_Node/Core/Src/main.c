@@ -119,7 +119,7 @@ static uint32_t continuous_movement_start_tick = 0U; /* tick when the current dw
 #define SAMPLE_PERIOD_IDLE_MS   100U     /* 10 Hz internal sampling in IDLE (FSM responsiveness) */
 #define SAMPLE_PERIOD_MOVING_MS 20U      /* 50 Hz sampling + transmit in MOVING */
 #define TX_PERIOD_IDLE_MS       1000U    /* 1 Hz UDP transmit in IDLE — every 10th sample */
-#define ENV_READ_PERIOD_MS      500U     /* 2 Hz HTS221/LPS22HH refresh; cached for every TX */
+#define ENV_READ_PERIOD_MS      500U     /* 2 Hz HTS221 refresh; cached for every TX */
 
 /* ISM330 I2C addr: SA0 tied to VDD on IOT02A → base 0x6B, left-shifted → 0xD6.
  * Confirmed in board schematic; datasheet default (SA0=0) gives 0x6A = 0xD4. */
@@ -156,13 +156,10 @@ static volatile uint8_t wifi_station_ready = 0;
 
 static char     jetson_ip[16]      = {0};   /* populated from JETSON_IP define at init */
 static uint8_t  hts221_initialized  = 0U;    /* SENSOR_Humidity_Init succeeded */
-static uint8_t  lps22hh_initialized = 0U;    /* SENSOR_Pressure_Init succeeded */
-
 /* Environmental sensor cache (refreshed every ENV_READ_PERIOD_MS so the I²C bus
  * stays out of the 50 Hz hot path; cached values stamp every outgoing packet). */
 static float    cached_temp_c       = -999.0f;
 static float    cached_humidity_pct =    0.0f;
-static float    cached_pressure_hpa =    0.0f;
 
 /* TX bookkeeping for periodic per-second status log. */
 static uint32_t last_tx_tick      = 0U;
@@ -332,15 +329,14 @@ static void WIFI_DelayWithYield(uint32_t delay_ms)
   }
 }
 
-/* Refresh HTS221 and LPS22HH cache values. Cached values stamp every TX so
- * the I²C bus does not block the 50 Hz transmit path.
+/* Refresh HTS221 cache values. Cached values stamp every TX so the I²C bus
+ * does not block the 50 Hz transmit path.
  * Cache is only updated on successful read — preserves last-known value when
  * HTS221 (1 Hz ODR) has no new data ready during a 2 Hz poll. */
 static void TELEMETRY_RefreshEnvCache(void)
 {
   float new_temp = 0.0f;
   float new_hum  = 0.0f;
-  float new_pres = 0.0f;
 
   if (hts221_initialized != 0U)
   {
@@ -349,14 +345,6 @@ static void TELEMETRY_RefreshEnvCache(void)
     {
       cached_temp_c       = new_temp;
       cached_humidity_pct = new_hum;
-    }
-  }
-
-  if (lps22hh_initialized != 0U)
-  {
-    if (SENSOR_Pressure_Read(&hi2c2, &new_pres) == 0)
-    {
-      cached_pressure_hpa = new_pres;
     }
   }
 }
@@ -626,21 +614,6 @@ int main(void)
   else
   {
     sprintf(uart_buf, "[SENSOR] WARNING: HTS221 not found on I2C2 — temp/humidity disabled\r\n");
-  }
-  HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
-
-  // -----------------------------------------------------------------
-  // PRESSURE SENSOR INITIALIZATION (LPS22HH)
-  // -----------------------------------------------------------------
-  if (SENSOR_Pressure_Init(&hi2c2) == 0)
-  {
-    lps22hh_initialized = 1U;
-    sprintf(uart_buf, "[SENSOR] LPS22HH initialized (1 Hz, BDU)\r\n");
-  }
-  else
-  {
-    /* Non-fatal: pressure field in UDP packet will be 0.0 */
-    sprintf(uart_buf, "[SENSOR] WARNING: LPS22HH not found on I2C2 — pressure disabled\r\n");
   }
   HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
 
@@ -990,12 +963,11 @@ int main(void)
      * --------------------------------------------------------------- */
     if ((HAL_GetTick() - tx_window_start_tick) >= 1000U)
     {
-      const char *state_name = (current_state == STATE_MOVING) ? "MOVING" : "IDLE";
       sprintf(uart_buf,
-              "[STREAM] %s tx=%lu/s accel=(%.2f,%.2f,%.2f)g temp=%.1fC hum=%.0f%% pres=%.1fhPa\r\n",
-              state_name, (unsigned long)tx_count_window,
+              "[STREAM] st=%u tx=%lu/s accel=(%.2f,%.2f,%.2f)g temp=%.1fC hum=%.0f%%\r\n",
+              (unsigned)current_state, (unsigned long)tx_count_window,
               vib_x, vib_y, vib_z,
-              cached_temp_c, cached_humidity_pct, cached_pressure_hpa);
+              cached_temp_c, cached_humidity_pct);
       HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
       tx_count_window      = 0U;
       tx_window_start_tick = HAL_GetTick();
