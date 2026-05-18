@@ -74,7 +74,7 @@ services:
       - ALUMET_SERVER_ADDR=${ALUMET_SERVER_ADDR:-}
     volumes:
       # INA3221 hardware power monitor: read-only sysfs access from host.
-      - /sys/bus/i2c/drivers/ina3221:/sys/bus/i2c/drivers/ina3221:ro
+      - /sys:/sys:ro
       - /etc/localtime:/etc/localtime:ro
       - /etc/timezone:/etc/timezone:ro
     restart: unless-stopped
