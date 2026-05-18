@@ -489,12 +489,18 @@ async def _status_log_task() -> None:
     can see live activity without drowning in 50 Hz per-packet logs."""
     while True:
         await asyncio.sleep(STATUS_LOG_PERIOD_S)
+        now = time.monotonic()
         for sid in list(_last_sample.keys()):
             sample = _last_sample.get(sid)
             if not sample:
                 continue
             rate = _tx_rate_window.get(sid, 0) / STATUS_LOG_PERIOD_S
             _tx_rate_window[sid] = 0
+            # Stop logging a shuttle that has gone silent (no packets for 5 periods).
+            # The watchdog will clean up its tracking state after MISSION_END_IDLE_S.
+            last_pkt = _last_packet_wall.get(sid)
+            if rate == 0 and last_pkt and (now - last_pkt) > STATUS_LOG_PERIOD_S * 5:
+                continue
             state_name = "MOVING" if sample["status.state"] == STATE_MOVING else "IDLE"
 
             temp   = sample["env.temp_c"]
@@ -516,12 +522,27 @@ async def _status_log_task() -> None:
 async def _mission_end_watchdog() -> None:
     """Catch the case where a shuttle goes IDLE and then stops sending entirely.
     Without this loop, _maybe_flush_mission only runs on incoming IDLE packets — so
-    a shuttle that powers off mid-IDLE would never flush its mission."""
+    a shuttle that powers off mid-IDLE would never flush its mission.
+    Also resets IDLE-only shuttles (no MOVING run) that have gone permanently silent."""
     while True:
         await asyncio.sleep(5.0)
         now = time.monotonic()
+        # Standard path: shuttles that had at least one MOVING packet.
         for sid in list(_last_moving_wall.keys()):
             _maybe_flush_mission(sid, now)
+        # Ghost-shuttle cleanup: shuttles that only ever sent IDLE packets and have
+        # gone silent. _maybe_flush_mission never fires for them (no _last_moving_wall
+        # entry), so we must reset them here once the silence exceeds MISSION_END_IDLE_S.
+        for sid in list(_last_packet_wall.keys()):
+            if sid in _last_moving_wall:
+                continue  # handled above
+            silence_s = now - _last_packet_wall[sid]
+            if silence_s > MISSION_END_IDLE_S:
+                logger.info(
+                    "[%s] IDLE-only shuttle silent %.0fs — clearing tracking state",
+                    sid, silence_s,
+                )
+                _reset_shuttle_state(sid)
 
 
 # ---------------------------------------------------------------------------

@@ -155,6 +155,7 @@ static volatile uint8_t wifi_station_event = 0xFF;
 static volatile uint8_t wifi_station_ready = 0;
 
 static char     jetson_ip[16]      = {0};   /* populated from JETSON_IP define at init */
+static uint8_t  stm32_ip[4]        = {0};   /* STM32's own DHCP address; used for beacon subnet filter */
 static uint8_t  hts221_initialized  = 0U;    /* SENSOR_Humidity_Init succeeded */
 /* Environmental sensor cache (refreshed every ENV_READ_PERIOD_MS so the I²C bus
  * stays out of the 50 Hz hot path; cached values stamp every outgoing packet). */
@@ -475,6 +476,27 @@ static uint8_t BEACON_Run(uint8_t retries, int32_t timeout_ms)
         continue;
       }
 
+      /* Subnet filter: only bond if the gateway IP is in the same /24 as this
+       * STM32's WiFi address. Rejects beacons sourced from VPN/Tailscale
+       * interfaces (e.g. 172.31.x.x) that the STM32 cannot reach via WiFi. */
+      if (stm32_ip[0] != 0U)
+      {
+        uint8_t         b0 = BEACON_ParseUint8(ip_start);
+        const char     *d1 = strchr(ip_start, '.');
+        uint8_t         b1 = d1 ? BEACON_ParseUint8(d1 + 1U) : 0U;
+        const char     *d2 = d1 ? strchr(d1 + 1U, '.') : NULL;
+        uint8_t         b2 = d2 ? BEACON_ParseUint8(d2 + 1U) : 0U;
+
+        if ((b0 != stm32_ip[0]) || (b1 != stm32_ip[1]) || (b2 != stm32_ip[2]))
+        {
+          sprintf(uart_buf,
+                  "[BEACON] Ignored (wrong subnet %u.%u.%u.x, STM32 is %u.%u.%u.x): %s\r\n",
+                  b0, b1, b2, stm32_ip[0], stm32_ip[1], stm32_ip[2], ip_start);
+          HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+          continue;
+        }
+      }
+
       strncpy(jetson_ip, ip_start, sizeof(jetson_ip) - 1U);
       jetson_ip[sizeof(jetson_ip) - 1U] = 0;
       sprintf(uart_buf, "[BEACON] Gateway found: %s\r\n", jetson_ip);
@@ -704,6 +726,8 @@ int main(void)
             sprintf(uart_buf, "[NETWORK] SUCCESS! Station IP: %d.%d.%d.%d\r\n",
                     ip_addr[0], ip_addr[1], ip_addr[2], ip_addr[3]);
             HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
+            /* Store for beacon subnet filter — BEACON_Run rejects IPs outside this /24. */
+            (void)memcpy(stm32_ip, ip_addr, 4U);
 
             /* Try beacon first; fall back to JETSON_IP if the Jetson is not yet reachable.
              * The main loop retries the beacon every BEACON_RETRY_PERIOD_MS (IDLE only),
