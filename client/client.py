@@ -56,6 +56,16 @@ ANOMALY_THRESHOLD_G = float(os.getenv("ANOMALY_THRESHOLD_G", "0.8"))
 # each round via fit_config() based on the previous round's energy (ADR-014).
 N_ESTIMATORS_DEFAULT = int(os.getenv("FL_N_ESTIMATORS_DEFAULT", "10"))
 
+# Gateway identity used in gw_status heartbeat — same env var as data-engine.py's
+# stm_mission tag so the FL trigger can correlate readings from the same Jetson.
+GATEWAY_ID = os.getenv("JETSON_HOSTNAME", socket.gethostname())
+
+# Timestamp (epoch seconds) of the previous heartbeat — used to derive
+# `missions_since_last_round` as the count of parquet files newer than this.
+# Module scope: persists across Flower's repeated client_fn() invocations within
+# one ai-worker process.
+_last_heartbeat_ts: float = 0.0
+
 
 # ==========================================
 # 2. ALUMET ENERGY PROFILING API
@@ -293,6 +303,83 @@ def load_buffered_data() -> tuple[np.ndarray, np.ndarray]:
     return X_train, y_train
 
 
+def _write_gw_status_heartbeat(last_round: int | None = None) -> None:
+    """
+    Emit a gw_status InfluxDB point so the server-side fl-trigger watcher can
+    detect when this gateway is alive and has new data ready for an FL round.
+
+    Best-effort: any failure is logged and swallowed so the FL round is never
+    interrupted by a transient InfluxDB outage. Runs on the caller's thread —
+    not a daemon — because the caller is already off the asyncio loop (Flower
+    evaluate / client_fn).
+    """
+    global _last_heartbeat_ts
+
+    # Snapshot the buffer cheaply: filename count + a one-shot read of the most
+    # recent file's shuttle_id column for the distinct-shuttle approximation.
+    parquet_files_available = 0
+    missions_since_last_round = 0
+    shuttle_count = 0
+    try:
+        if os.path.isdir(BUFFER_DIR):
+            entries = [f for f in os.listdir(BUFFER_DIR) if f.endswith(".parquet")]
+            parquet_files_available = len(entries)
+            # Count files whose mtime is strictly newer than the last heartbeat —
+            # bootstraps to "all files" on the very first call (_last_heartbeat_ts=0).
+            missions_since_last_round = sum(
+                1 for f in entries
+                if os.path.getmtime(os.path.join(BUFFER_DIR, f)) > _last_heartbeat_ts
+            )
+            # Cheap distinct-shuttle count: read only the shuttle_id column from
+            # the newest parquet file. Filename pattern is "mission_<ts>.parquet"
+            # without a shuttle ID, so we have to peek inside.
+            if entries:
+                # Filename pattern is "mission_<ts>.parquet" with no shuttle ID,
+                # so peek inside the newest file's header.shuttle_id column —
+                # written by data-engine.py _unpack_telemetry().
+                newest = max(entries, key=lambda f: os.path.getmtime(os.path.join(BUFFER_DIR, f)))
+                df = pd.read_parquet(
+                    os.path.join(BUFFER_DIR, newest),
+                    columns=["header.shuttle_id"],
+                )
+                shuttle_count = int(df["header.shuttle_id"].nunique())
+    except Exception as exc:
+        logger.warning("[GW_STATUS] buffer scan failed: %s", exc)
+
+    influx_url    = os.getenv("INFLUXDB_URL",    "http://127.0.0.1:8086")
+    influx_token  = os.getenv("INFLUXDB_TOKEN",  "pludos-secret-token")
+    influx_org    = os.getenv("INFLUXDB_ORG",    "pludos")
+    influx_bucket = os.getenv("INFLUXDB_BUCKET", "alumet_energy")
+
+    try:
+        client = InfluxDBClient(url=influx_url, token=influx_token, org=influx_org)
+        try:
+            point = (
+                Point("gw_status")
+                .tag("gateway_id", GATEWAY_ID)
+                .field("shuttle_count",             shuttle_count)
+                .field("missions_since_last_round", missions_since_last_round)
+                .field("parquet_files_available",   parquet_files_available)
+                # last_round is -1 when emitted at client startup (no round yet).
+                .field("last_round", int(last_round) if last_round is not None else -1)
+                .time(time.time_ns(), WritePrecision.NS)
+            )
+            client.write_api(write_options=SYNCHRONOUS).write(
+                bucket=influx_bucket, record=point
+            )
+            logger.info(
+                "[GW_STATUS] gateway=%s parquet=%d missions_new=%d shuttles=%d round=%s",
+                GATEWAY_ID, parquet_files_available, missions_since_last_round,
+                shuttle_count, last_round,
+            )
+        finally:
+            client.close()
+        _last_heartbeat_ts = time.time()
+    except Exception as exc:
+        # Heartbeat is best-effort; never fail the FL round on InfluxDB issues.
+        logger.warning("[GW_STATUS] write failed: %s", exc)
+
+
 class PLUDOSClient(fl.client.NumPyClient):
     """Flower framework wrapper for PLUDOS edge node participation in FL rounds."""
 
@@ -378,6 +465,9 @@ class PLUDOSClient(fl.client.NumPyClient):
             accuracy = float((preds == y_test).mean())
             logger.info("[EVAL] round=%s test_samples=%d accuracy=%.3f",
                         config.get("server_round", "?"), len(X_test), accuracy)
+            # Heartbeat on successful round completion — server trigger reads this
+            # to know the gateway is alive and what state its buffer is in.
+            _write_gw_status_heartbeat(last_round=config.get("server_round"))
             return 0.0, len(X_test), {"accuracy": accuracy}
         except Exception as exc:
             logger.warning("[EVAL] evaluation failed: %s", exc)
@@ -385,6 +475,13 @@ class PLUDOSClient(fl.client.NumPyClient):
 
 
 def client_fn(context: fl.common.Context):
+    # Startup heartbeat bootstraps the FL trigger: round 1 can fire even before
+    # any FL has occurred, as long as one parquet exists in the buffer.
+    try:
+        _write_gw_status_heartbeat(last_round=None)
+    except Exception as exc:
+        # Never block joining a round on a heartbeat failure.
+        logger.warning("[GW_STATUS] startup heartbeat skipped: %s", exc)
     return PLUDOSClient().to_client()
 
 
