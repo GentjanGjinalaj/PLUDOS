@@ -8,6 +8,9 @@ __pycache__/
 *.parquet
 # ram_buffer/ directories hold .parquet files (ignored above) and a .gitkeep — don't ignore the dir
 
+# Trained global models — written by server.py _persist_global_model after each FL round.
+server/models/
+
 # Secrets and local config (never commit)
 # Catch-all: any .env file anywhere in the tree (root, client/, server/, etc.)
 **/.env

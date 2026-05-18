@@ -9,6 +9,7 @@ energy from InfluxDB fl_phases measurement (ADR-014).
 import json
 import logging
 import os
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
 import flwr as fl
@@ -52,6 +53,51 @@ ENERGY_BUDGET_J      = float(os.getenv("FL_ENERGY_BUDGET_J",    "50.0"))
 
 # Tracks n_estimators across rounds — starts at default, adapted by energy feedback.
 _current_n_estimators: int = N_ESTIMATORS_DEFAULT
+
+# ---------------------------------------------------------------------------
+# Persisted global models — written after each successful aggregation.
+# MODELS_DIR is relative to the working directory of `flwr run .` (repo root).
+# Override via FL_MODELS_DIR if the trigger container mounts the repo elsewhere.
+# ---------------------------------------------------------------------------
+MODELS_DIR = Path(os.getenv("FL_MODELS_DIR", "server/models"))
+
+
+def _persist_global_model(server_round: int, merged_bytes: bytes) -> None:
+    """
+    Save the merged booster for this round and atomically refresh the
+    `latest.ubj` symlink. Provides a crash-recovery path: a server restarted
+    between rounds can resume inference from `MODELS_DIR/latest.ubj` without
+    re-running training.
+
+    Best-effort: persistence failures are logged but do not fail the round —
+    the next aggregation will write a new copy.
+    """
+    try:
+        MODELS_DIR.mkdir(parents=True, exist_ok=True)
+
+        # Round it to xgboost's native UBJSON format so it can be loaded with
+        # xgb.Booster.load_model(path) directly (no manual byte-buffer plumbing).
+        booster = xgb.Booster()
+        booster.load_model(bytearray(merged_bytes))
+
+        round_path = MODELS_DIR / f"global_model_round_{server_round}.ubj"
+        booster.save_model(str(round_path))
+
+        # Atomic symlink update: write to a temp name, then os.replace() it
+        # onto latest.ubj. Avoids a window where latest.ubj points nowhere.
+        tmp_link = MODELS_DIR / "latest.ubj.tmp"
+        if tmp_link.exists() or tmp_link.is_symlink():
+            tmp_link.unlink()
+        # Relative symlink target — survives moving the models dir.
+        tmp_link.symlink_to(round_path.name)
+        os.replace(tmp_link, MODELS_DIR / "latest.ubj")
+
+        logger.info(
+            "[MODEL] persisted round %d → %s (%d B), latest.ubj refreshed",
+            server_round, round_path.name, round_path.stat().st_size,
+        )
+    except Exception as exc:
+        logger.error("[MODEL] persistence failed for round %d: %s", server_round, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +235,11 @@ class XGBoostStrategy(fl.server.strategy.FedAvg):
                 # Covers both merge errors (bad JSON, missing keys) and load failures.
                 logger.error("Booster merge/validation failed (%s). Falling back to largest.", exc)
                 merged_bytes = max(raw_streams, key=len)
+
+        # Persist the round's authoritative global model so a crashed server can
+        # recover without re-training. Runs after the merge succeeds (or the
+        # single-gateway passthrough) and never fails the round.
+        _persist_global_model(server_round, merged_bytes)
 
         parameters = ndarrays_to_parameters(
             [np.frombuffer(merged_bytes, dtype=np.uint8)]
