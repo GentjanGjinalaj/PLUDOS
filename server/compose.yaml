@@ -15,6 +15,13 @@ services:
       - DOCKER_INFLUXDB_INIT_ORG=${INFLUXDB_ORG}
       - DOCKER_INFLUXDB_INIT_BUCKET=${INFLUXDB_BUCKET}
       - DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=${INFLUXDB_ADMIN_TOKEN}
+    # Healthcheck is consumed by fl-trigger's depends_on so it doesn't start
+    # polling before the bucket is provisioned.
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8086/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
     restart: unless-stopped
 
   # Grafana — energy dashboards (fl_energy measurement, per round / per device)
@@ -70,6 +77,35 @@ services:
       - influxdb
     restart: unless-stopped
 
+  # FL Trigger — watches InfluxDB for ready gateways and launches `flwr run .`
+  # autonomously. Replaces the manual `flwr run .` step from the operator
+  # workflow. See server/trigger/trigger.py and docs/DEPLOYMENT_GUIDE.md §3.8.
+  fl-trigger:
+    build:
+      context: ./trigger
+      dockerfile: Containerfile
+    container_name: pludos-fl-trigger
+    env_file: .env
+    environment:
+      # Use the internal compose bridge name — fl-trigger and influxdb share the network.
+      - INFLUXDB_URL=http://influxdb:8086
+      - INFLUXDB_TOKEN=${INFLUXDB_ADMIN_TOKEN}
+      - INFLUXDB_ORG=${INFLUXDB_ORG}
+      - INFLUXDB_BUCKET=${INFLUXDB_BUCKET}
+      - FL_TRIGGER_INTERVAL_S=${FL_TRIGGER_INTERVAL_S:-30}
+      - FL_MIN_FIT_CLIENTS=${FL_MIN_FIT_CLIENTS:-1}
+      - FL_NUM_ROUNDS=${FL_NUM_ROUNDS:-3}
+    volumes:
+      # PLUDOS repo, read-only — trigger only invokes `flwr run .`, never writes here.
+      - ../:/app/project:ro
+      # State: pidfile, last_run.json, per-round logs. Survives container restart.
+      - fl_trigger_state:/app/state
+    depends_on:
+      influxdb:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   influxdb_data:
   grafana_data:
+  fl_trigger_state:

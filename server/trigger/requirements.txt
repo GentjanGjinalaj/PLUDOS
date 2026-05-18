@@ -1,0 +1,11 @@
+# Runtime deps for the fl-trigger container.
+# flwr is required because `flwr run .` (invoked by trigger.py) loads the
+# server.py and client.py apps in-process. xgboost / pandas / pyarrow /
+# influxdb-client are pulled in transitively by those apps.
+
+flwr[simulation]>=1.9.0
+xgboost
+numpy
+pandas
+pyarrow
+influxdb-client

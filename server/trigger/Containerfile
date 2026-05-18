@@ -1,0 +1,32 @@
+# PLUDOS FL Round Trigger — runs trigger.py which polls InfluxDB and spawns
+# `flwr run .` against the bind-mounted project at /app/project.
+#
+# Slim Python base — same Python minor as the rest of the stack to avoid the
+# subtle version-skew bugs that flwr's gRPC dependency occasionally surfaces.
+
+FROM docker.io/library/python:3.11-slim
+
+WORKDIR /app
+
+# curl is used by the compose healthcheck via test+find, but having it on the
+# image also lets a human exec in to probe InfluxDB during debugging. tiny.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends curl \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY trigger.py .
+
+# State directory is also mounted as a named volume; create it here so the
+# healthcheck has a valid path even on first boot before any tick has run.
+RUN mkdir -p /app/state/logs
+
+# Healthcheck: trigger.py touches /app/state/heartbeat each loop iteration.
+# If the file is older than 2 × default interval, the container is unhealthy.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD test -n "$(find /app/state/heartbeat -mmin -2 2>/dev/null)" || exit 1
+
+# -u: unbuffered stdout so `podman logs -f` shows the loop ticks in real time.
+CMD ["python", "-u", "trigger.py"]
