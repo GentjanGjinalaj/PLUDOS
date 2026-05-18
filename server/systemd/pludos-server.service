@@ -1,0 +1,35 @@
+# PLUDOS Central Server — systemd user service
+#
+# Brings up the full server compose stack (InfluxDB + Grafana + Alumet +
+# FL Trigger) at boot without requiring an interactive login session.
+#
+# Install (one-time, on the server machine):
+#
+#   mkdir -p ~/.config/systemd/user
+#   cp server/systemd/pludos-server.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now pludos-server.service
+#   loginctl enable-linger $(whoami)
+#
+# `enable-linger` is what lets the user service start on boot without a
+# logged-in shell. Mirrors the Jetson-side template documented in
+# docs/DEPLOYMENT_GUIDE.md §2.9.
+#
+# If `podman-compose` lives at /usr/local/bin/ (pip --user install instead of
+# distro package), edit ExecStart / ExecStop to use the full path.
+
+[Unit]
+Description=PLUDOS Central Server (InfluxDB + Grafana + Alumet + FL Trigger)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/PLUDOS/server
+ExecStart=/usr/bin/podman-compose up
+ExecStop=/usr/bin/podman-compose down
+Restart=always
+RestartSec=10s
+
+[Install]
+WantedBy=default.target
