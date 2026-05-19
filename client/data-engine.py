@@ -151,15 +151,9 @@ def _parse_shuttle_names(env_val: str) -> dict[int, str]:
                 pass
     return result
 
-SHUTTLE_NAMES: dict[int, str] = _parse_shuttle_names(
-    os.getenv(
-        "SHUTTLE_NAMES",
-        # Default covers the 3-Jetson × 2-STM deployment so unmapped IDs don't
-        # surface as "shuttle-3"/"shuttle-4" in Grafana on Jetson 2 or 3.
-        "1:STM32-Alpha,2:STM32-Beta,3:STM32-Charlie,4:STM32-Delta,"
-        "5:STM32-Echo,6:STM32-Foxtrot",
-    )
-)
+# Default is empty — unmapped IDs fall through to "shuttle-{n}" in _unpack_telemetry.
+# Override with SHUTTLE_NAMES="1:shuttle-1,2:shuttle-2" in .env when custom labels are needed.
+SHUTTLE_NAMES: dict[int, str] = _parse_shuttle_names(os.getenv("SHUTTLE_NAMES", ""))
 
 # ---------------------------------------------------------------------------
 # Power constants — used to derive power_mw and integrate energy on gateway.
