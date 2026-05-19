@@ -310,6 +310,17 @@ def _unpack_telemetry(raw: bytes) -> dict:
     }
 
 
+def _reset_shuttle_state(shuttle_id: str) -> None:
+    """Wipe all per-shuttle dicts — called on mission-end and ghost-shuttle cleanup."""
+    _telemetry_buf.pop(shuttle_id, None)
+    for store in (
+        _mission_energy_j, _mission_start_wall, _ntp_offsets,
+        _last_packet_wall, _packet_counts, _last_seq_ids, _seq_wrap_counts,
+        _last_moving_wall, _last_sample, _tx_rate_window,
+    ):
+        store.pop(shuttle_id, None)
+
+
 def _maybe_flush_mission(shuttle_id: str, now: float) -> None:
     """If the shuttle has been IDLE for >= MISSION_END_IDLE_S after any MOVING run,
     flush its buffer to one Parquet file and reset all per-shuttle state."""
@@ -331,16 +342,10 @@ def _maybe_flush_mission(shuttle_id: str, now: float) -> None:
         shuttle_id, MISSION_END_IDLE_S, energy, pkts, duration_ms,
     )
 
+    # Pop the buffer before reset so _reset_shuttle_state's pop is a no-op.
     _flush(_telemetry_buf.pop(shuttle_id, []), "mission")
     _write_mission_summary(shuttle_id, energy, pkts, duration_ms)
-
-    # Reset all per-shuttle state so the next MOVING burst starts a fresh mission.
-    for store in (
-        _mission_energy_j, _mission_start_wall, _ntp_offsets,
-        _last_packet_wall, _packet_counts, _last_seq_ids, _seq_wrap_counts,
-        _last_moving_wall, _last_sample, _tx_rate_window,
-    ):
-        store.pop(shuttle_id, None)
+    _reset_shuttle_state(shuttle_id)
 
 
 # ---------------------------------------------------------------------------
