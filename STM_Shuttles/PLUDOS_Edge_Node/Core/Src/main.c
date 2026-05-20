@@ -121,8 +121,8 @@ static uint32_t continuous_movement_start_tick = 0U; /* tick when the current dw
 #define NO_MOVEMENT_TIMEOUT_MS  20000U   /* no above-threshold sample for this long → STATE_IDLE */
 
 #define SAMPLE_PERIOD_IDLE_MS   100U     /* 10 Hz internal sampling in IDLE (FSM responsiveness) */
-#define SAMPLE_PERIOD_MOVING_MS 20U      /* 50 Hz sampling + transmit in MOVING */
-#define TX_PERIOD_IDLE_MS       1000U    /* 1 Hz UDP transmit in IDLE — every 10th sample */
+#define SAMPLE_PERIOD_MOVING_MS 100U     /* 10 Hz sampling + transmit in MOVING */
+#define TX_PERIOD_IDLE_MS       10000U   /* 0.1 Hz UDP transmit in IDLE — every 100th sample */
 #define ENV_READ_PERIOD_MS      500U     /* 2 Hz HTS221 refresh; cached for every TX */
 
 /* ISM330 I2C addr: SA0 tied to VDD on IOT02A → base 0x6B, left-shifted → 0xD6.
@@ -1013,8 +1013,8 @@ int main(void)
 
     /* -----------------------------------------------------------------
      * PHASE 4: transmit telemetry at the state-appropriate rate
-     *   MOVING: every loop iteration  (50 Hz)
-     *   IDLE:   every TX_PERIOD_IDLE_MS (1 Hz)
+     *   MOVING: every loop iteration  (10 Hz)
+     *   IDLE:   every TX_PERIOD_IDLE_MS (0.1 Hz)
      * --------------------------------------------------------------- */
     {
       uint8_t should_tx = 0U;
