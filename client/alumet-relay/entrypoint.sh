@@ -27,6 +27,11 @@ else
     echo "[LOCAL] ALUMET_SERVER_ADDR not set — writing directly to InfluxDB"
     # Write credentials into a temp TOML config; avoids shell quoting issues with --config-override.
     cat > "${CONFIG}" <<TOML
+[plugins.jetson]
+# INA3221 read every 5 s — default is ~100 ms, far more than needed for Grafana.
+poll_interval  = "5s"
+flush_interval = "5s"
+
 [plugins.influxdb]
 host   = "${INFLUXDB_URL:-http://localhost:8086}"
 token  = "${INFLUXDB_TOKEN}"
@@ -38,6 +43,5 @@ attributes_as_tags = ["ina_channel_label"]
 TOML
     exec alumet-agent \
         --config "${CONFIG}" \
-        --config-override "plugins.jetson.poll_interval='5s'" \
         --plugins jetson,influxdb
 fi
