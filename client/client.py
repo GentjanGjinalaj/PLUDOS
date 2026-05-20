@@ -276,7 +276,12 @@ def load_buffered_data() -> tuple[np.ndarray, np.ndarray]:
     if not os.path.exists(BUFFER_DIR):
         raise FileNotFoundError(f"CRITICAL: Buffer directory {BUFFER_DIR} not found.")
 
-    files = sorted([f for f in os.listdir(BUFFER_DIR) if f.endswith(".parquet")])
+    # Sort by modification time so daily (YYYY-MM-DD.parquet) and intra-day mission
+    # files are ordered chronologically regardless of their different name formats.
+    files = sorted(
+        [f for f in os.listdir(BUFFER_DIR) if f.endswith(".parquet")],
+        key=lambda f: os.path.getmtime(os.path.join(BUFFER_DIR, f)),
+    )
     if not files:
         raise FileNotFoundError(
             "CRITICAL: No Parquet files found in buffer. "

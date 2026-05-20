@@ -25,6 +25,7 @@ There is no CoAP and no second port. Packet loss is tolerated — the next
 """
 
 import asyncio
+import glob
 import logging
 import math
 import os
@@ -32,6 +33,7 @@ import socket
 import struct
 import threading
 import time
+from datetime import datetime, timedelta
 
 import pandas as pd
 from influxdb_client import InfluxDBClient, Point, WritePrecision  # type: ignore
@@ -701,6 +703,88 @@ async def _broadcast_beacon() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Daily consolidation — merges per-mission files into one YYYY-MM-DD.parquet
+# ---------------------------------------------------------------------------
+
+def _consolidate_day(date_str: str) -> None:
+    """Merge all mission_s*_*.parquet files whose flush timestamp falls on date_str (UTC)
+    into a single daily file named YYYY-MM-DD.parquet containing all shuttles.
+    Source files are deleted on success. Runs on a thread executor — does blocking I/O."""
+    pattern   = os.path.join(BUFFER_DIR, "mission_s*_*.parquet")
+    day_files = []
+    for path in sorted(glob.glob(pattern)):
+        try:
+            # Filename: mission_s{id}_{unix_ms}.parquet — extract unix_ms from last segment.
+            ts_ms = int(os.path.basename(path).rsplit("_", 1)[-1].replace(".parquet", ""))
+            if datetime.utcfromtimestamp(ts_ms / 1000).strftime("%Y-%m-%d") == date_str:
+                day_files.append(path)
+        except (ValueError, IndexError):
+            pass
+
+    if not day_files:
+        logger.debug("[CONSOLIDATE] No mission files found for %s", date_str)
+        return
+
+    frames = [pd.read_parquet(f) for f in day_files]
+    df = pd.concat(frames, ignore_index=True)
+    df.sort_values(["shuttle_id", "seq"], inplace=True)
+
+    daily_path = os.path.join(BUFFER_DIR, f"{date_str}.parquet")
+    # Merge with an existing daily file in case consolidation runs more than once for the day.
+    if os.path.exists(daily_path):
+        existing = pd.read_parquet(daily_path)
+        df = pd.concat([existing, df], ignore_index=True)
+        df.sort_values(["shuttle_id", "seq"], inplace=True)
+        df.drop_duplicates(subset=["shuttle_id", "seq"], keep="last", inplace=True)
+
+    tmp_path = daily_path + ".tmp"
+    # PyArrow write is sync but consolidation runs on an executor — acceptable.
+    df.to_parquet(tmp_path, engine="pyarrow", index=False)
+    os.replace(tmp_path, daily_path)
+
+    for f in day_files:
+        os.remove(f)
+
+    logger.info(
+        "[CONSOLIDATE] %s: merged %d file(s), %d total rows → %s",
+        date_str, len(day_files), len(df), os.path.basename(daily_path),
+    )
+
+
+def _consolidate_stale() -> None:
+    """At startup, consolidate any mission files from days before today (Jetson may have been
+    offline when midnight consolidation was supposed to run)."""
+    today   = datetime.utcnow().strftime("%Y-%m-%d")
+    pattern = os.path.join(BUFFER_DIR, "mission_s*_*.parquet")
+    stale_dates: set[str] = set()
+    for path in glob.glob(pattern):
+        try:
+            ts_ms = int(os.path.basename(path).rsplit("_", 1)[-1].replace(".parquet", ""))
+            date  = datetime.utcfromtimestamp(ts_ms / 1000).strftime("%Y-%m-%d")
+            if date < today:
+                stale_dates.add(date)
+        except (ValueError, IndexError):
+            pass
+    for date in sorted(stale_dates):
+        logger.info("[CONSOLIDATE] Startup: consolidating stale files for %s", date)
+        _consolidate_day(date)
+
+
+async def _daily_consolidate_task() -> None:
+    """At 00:00:05 UTC each day, consolidate yesterday's mission files into YYYY-MM-DD.parquet."""
+    while True:
+        now_utc  = datetime.utcnow()
+        midnight = (now_utc + timedelta(days=1)).replace(hour=0, minute=0, second=5, microsecond=0)
+        wait_s   = (midnight - now_utc).total_seconds()
+        logger.info("[CONSOLIDATE] Next daily consolidation in %.0f s (at %s UTC)", wait_s, midnight.isoformat())
+        await asyncio.sleep(wait_s)
+        # 10-second buffer ensures we're solidly into the new day before computing yesterday.
+        yesterday = (datetime.utcnow() - timedelta(seconds=10)).strftime("%Y-%m-%d")
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _consolidate_day, yesterday)
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -726,10 +810,14 @@ async def main() -> None:
     )
     logger.info("Telemetry UDP listener bound on port %d", TELEMETRY_PORT)
 
+    # Consolidate any mission files from days before today (handles Jetson restarts / downtime).
+    _consolidate_stale()
+
     # Background tasks.
     asyncio.create_task(_status_log_task())
     asyncio.create_task(_mission_end_watchdog())
     asyncio.create_task(_broadcast_beacon())
+    asyncio.create_task(_daily_consolidate_task())
 
     await loop.create_future()  # run forever
 
