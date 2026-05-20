@@ -1,14 +1,16 @@
 """
-PLUDOS Edge Gateway: Data Engine (ADR-015 v2 — compact 28-byte stream)
+PLUDOS Edge Gateway: Data Engine (ADR-016 v3 — compact 24-byte stream)
 -----------------------------------------------------------------------
 Listens on a single raw UDP socket:
   - UDP 5683: PludosTelemetry packets from each STM32 shuttle
-    (28 bytes — uint8 id + seq + tick + state + accel xyz + temp + humidity)
+    (24 bytes — uint8 id + uint16 seq + uint32 tick + uint8 state +
+     8×int16 sensors: accel xyz, gyro xyz, temp, humidity)
+    Sensors scaled ×100 (g, dps, °C) or ×10 (%RH); 0x7FFF = unavailable.
     See `docs/wire_protocol.md §1`.
 
 pressure_hpa and power_mw are no longer on the wire. Power is derived from
 state (POWER_IDLE_MW / POWER_MOVING_MW env vars). Parquet files are enriched
-at flush time with power_mw, accel_magnitude_g, and shuttle_name — zero
+at flush time with accel_mag and a proper UTC Timestamp — zero
 per-packet overhead for the enrichment.
 
 Every incoming packet is appended to that shuttle's in-memory buffer. A
@@ -59,7 +61,7 @@ SHUTTLE_SOFT_LIMIT = int(os.getenv("SHUTTLE_SOFT_LIMIT", "1000"))
 SHUTTLE_HARD_LIMIT = int(os.getenv("SHUTTLE_HARD_LIMIT", "1500"))
 
 # Emergency safety ceiling across the entire gateway (all shuttles combined).
-# At 28 bytes/packet and 8 GB Jetson RAM, 50 000 packets ≈ 1.4 MB.
+# At 24 bytes/packet and 8 GB Jetson RAM, 50 000 packets ≈ 1.2 MB.
 GATEWAY_HARD_LIMIT = int(os.getenv("GATEWAY_HARD_LIMIT", "50000"))
 
 if SHUTTLE_HARD_LIMIT <= SHUTTLE_SOFT_LIMIT:
@@ -124,14 +126,38 @@ _GATEWAY_TAG = os.getenv("JETSON_HOSTNAME", socket.gethostname())
 STATE_IDLE   = 0
 STATE_MOVING = 1
 
+# Universal wire sentinel (ADR-016 v3): 0x7FFF (32767) in any int16 field means
+# that sensor was unavailable. Gateway converts to NaN before buffering.
+_SENSOR_SENTINEL_INT = 32767
+
+# Final Parquet columns in standard order — must stay in sync with client.py feature_cols.
+# Intermediate fields (tick_ms, seq_wire, timestamp_ms) are dropped at flush time.
+_PARQUET_COLS = [
+    "timestamp",    # pd.Timestamp UTC — anchored STM32 tick via per-shuttle NTP offset
+    "shuttle_id",   # int8  — 1-based integer matching wifi_credentials.h SHUTTLE_ID
+    "seq",          # int32 — uint16 wire counter unwrapped across rollovers; sort key
+    "state",        # int8  — 0=IDLE, 1=MOVING
+    "accel_x",      # float32 g — ISM330 X axis, ±2g FS; NaN if unavailable
+    "accel_y",      # float32 g — ISM330 Y axis
+    "accel_z",      # float32 g — ISM330 Z axis
+    "accel_mag",    # float32 g — √(x²+y²+z²); derived at flush
+    "gyro_x",       # float32 dps — ISM330 roll rate, ±250 dps FS; NaN if unavailable
+    "gyro_y",       # float32 dps — ISM330 pitch rate
+    "gyro_z",       # float32 dps — ISM330 yaw rate
+    "gyro_mag",     # float32 dps — √(gx²+gy²+gz²); derived at flush
+    "temp_c",       # float32 °C — HTS221; NaN when unavailable
+    "humidity_pct", # float32 %  — HTS221 RH; NaN when unavailable
+]
+
 # ---------------------------------------------------------------------------
 # Wire format — must match wire_protocol.md §1 exactly.
 # ---------------------------------------------------------------------------
 
-# 28-byte compact format (ADR-015 v2): id(1)+seq(2)+tick(4)+state(1)+ax/ay/az/temp/hum(5×4=20)
-TELEMETRY_FMT  = "<BHIBfffff"
+# 24-byte compact format (ADR-016 v3): id(1)+seq(2)+tick(4)+state(1)+8×int16(16)
+# Sensors: accel xyz ×100 g, gyro xyz ×100 dps, temp ×100 °C, humidity ×10 %RH.
+TELEMETRY_FMT  = "<BHIBhhhhhhhh"
 TELEMETRY_SIZE = struct.calcsize(TELEMETRY_FMT)
-assert TELEMETRY_SIZE == 28, f"telemetry fmt must be 28 bytes, got {TELEMETRY_SIZE}"
+assert TELEMETRY_SIZE == 24, f"telemetry fmt must be 24 bytes, got {TELEMETRY_SIZE}"
 
 # ---------------------------------------------------------------------------
 # Shuttle identity — maps the 1-byte wire ID to a human-readable name.
@@ -208,40 +234,49 @@ _tx_rate_window: dict[str, int] = {}
 # ---------------------------------------------------------------------------
 
 def _flush(buf: list[dict], prefix: str) -> None:
-    """Sort by (shuttle_id, sequence_monotonic), enrich with derived columns, write atomic Parquet."""
+    """Cast to ML-ready dtypes, compute derived columns, write clean Parquet atomically."""
     if not buf:
         return
-    df = pd.json_normalize(buf)
+    df = pd.DataFrame(buf)
+    df.sort_values(by=["shuttle_id", "seq"], inplace=True)
 
-    sort_cols = ["header.shuttle_id", "header.sequence_monotonic"]
-    if all(c in df.columns for c in sort_cols):
-        df.sort_values(by=sort_cols, inplace=True)
-    else:
-        df.sort_values(by=["header.shuttle_id", "header.sequence_id"], inplace=True)
+    # Anchor STM32 relative tick to gateway NTP wall clock → proper UTC Timestamp.
+    df["timestamp"] = pd.to_datetime(df["timestamp_ms"], unit="ms", utc=True)
 
-    # Enrich once at flush — no per-packet overhead on the hot path.
-    if "status.state" in df.columns:
-        # Derive power from state so Parquet consumers don't need the env constants.
-        df["energy.power_mw"] = df["status.state"].apply(
-            lambda s: POWER_MOVING_MW if s == STATE_MOVING else POWER_IDLE_MW
-        )
-    if all(c in df.columns for c in ("sensors.accel_x", "sensors.accel_y", "sensors.accel_z")):
-        # Scalar vibration proxy: |a| includes gravity DC; subtract 1g on dominant axis
-        # for a cleaner estimate, but that requires orientation calibration.
-        # For now, magnitude gives a useful anomaly indicator without calibration.
-        df["sensors.accel_magnitude_g"] = (
-            df["sensors.accel_x"] ** 2
-            + df["sensors.accel_y"] ** 2
-            + df["sensors.accel_z"] ** 2
-        ).pow(0.5)
+    # Magnitude proxies derived at flush; pandas propagates NaN through the arithmetic.
+    df["accel_mag"] = (df["accel_x"]**2 + df["accel_y"]**2 + df["accel_z"]**2).pow(0.5)
+    df["gyro_mag"]  = (df["gyro_x"]**2  + df["gyro_y"]**2  + df["gyro_z"]**2).pow(0.5)
 
+    # Wire precision is int16 ×100 → 2 dp for g/dps/°C, ×10 → 1 dp for %RH.
+    df[["accel_x", "accel_y", "accel_z", "accel_mag",
+        "gyro_x",  "gyro_y",  "gyro_z",  "gyro_mag",
+        "temp_c"]] = (
+        df[["accel_x", "accel_y", "accel_z", "accel_mag",
+            "gyro_x",  "gyro_y",  "gyro_z",  "gyro_mag",
+            "temp_c"]].round(2)
+    )
+    df["humidity_pct"] = df["humidity_pct"].round(1)
+
+    # Compact ML dtypes.
+    df["shuttle_id"] = df["shuttle_id"].astype("int8")
+    df["state"]      = df["state"].astype("int8")
+    df["seq"]        = df["seq"].astype("int32")
+    for col in ("accel_x", "accel_y", "accel_z", "accel_mag",
+                "gyro_x",  "gyro_y",  "gyro_z",  "gyro_mag",
+                "temp_c",  "humidity_pct"):
+        df[col] = df[col].astype("float32")
+
+    # Drop all intermediate fields; enforce canonical column order.
+    df = df[_PARQUET_COLS]
+
+    shuttle_label = f"shuttle-{df['shuttle_id'].iloc[0]}"
     ts        = int(time.time())
     file_path = os.path.join(BUFFER_DIR, f"{prefix}_{ts}.parquet")
     tmp_path  = file_path + ".tmp"
     # PyArrow write is sync but only fires on flush — acceptable latency spike.
-    df.to_parquet(tmp_path, engine="pyarrow")
+    df.to_parquet(tmp_path, engine="pyarrow", index=False)
     os.replace(tmp_path, file_path)  # atomic rename: crash-safe on Linux
-    logger.info("Flushed %d records → %s", len(buf), file_path)
+    logger.info("[%s] Flushed %d records → %s", shuttle_label, len(df), file_path)
     buf.clear()
 
 
@@ -280,27 +315,32 @@ def _write_mission_summary(
 
 
 def _unpack_telemetry(raw: bytes) -> dict:
-    """Unpack a 28-byte PludosTelemetry packet into a labelled dict.
-    Wire sentinel -999.0 °C converted to NaN so downstream ML treats it as missing."""
-    sid_int, seq, tick, state, ax, ay, az, temp, hum = struct.unpack(TELEMETRY_FMT, raw)
+    """Unpack a 24-byte PludosTelemetry v3 packet. 0x7FFF (32767) in any int16 field → NaN."""
+    sid_int, seq, tick, state, ax_r, ay_r, az_r, gx_r, gy_r, gz_r, temp_r, hum_r = \
+        struct.unpack(TELEMETRY_FMT, raw)
 
-    shuttle_name = SHUTTLE_NAMES.get(sid_int, f"shuttle-{sid_int}")
-    # Sentinel decoding: -999.0 °C means HTS221 unavailable; humidity is also invalid then.
-    temp_out = float("nan") if temp == -999.0 else temp
-    hum_out  = float("nan") if temp == -999.0 else hum
+    # 0x7FFF is the universal unavailable sentinel from firmware (out of range for all fields).
+    nan = float("nan")
+    ok_a = ax_r != _SENSOR_SENTINEL_INT
+    ok_g = gx_r != _SENSOR_SENTINEL_INT
+    ok_t = temp_r != _SENSOR_SENTINEL_INT
+    ok_h = hum_r  != _SENSOR_SENTINEL_INT
 
     return {
-        "header.shuttle_id":   sid_int,       # raw integer (1, 2, …) — compact sort key
-        "header.shuttle_name": shuttle_name,  # human-readable; used as per-shuttle dict key
-        "header.sequence_id":  seq,
-        "status.tick_ms":      tick,
-        "status.state":        int(state),    # 0 = IDLE, 1 = MOVING
-        "status.is_moving":    bool(state == STATE_MOVING),
-        "sensors.accel_x":     ax,
-        "sensors.accel_y":     ay,
-        "sensors.accel_z":     az,
-        "env.temp_c":          temp_out,
-        "env.humidity_pct":    hum_out,
+        # --- Parquet columns (kept at flush) ---
+        "shuttle_id":   sid_int,
+        "state":        int(state),
+        "accel_x":      ax_r / 100.0 if ok_a else nan,
+        "accel_y":      ay_r / 100.0 if ok_a else nan,
+        "accel_z":      az_r / 100.0 if ok_a else nan,
+        "gyro_x":       gx_r / 100.0 if ok_g else nan,
+        "gyro_y":       gy_r / 100.0 if ok_g else nan,
+        "gyro_z":       gz_r / 100.0 if ok_g else nan,
+        "temp_c":       temp_r / 100.0 if ok_t else nan,
+        "humidity_pct": hum_r  / 10.0  if ok_h else nan,
+        # --- Intermediate: consumed in datagram_received, dropped at flush ---
+        "tick_ms":  tick,  # HAL_GetTick() ms since boot; anchored to UTC via NTP offset
+        "seq_wire": seq,   # raw uint16 counter; used for wrap detection only
     }
 
 
@@ -365,7 +405,7 @@ class TelemetryProtocol(asyncio.DatagramProtocol):
         # SHUTTLE_GROUP filter: defence-in-depth in case an STM32 bonded to the
         # wrong Jetson (or multiple Jetsons beacon on the same WiFi). Empty group
         # = accept all (single-Jetson dev default).
-        sid_int = pkt["header.shuttle_id"]
+        sid_int = pkt["shuttle_id"]
         if SHUTTLE_GROUP and sid_int not in SHUTTLE_GROUP:
             logger.debug(
                 "Telemetry: shuttle_id=%d not in SHUTTLE_GROUP=%s — dropping pkt from %s",
@@ -373,98 +413,99 @@ class TelemetryProtocol(asyncio.DatagramProtocol):
             )
             return
 
-        shuttle_id  = pkt["header.shuttle_name"]  # string key for all per-shuttle dicts
-        sequence_id = pkt["header.sequence_id"]
-        tick_ms     = pkt["status.tick_ms"]
-        state       = pkt["status.state"]
+        # shuttle_name: human-readable string key for all per-shuttle state dicts.
+        # pkt["shuttle_id"] (integer) is the Parquet column; shuttle_name never appears in Parquet.
+        shuttle_name = SHUTTLE_NAMES.get(sid_int, f"shuttle-{sid_int}")
+        sequence_id  = pkt["seq_wire"]
+        tick_ms      = pkt["tick_ms"]
+        state        = pkt["state"]
         # Derive power from state — not transmitted on the wire (ADR-015 v2).
-        power_mw    = POWER_MOVING_MW if state == STATE_MOVING else POWER_IDLE_MW
+        power_mw     = POWER_MOVING_MW if state == STATE_MOVING else POWER_IDLE_MW
 
         receipt_ms = int(time.time() * 1000)
         now        = time.monotonic()
 
         # First packet from this shuttle (since boot or since last mission flush):
         # establish the NTP offset and mark the mission start.
-        if shuttle_id not in _ntp_offsets:
-            _ntp_offsets[shuttle_id]        = receipt_ms - tick_ms
-            _mission_start_wall[shuttle_id] = now
+        if shuttle_name not in _ntp_offsets:
+            _ntp_offsets[shuttle_name]        = receipt_ms - tick_ms
+            _mission_start_wall[shuttle_name] = now
             logger.info(
                 "[%s] NTP offset established: %d ms (state=%s)",
-                shuttle_id, _ntp_offsets[shuttle_id],
+                shuttle_name, _ntp_offsets[shuttle_name],
                 "MOVING" if state == STATE_MOVING else "IDLE",
             )
 
         # Drift correction: refresh the offset every NTP_REFRESH_INTERVAL packets.
-        _packet_counts[shuttle_id] = _packet_counts.get(shuttle_id, 0) + 1
-        count = _packet_counts[shuttle_id]
+        _packet_counts[shuttle_name] = _packet_counts.get(shuttle_name, 0) + 1
+        count = _packet_counts[shuttle_name]
         if count % NTP_REFRESH_INTERVAL == 0:
-            old_offset = _ntp_offsets[shuttle_id]
-            _ntp_offsets[shuttle_id] = receipt_ms - tick_ms
-            drift_ms = _ntp_offsets[shuttle_id] - old_offset
+            old_offset = _ntp_offsets[shuttle_name]
+            _ntp_offsets[shuttle_name] = receipt_ms - tick_ms
+            drift_ms = _ntp_offsets[shuttle_name] - old_offset
             logger.info(
                 "[%s] NTP offset refreshed at pkt %d: %d ms (drift %+d ms)",
-                shuttle_id, count, _ntp_offsets[shuttle_id], drift_ms,
+                shuttle_name, count, _ntp_offsets[shuttle_name], drift_ms,
             )
 
-        pkt["timestamp_ms"] = tick_ms + _ntp_offsets[shuttle_id]
+        pkt["timestamp_ms"] = tick_ms + _ntp_offsets[shuttle_name]
 
         # uint16 sequence wrap detection — STM32 counter rolls 65535 → 0.
-        last_seq = _last_seq_ids.get(shuttle_id, sequence_id)
+        last_seq = _last_seq_ids.get(shuttle_name, sequence_id)
         if last_seq > 60000 and sequence_id < 5000:
-            _seq_wrap_counts[shuttle_id] = _seq_wrap_counts.get(shuttle_id, 0) + 1
+            _seq_wrap_counts[shuttle_name] = _seq_wrap_counts.get(shuttle_name, 0) + 1
             logger.info(
-                "[%s] sequence_id wrap #%d detected (was %d → %d)",
-                shuttle_id, _seq_wrap_counts[shuttle_id], last_seq, sequence_id,
+                "[%s] sequence wrap #%d detected (was %d → %d)",
+                shuttle_name, _seq_wrap_counts[shuttle_name], last_seq, sequence_id,
             )
-        _last_seq_ids[shuttle_id] = sequence_id
-        pkt["header.sequence_monotonic"] = (
-            sequence_id + _seq_wrap_counts.get(shuttle_id, 0) * 65536
-        )
+        _last_seq_ids[shuttle_name] = sequence_id
+        # Monotonic: unwraps uint16 rollovers so sort order is always globally correct.
+        pkt["seq"] = sequence_id + _seq_wrap_counts.get(shuttle_name, 0) * 65536
 
         # Energy integration uses wall-clock elapsed since the previous packet so the
         # estimate is correct across IDLE (1 Hz) and MOVING (50 Hz) rates.
-        if shuttle_id in _last_packet_wall:
-            elapsed_s = now - _last_packet_wall[shuttle_id]
+        if shuttle_name in _last_packet_wall:
+            elapsed_s = now - _last_packet_wall[shuttle_name]
         else:
             elapsed_s = 0.02
-        _last_packet_wall[shuttle_id] = now
+        _last_packet_wall[shuttle_name] = now
 
-        _mission_energy_j.setdefault(shuttle_id, 0.0)
-        _mission_energy_j[shuttle_id] += (power_mw / 1000.0) * elapsed_s  # mW→W × s = J
+        _mission_energy_j.setdefault(shuttle_name, 0.0)
+        _mission_energy_j[shuttle_name] += (power_mw / 1000.0) * elapsed_s  # mW→W × s = J
 
         # Mission boundary tracking: any MOVING packet resets the IDLE timer.
         if state == STATE_MOVING:
-            _last_moving_wall[shuttle_id] = now
+            _last_moving_wall[shuttle_name] = now
 
         # Buffer the packet. Per-shuttle list so multi-shuttle deployments don't
         # interleave each other's missions in one Parquet file (P2-9 fix preserved).
-        _telemetry_buf.setdefault(shuttle_id, []).append(pkt)
-        _last_sample[shuttle_id]    = pkt
-        _tx_rate_window[shuttle_id] = _tx_rate_window.get(shuttle_id, 0) + 1
+        _telemetry_buf.setdefault(shuttle_name, []).append(pkt)
+        _last_sample[shuttle_name]    = pkt
+        _tx_rate_window[shuttle_name] = _tx_rate_window.get(shuttle_name, 0) + 1
 
-        shuttle_pkts = len(_telemetry_buf[shuttle_id])
+        shuttle_pkts = len(_telemetry_buf[shuttle_name])
         total_pkts   = sum(len(v) for v in _telemetry_buf.values())
 
         # Mission-end via state transition is the normal path. We only check on
         # IDLE packets to avoid running the check 50× per second during MOVING.
         if state == STATE_IDLE:
-            _maybe_flush_mission(shuttle_id, now)
+            _maybe_flush_mission(shuttle_name, now)
 
         # Buffer-pressure flushes (mid-mission). These do not reset shuttle state —
         # the mission keeps accruing energy and the next batch lands in the next file.
         elif shuttle_pkts >= SHUTTLE_HARD_LIMIT:
             logger.warning(
                 "[%s] per-shuttle HARD LIMIT (%d pkts) — mid-mission flush",
-                shuttle_id, shuttle_pkts,
+                shuttle_name, shuttle_pkts,
             )
-            _flush(_telemetry_buf[shuttle_id], "mission")
+            _flush(_telemetry_buf[shuttle_name], "mission")
 
         elif shuttle_pkts >= SHUTTLE_SOFT_LIMIT:
             logger.info(
                 "[%s] per-shuttle soft limit (%d pkts) — proactive flush",
-                shuttle_id, shuttle_pkts,
+                shuttle_name, shuttle_pkts,
             )
-            _flush(_telemetry_buf[shuttle_id], "mission")
+            _flush(_telemetry_buf[shuttle_name], "mission")
 
         elif total_pkts >= GATEWAY_HARD_LIMIT:
             logger.error(
@@ -483,12 +524,27 @@ class TelemetryProtocol(asyncio.DatagramProtocol):
 # Background tasks
 # ---------------------------------------------------------------------------
 
+def _write_telemetry_batch(points: list) -> None:
+    """Write per-shuttle live telemetry batch to InfluxDB for Grafana monitoring (1 Hz cadence)."""
+    def _write() -> None:
+        client = InfluxDBClient(url=_INFLUXDB_URL, token=_INFLUXDB_TOKEN, org=_INFLUXDB_ORG)
+        try:
+            client.write_api(write_options=SYNCHRONOUS).write(
+                bucket=_INFLUXDB_BUCKET, record=points
+            )
+        except Exception as exc:
+            logger.debug("[INFLUXDB] telemetry batch write failed: %s", exc)
+        finally:
+            client.close()
+    threading.Thread(target=_write, daemon=True).start()
+
+
 async def _status_log_task() -> None:
-    """Once per STATUS_LOG_PERIOD_S, emit a per-shuttle summary line so operators
-    can see live activity without drowning in 50 Hz per-packet logs."""
+    """Once per STATUS_LOG_PERIOD_S, emit per-shuttle summary log and push live telemetry to InfluxDB."""
     while True:
         await asyncio.sleep(STATUS_LOG_PERIOD_S)
         now = time.monotonic()
+        influx_points = []
         for sid in list(_last_sample.keys()):
             sample = _last_sample.get(sid)
             if not sample:
@@ -500,22 +556,59 @@ async def _status_log_task() -> None:
             last_pkt = _last_packet_wall.get(sid)
             if rate == 0 and last_pkt and (now - last_pkt) > STATUS_LOG_PERIOD_S * 5:
                 continue
-            state_name = "MOVING" if sample["status.state"] == STATE_MOVING else "IDLE"
 
-            temp   = sample["env.temp_c"]
-            hum    = sample["env.humidity_pct"]
-            energy = _mission_energy_j.get(sid, 0.0)
-            pwr    = POWER_MOVING_MW if sample["status.state"] == STATE_MOVING else POWER_IDLE_MW
+            state_name = "MOVING" if sample["state"] == STATE_MOVING else "IDLE"
+            ax, ay, az = sample["accel_x"], sample["accel_y"], sample["accel_z"]
+            gx, gy, gz = sample["gyro_x"],  sample["gyro_y"],  sample["gyro_z"]
+            temp       = sample["temp_c"]
+            hum        = sample["humidity_pct"]
+            energy     = _mission_energy_j.get(sid, 0.0)
+            pwr        = POWER_MOVING_MW if sample["state"] == STATE_MOVING else POWER_IDLE_MW
 
+            gyro_ok  = not (math.isnan(gx) or math.isnan(gy) or math.isnan(gz))
+            gyro_str = f"({gx:.1f},{gy:.1f},{gz:.1f})" if gyro_ok else "n/a"
             logger.info(
-                "[%s] %s %.1fHz seq=%d accel=(%.2f,%.2f,%.2f)g "
+                "[%s] %s %.1fHz seq=%d accel=(%.2f,%.2f,%.2f)g gyro=%sdps "
                 "temp=%s°C hum=%s%% pwr=%.0fmW e=%.2fJ",
-                sid, state_name, rate, sample["header.sequence_id"],
-                sample["sensors.accel_x"], sample["sensors.accel_y"], sample["sensors.accel_z"],
-                "n/a" if math.isnan(temp) else f"{temp:.1f}",
-                "n/a" if math.isnan(hum)  else f"{hum:.0f}",
+                sid, state_name, rate, sample["seq_wire"],
+                ax, ay, az, gyro_str,
+                "n/a" if math.isnan(temp) else f"{temp:.2f}",
+                "n/a" if math.isnan(hum)  else f"{hum:.1f}",
                 pwr, energy,
             )
+
+            if not _INFLUXDB_TOKEN:
+                continue
+            # Live telemetry point for Grafana — one per active shuttle per second.
+            accel_mag = math.sqrt(ax**2 + ay**2 + az**2)
+            point = (
+                Point("stm_telemetry")
+                .tag("shuttle_id", str(sample["shuttle_id"]))
+                .tag("gateway",    _GATEWAY_TAG)
+                .field("state",      sample["state"])
+                .field("accel_x",    round(ax, 2))
+                .field("accel_y",    round(ay, 2))
+                .field("accel_z",    round(az, 2))
+                .field("accel_mag",  round(accel_mag, 2))
+                .field("tx_rate_hz", rate)
+                .field("energy_j",   round(energy, 3))
+                .time(time.time_ns(), WritePrecision.NS)
+            )
+            if gyro_ok:
+                gyro_mag = math.sqrt(gx**2 + gy**2 + gz**2)
+                point = (point
+                    .field("gyro_x",   round(gx, 2))
+                    .field("gyro_y",   round(gy, 2))
+                    .field("gyro_z",   round(gz, 2))
+                    .field("gyro_mag", round(gyro_mag, 2)))
+            if not math.isnan(temp):
+                point = point.field("temp_c",       round(temp, 2))
+            if not math.isnan(hum):
+                point = point.field("humidity_pct", round(hum, 1))
+            influx_points.append(point)
+
+        if influx_points:
+            _write_telemetry_batch(influx_points)
 
 
 async def _mission_end_watchdog() -> None:
@@ -597,8 +690,9 @@ async def _broadcast_beacon() -> None:
 # ---------------------------------------------------------------------------
 
 async def main() -> None:
+    logger.info("Gateway wall clock: %s UTC", pd.Timestamp.now(tz="UTC").isoformat())
     logger.info(
-        "PLUDOS Data Engine (ADR-015 v2) starting | TEST_MODE=%s | UDP=%d | "
+        "PLUDOS Data Engine (ADR-016 v3 + gyro) starting | TEST_MODE=%s | UDP=%d | "
         "pkt=%dB | shuttle soft=%d hard=%d | gateway hard=%d | mission_end_idle=%.0fs | "
         "group=%s | dir=%s",
         TEST_MODE, TELEMETRY_PORT, TELEMETRY_SIZE,

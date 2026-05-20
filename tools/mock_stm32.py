@@ -1,9 +1,10 @@
 """
-PLUDOS Hardware Simulator (STM32 — ADR-015 v2)
+PLUDOS Hardware Simulator (STM32 — ADR-016 v3)
 ----------------------------------------------
 Spawns N parallel shuttles, each cycling IDLE → MOVING → long IDLE forever,
-streaming 28-byte PludosTelemetry packets over raw UDP to one Jetson
+streaming 24-byte PludosTelemetry v3 packets over raw UDP to one Jetson
 gateway. Matches `docs/wire_protocol.md §1` and `client/data-engine.py`.
+Sensors encoded as int16 (×100 for g/dps/°C, ×10 for %RH). 0x7FFF = N/A.
 
 Typical uses:
   # Single-shuttle smoke test against a local data-engine.
@@ -49,10 +50,17 @@ MISSION_S           = float(os.getenv("MISSION_S",         "30"))
 IDLE_S              = float(os.getenv("IDLE_S",            "5"))
 POST_MISSION_IDLE_S = float(os.getenv("POST_MISSION_IDLE_S", "35"))
 
-# Wire format — must match wire_protocol.md §1 and data-engine.py exactly.
-TELEMETRY_FMT  = "<BHIBfffff"
+# Wire format v3 — must match wire_protocol.md §1 and data-engine.py exactly.
+TELEMETRY_FMT  = "<BHIBhhhhhhhh"
 TELEMETRY_SIZE = struct.calcsize(TELEMETRY_FMT)
-assert TELEMETRY_SIZE == 28, f"PludosTelemetry must be 28 B (got {TELEMETRY_SIZE})"
+assert TELEMETRY_SIZE == 24, f"PludosTelemetry must be 24 B (got {TELEMETRY_SIZE})"
+
+# Scale factors matching firmware encoding.
+_SCALE_G   = 100   # g    → int16
+_SCALE_DPS = 100   # dps  → int16
+_SCALE_C   = 100   # °C   → int16
+_SCALE_RH  = 10    # %RH  → int16
+_SENTINEL  = 0x7FFF
 
 STATE_IDLE   = 0
 STATE_MOVING = 1
@@ -66,16 +74,25 @@ TX_PERIOD_MOVING_S = 0.02   # 50 Hz in MOVING
 # Packet builder
 # ---------------------------------------------------------------------------
 
+def _to_i16(val: float, scale: int) -> int:
+    # Clamp to int16 range; return sentinel on NaN or overflow.
+    raw = round(val * scale)
+    return raw if -32767 <= raw <= 32766 else _SENTINEL
+
 def _pack(shuttle_id: int, seq: int, tick_ms: int, state: int,
-          ax: float, ay: float, az: float, temp: float, hum: float) -> bytes:
-    # 28-byte little-endian PludosTelemetry matching `<BHIBfffff`.
+          ax: float, ay: float, az: float,
+          gx: float, gy: float, gz: float,
+          temp: float, hum: float) -> bytes:
+    # 24-byte little-endian PludosTelemetry v3 matching `<BHIBhhhhhhhh`.
     return struct.pack(
         TELEMETRY_FMT,
         shuttle_id & 0xFF,
         seq & 0xFFFF,
         tick_ms & 0xFFFFFFFF,
         state & 0xFF,
-        ax, ay, az, temp, hum,
+        _to_i16(ax, _SCALE_G),   _to_i16(ay, _SCALE_G),   _to_i16(az, _SCALE_G),
+        _to_i16(gx, _SCALE_DPS), _to_i16(gy, _SCALE_DPS), _to_i16(gz, _SCALE_DPS),
+        _to_i16(temp, _SCALE_C), _to_i16(hum, _SCALE_RH),
     )
 
 
@@ -99,15 +116,19 @@ async def _send_phase(sock: socket.socket, shuttle_id: int, state: int,
         seq_ref[0] = (seq_ref[0] + 1) & 0xFFFF
         tick_ms = int(time.monotonic() * 1000) - boot_ms
 
-        ax = round(random.uniform(*ax_range), 4)
-        ay = round(random.uniform(*ax_range), 4)
-        az = round(az_dc + random.uniform(-az_jitter, az_jitter), 4)
-        # Slow-changing env, refreshed each sample — matches HTS221 1 Hz ODR scale.
+        ax = round(random.uniform(*ax_range), 2)
+        ay = round(random.uniform(*ax_range), 2)
+        az = round(az_dc + random.uniform(-az_jitter, az_jitter), 2)
+        # Simulated gyro: small random rotation rates during MOVING, near-zero at IDLE.
+        g_scale = 5.0 if state == STATE_MOVING else 0.5
+        gx = round(random.uniform(-g_scale, g_scale), 2)
+        gy = round(random.uniform(-g_scale, g_scale), 2)
+        gz = round(random.uniform(-g_scale, g_scale), 2)
         temp = round(random.uniform(20.0, 25.0), 1)
         hum  = round(random.uniform(40.0, 60.0), 1)
 
         sock.sendto(
-            _pack(shuttle_id, seq_ref[0], tick_ms, state, ax, ay, az, temp, hum),
+            _pack(shuttle_id, seq_ref[0], tick_ms, state, ax, ay, az, gx, gy, gz, temp, hum),
             (TELEMETRY_HOST, TELEMETRY_PORT),
         )
         await asyncio.sleep(period)

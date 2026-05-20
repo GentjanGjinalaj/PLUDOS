@@ -292,13 +292,49 @@ def load_buffered_data() -> tuple[np.ndarray, np.ndarray]:
         len(df), len(recent), recent[0], recent[-1],
     )
 
-    # Column names match data-engine.py _unpack_critical() output — must stay in sync.
-    feature_cols = ["sensors.accel_x", "sensors.accel_y", "sensors.accel_z"]
-    X_train = df[feature_cols].values
+    # ZUPT speed estimate: integrate horizontal accel magnitude (sqrt(ax²+ay²)) per shuttle.
+    # Velocity resets to 0 at each IDLE→MOVING transition, bounding integration drift
+    # to a single pick cycle. IDLE samples are held at speed=0 (shuttle is stationary).
+    # dt_s = 0.02 s because MOVING TX rate is 50 Hz; IDLE samples don't accumulate velocity.
+    dt_s = 0.02
+    df["speed_ms"]       = 0.0
+    df["displacement_m"] = 0.0
+    for sid, group in df.groupby("shuttle_id", sort=False):
+        idx     = group.sort_values("seq").index
+        states  = group.loc[idx, "state"].values.astype(int)
+        ax_vals = group.loc[idx, "accel_x"].values
+        ay_vals = group.loc[idx, "accel_y"].values
+        speeds, disps = [], []
+        vel, disp, prev = 0.0, 0.0, int(states[0])
+        for i in range(len(states)):
+            s = int(states[i])
+            if s == 1 and prev == 0:
+                vel = 0.0  # ZUPT: zero velocity at each IDLE→MOVING start
+            if s == 1 and not (np.isnan(ax_vals[i]) or np.isnan(ay_vals[i])):
+                a_h  = float(np.sqrt(ax_vals[i]**2 + ay_vals[i]**2))
+                vel  = max(0.0, vel + a_h * 9.81 * dt_s)
+                disp += vel * dt_s
+            else:
+                vel = 0.0
+            speeds.append(round(vel, 2))
+            disps.append(round(disp, 2))
+            prev = s
+        df.loc[idx, "speed_ms"]       = speeds
+        df.loc[idx, "displacement_m"] = disps
 
-    # Anomaly label: Z-axis > ANOMALY_THRESHOLD_G.
-    # Threshold is configurable but uncalibrated — see docs/future_options.md §3.3.
-    y_train = (df["sensors.accel_z"] > ANOMALY_THRESHOLD_G).astype(int).values
+    # Column names match data-engine.py _PARQUET_COLS — must stay in sync.
+    feature_cols = [
+        "accel_x", "accel_y", "accel_z", "accel_mag",
+        "gyro_x",  "gyro_y",  "gyro_z",  "gyro_mag",
+        "speed_ms", "displacement_m",
+        "state",
+    ]
+    # Drop rows where any feature is NaN (sensor failure packets).
+    df_clean = df[feature_cols].dropna()
+    X_train = df_clean.values
+
+    # Anomaly label: Z-axis > ANOMALY_THRESHOLD_G — high vertical shock.
+    y_train = (df.loc[df_clean.index, "accel_z"] > ANOMALY_THRESHOLD_G).astype(int).values
 
     return X_train, y_train
 
@@ -335,14 +371,14 @@ def _write_gw_status_heartbeat(last_round: int | None = None) -> None:
             # without a shuttle ID, so we have to peek inside.
             if entries:
                 # Filename pattern is "mission_<ts>.parquet" with no shuttle ID,
-                # so peek inside the newest file's header.shuttle_id column —
-                # written by data-engine.py _unpack_telemetry().
+                # so peek inside the newest file's shuttle_id column —
+                # written by data-engine.py _flush().
                 newest = max(entries, key=lambda f: os.path.getmtime(os.path.join(BUFFER_DIR, f)))
                 df = pd.read_parquet(
                     os.path.join(BUFFER_DIR, newest),
-                    columns=["header.shuttle_id"],
+                    columns=["shuttle_id"],
                 )
-                shuttle_count = int(df["header.shuttle_id"].nunique())
+                shuttle_count = int(df["shuttle_id"].nunique())
     except Exception as exc:
         logger.warning("[GW_STATUS] buffer scan failed: %s", exc)
 

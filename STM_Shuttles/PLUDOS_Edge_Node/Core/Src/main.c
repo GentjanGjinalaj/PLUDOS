@@ -36,23 +36,27 @@
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 
-/* 28-byte unified telemetry payload (ADR-015 v2 / wire_protocol.md §1).
- * pressure_hpa removed — LPS22HH absent on this board; power_mw removed — gateway
- * derives it from state using POWER_IDLE_MW / POWER_MOVING_MW env vars.
- * shuttle_id shrunk from char[12] to uint8_t: 1 = STM32-Alpha, 2 = STM32-Beta, …
- * Python unpack: struct.unpack('<BHIBfffff', data) */
+/* 24-byte unified telemetry payload (ADR-016 v3 / wire_protocol.md §1).
+ * Sensor floats replaced by int16_t scaled ×100 (accel g, gyro dps, temp °C) or
+ * ×10 (humidity %RH) — halves per-field wire cost; adds ISM330 gyroscope.
+ * Sentinel: 0x7FFF (INT16_MAX) for accel/gyro/humidity unavailable;
+ *           0x8000 (INT16_MIN) for temp unavailable.
+ * Python unpack: struct.unpack('<BHIBhhhhhhhh', data) */
 #pragma pack(push, 1)
 typedef struct {
   uint8_t  shuttle_id;      /* 1-based integer; gateway maps to name via SHUTTLE_NAMES */
   uint16_t sequence_id;     /* monotonic per-shuttle, wraps at 65535                    */
   uint32_t tick_ms;         /* HAL_GetTick() at sample time                             */
   uint8_t  state;           /* 0 = STATE_IDLE, 1 = STATE_MOVING                         */
-  float    accel_x;         /* g, ISM330 X axis — raw signal; AC content = vibration    */
-  float    accel_y;         /* g, ISM330 Y axis                                          */
-  float    accel_z;         /* g, ISM330 Z axis                                          */
-  float    temp_c;          /* HTS221 °C; -999.0 = sensor unavailable                   */
-  float    humidity_pct;    /* HTS221 %RH 0–100; 0.0 if temp sentinel                   */
-} __attribute__((packed)) PludosTelemetry_t;   /* total: 28 bytes                        */
+  int16_t  accel_x;         /* g × 100; 0x7FFF if ISM330 unavailable                   */
+  int16_t  accel_y;         /* g × 100                                                   */
+  int16_t  accel_z;         /* g × 100                                                   */
+  int16_t  gyro_x;          /* dps × 100; 0x7FFF if ISM330 unavailable                  */
+  int16_t  gyro_y;          /* dps × 100                                                  */
+  int16_t  gyro_z;          /* dps × 100                                                  */
+  int16_t  temp_c;          /* °C × 100; 0x8000 if HTS221 unavailable                   */
+  int16_t  humidity_pct;    /* %RH × 10;  0x7FFF if HTS221 unavailable                  */
+} __attribute__((packed)) PludosTelemetry_t;   /* total: 24 bytes                        */
 #pragma pack(pop)
 
 /* USER CODE END PTD */
@@ -123,14 +127,22 @@ static uint32_t continuous_movement_start_tick = 0U; /* tick when the current dw
 
 /* ISM330 I2C addr: SA0 tied to VDD on IOT02A → base 0x6B, left-shifted → 0xD6.
  * Confirmed in board schematic; datasheet default (SA0=0) gives 0x6A = 0xD4. */
-#define ISM330_ADDR 0xD6
-#define CTRL1_XL    0x10
-#define OUTX_L_A    0x28
+#define ISM330_ADDR        0xD6
+#define CTRL1_XL           0x10  /* accel control: ODR + FS */
+#define CTRL2_G            0x11  /* gyro control:  ODR + FS */
+#define OUTX_L_A           0x28  /* accel output X low byte (6-byte burst: X, Y, Z) */
+#define OUTX_L_G           0x22  /* gyro output X low byte  (6-byte burst: X, Y, Z) */
+/* ISM330DHCX gyro sensitivity at ±250 dps FS: 8.75 mdps/LSB (DS13281 Table 3). */
+#define GYRO_SENS_MDPS_LSB 8.75f
 
 /* Global physics variables so the Live Watch can see them */
 float vib_x = 0.0f;
 float vib_y = 0.0f;
 float vib_z = 0.0f;
+float gyro_x = 0.0f;
+float gyro_y = 0.0f;
+float gyro_z = 0.0f;
+static uint8_t ism330_gyro_ok = 0U; /* set 1 on successful gyro read each loop; used in TELEMETRY_Send */
 
 static uint16_t current_packet_num = 1U;
 
@@ -530,15 +542,22 @@ static int32_t TELEMETRY_Send(void)
     return -1;
   }
 
-  pkt.shuttle_id    = SHUTTLE_ID;
-  pkt.sequence_id   = current_packet_num;
-  pkt.tick_ms       = HAL_GetTick();
-  pkt.state         = (uint8_t)current_state;
-  pkt.accel_x       = vib_x;
-  pkt.accel_y       = vib_y;
-  pkt.accel_z       = vib_z;
-  pkt.temp_c        = cached_temp_c;
-  pkt.humidity_pct  = cached_humidity_pct;
+  pkt.shuttle_id   = SHUTTLE_ID;
+  pkt.sequence_id  = current_packet_num;
+  pkt.tick_ms      = HAL_GetTick();
+  pkt.state        = (uint8_t)current_state;
+
+  /* Scale floats to int16 at 2 dp precision. 0x7FFF sentinel for any unavailable field.
+   * vib_x == 99.0f is the accel failure sentinel (99g > ±2g FS — impossible real value). */
+  pkt.accel_x      = (vib_x < 90.0f) ? (int16_t)(vib_x * 100.0f) : (int16_t)0x7FFF;
+  pkt.accel_y      = (vib_y < 90.0f) ? (int16_t)(vib_y * 100.0f) : (int16_t)0x7FFF;
+  pkt.accel_z      = (vib_z < 90.0f) ? (int16_t)(vib_z * 100.0f) : (int16_t)0x7FFF;
+  pkt.gyro_x       = ism330_gyro_ok ? (int16_t)(gyro_x * 100.0f) : (int16_t)0x7FFF;
+  pkt.gyro_y       = ism330_gyro_ok ? (int16_t)(gyro_y * 100.0f) : (int16_t)0x7FFF;
+  pkt.gyro_z       = ism330_gyro_ok ? (int16_t)(gyro_z * 100.0f) : (int16_t)0x7FFF;
+  /* cached_temp_c == -999.0f is the HTS221 failure sentinel. */
+  pkt.temp_c       = (cached_temp_c > -998.0f) ? (int16_t)(cached_temp_c * 100.0f) : (int16_t)0x7FFF;
+  pkt.humidity_pct = (cached_temp_c > -998.0f) ? (int16_t)(cached_humidity_pct * 10.0f) : (int16_t)0x7FFF;
 
   dest.sin_len         = sizeof(dest);
   dest.sin_family      = MX_AF_INET;
@@ -624,6 +643,19 @@ int main(void)
   }
 
   HAL_Delay(100);  /* allow ISM330 to stabilize */
+
+  /* Enable gyroscope: same ODR register value as accelerometer, ±250 dps FS. */
+  uint8_t gyro_config = 0x50;  /* FS_G=00 → ±250 dps; ODR matches accel */
+  if (HAL_I2C_Mem_Write(&hi2c2, ISM330_ADDR, CTRL2_G, 1, &gyro_config, 1, 100) == HAL_OK)
+  {
+    sprintf(uart_buf, "[SENSOR] ISM330 gyroscope enabled (±250 dps)\r\n");
+    HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
+  }
+  else
+  {
+    sprintf(uart_buf, "[SENSOR] ERROR: Failed to initialize ISM330 gyroscope\r\n");
+    HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
+  }
 
   // -----------------------------------------------------------------
   // HUMIDITY/TEMPERATURE INITIALIZATION (HTS221)
@@ -840,6 +872,25 @@ int main(void)
         vib_y = (raw_y * 0.061f) / 1000.0f;
         vib_z = (raw_z * 0.061f) / 1000.0f;
 
+        /* Gyro: same ISM330 chip, OUTX_L_G registers, identical 6-byte little-endian layout. */
+        uint8_t raw_g[6] = {0};
+        if (HAL_I2C_Mem_Read(&hi2c2, ISM330_ADDR, OUTX_L_G, 1, raw_g, 6, 100) == HAL_OK)
+        {
+          int16_t raw_gx = (int16_t)((raw_g[1] << 8) | raw_g[0]);
+          int16_t raw_gy = (int16_t)((raw_g[3] << 8) | raw_g[2]);
+          int16_t raw_gz = (int16_t)((raw_g[5] << 8) | raw_g[4]);
+          gyro_x = (raw_gx * GYRO_SENS_MDPS_LSB) / 1000.0f;  /* mdps/LSB → dps */
+          gyro_y = (raw_gy * GYRO_SENS_MDPS_LSB) / 1000.0f;
+          gyro_z = (raw_gz * GYRO_SENS_MDPS_LSB) / 1000.0f;
+          ism330_gyro_ok = 1U;
+        }
+        else
+        {
+          ism330_gyro_ok = 0U;
+          sprintf(uart_buf, "[SENSOR] ERROR: I2C gyro read failed\r\n");
+          HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+        }
+
         a_mag_g2 = (vib_x * vib_x) + (vib_y * vib_y) + (vib_z * vib_z);
         deviation = fabsf(a_mag_g2 - 1.0f);
 
@@ -892,7 +943,8 @@ int main(void)
       }
       else
       {
-        vib_x = 99.0f; vib_y = 99.0f; vib_z = 99.0f; /* sentinel; gateway can detect */
+        vib_x = 99.0f; vib_y = 99.0f; vib_z = 99.0f; /* sentinel: 99g > ±2g FS, gateway converts to NaN */
+        ism330_gyro_ok = 0U;
         sprintf(uart_buf, "[SENSOR] ERROR: I2C accel read failed\r\n");
         HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
       }
@@ -988,9 +1040,10 @@ int main(void)
     if ((HAL_GetTick() - tx_window_start_tick) >= 1000U)
     {
       sprintf(uart_buf,
-              "[STREAM] st=%u tx=%lu/s accel=(%.2f,%.2f,%.2f)g temp=%.1fC hum=%.0f%%\r\n",
+              "[STREAM] st=%u tx=%lu/s accel=(%.2f,%.2f,%.2f)g gyro=(%.1f,%.1f,%.1f)dps temp=%.1fC hum=%.0f%%\r\n",
               (unsigned)current_state, (unsigned long)tx_count_window,
               vib_x, vib_y, vib_z,
+              gyro_x, gyro_y, gyro_z,
               cached_temp_c, cached_humidity_pct);
       HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
       tx_count_window      = 0U;
