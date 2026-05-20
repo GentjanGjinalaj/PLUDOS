@@ -292,6 +292,17 @@ def load_buffered_data() -> tuple[np.ndarray, np.ndarray]:
         len(df), len(recent), recent[0], recent[-1],
     )
 
+    # Backward-compatible backfill for columns added in schema upgrades.
+    # Old files (pre-ADR-016 v3) lack gyro and seq_gap — impute neutral values so
+    # the model can still train on them rather than crashing with KeyError.
+    for gyro_col in ("gyro_x", "gyro_y", "gyro_z", "gyro_mag"):
+        if gyro_col not in df.columns:
+            df[gyro_col] = 0.0  # 0 dps — neutral, treated as no rotation
+    if "seq_gap" not in df.columns:
+        df["seq_gap"] = 0  # 0 — no loss info for pre-seq_gap files
+    if "accel_mag" not in df.columns:
+        df["accel_mag"] = (df["accel_x"]**2 + df["accel_y"]**2 + df["accel_z"]**2).pow(0.5)
+
     # ZUPT speed estimate: integrate horizontal accel magnitude (sqrt(ax²+ay²)) per shuttle.
     # Velocity resets to 0 at each IDLE→MOVING transition, bounding integration drift
     # to a single pick cycle. IDLE samples are held at speed=0 (shuttle is stationary).
