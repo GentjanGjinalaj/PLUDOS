@@ -134,15 +134,16 @@ _SENSOR_SENTINEL_INT = 32767
 # Intermediate fields (tick_ms, seq_wire, timestamp_ms) are dropped at flush time.
 _PARQUET_COLS = [
     "timestamp",    # pd.Timestamp UTC — anchored STM32 tick via per-shuttle NTP offset
-    "shuttle_id",   # int8  — 1-based integer matching wifi_credentials.h SHUTTLE_ID
-    "seq",          # int32 — uint16 wire counter unwrapped across rollovers; sort key
-    "seq_gap",      # int16 — packets dropped before this row (seq[i]-seq[i-1]-1); 0=no loss
-    "interval_ms",  # float32 ms — wall-clock elapsed since previous packet; NaN for first row
-    "state",        # int8  — 0=IDLE, 1=MOVING
+    "shuttle_id",   # int8    — 1-based integer matching wifi_credentials.h SHUTTLE_ID
+    "seq",          # int32   — uint16 wire counter unwrapped across rollovers; sort key
+    "seq_gap",      # int16   — packets dropped before this row; 0=no loss
+    "state",        # int8    — 0=IDLE, 1=MOVING
+    "energy_j",     # float32 J — cumulative mission energy at this packet (power×elapsed)
     "accel_x",      # float32 g — ISM330 X axis, ±2g FS; NaN if unavailable
     "accel_y",      # float32 g — ISM330 Y axis
     "accel_z",      # float32 g — ISM330 Z axis
     "accel_mag",    # float32 g — √(x²+y²+z²); derived at flush
+    "accel_jerk",   # float32 g/s — |Δaccel_mag/Δt|; captures sudden impacts; derived at flush
     "gyro_x",       # float32 dps — ISM330 roll rate, ±250 dps FS; NaN if unavailable
     "gyro_y",       # float32 dps — ISM330 pitch rate
     "gyro_z",       # float32 dps — ISM330 yaw rate
@@ -245,39 +246,35 @@ def _flush(buf: list[dict], prefix: str) -> None:
     # Anchor STM32 relative tick to gateway NTP wall clock → proper UTC Timestamp.
     df["timestamp"] = pd.to_datetime(df["timestamp_ms"], unit="ms", utc=True)
 
-    # seq_gap: how many packets were dropped before each received packet.
-    # diff() of 1 = consecutive = no gap. Clamp negative (reorder edge case) to 0.
-    # First row gets 0 — no prior packet to compare against.
+    # seq_gap: packets dropped before each row. diff()=1 means consecutive, so sub(1).
+    # Clamp negative (reorder edge case) to 0. First row = 0 (no prior to compare).
     df["seq_gap"] = df["seq"].diff().sub(1).clip(lower=0).fillna(0).astype("int16")
-
-    # interval_ms: actual wall-clock elapsed since the previous packet (ms).
-    # NaN for the first row — no prior timestamp. Reveals network jitter and WiFi dead zones.
-    df["interval_ms"] = (
-        df["timestamp"].diff().dt.total_seconds().mul(1000).round(1).astype("float32")
-    )
 
     # Magnitude proxies derived at flush; pandas propagates NaN through the arithmetic.
     df["accel_mag"] = (df["accel_x"]**2 + df["accel_y"]**2 + df["accel_z"]**2).pow(0.5)
     df["gyro_mag"]  = (df["gyro_x"]**2  + df["gyro_y"]**2  + df["gyro_z"]**2).pow(0.5)
 
-    # Wire precision is int16 ×100 → 2 dp for g/dps/°C, ×10 → 1 dp for %RH.
-    df[["accel_x", "accel_y", "accel_z", "accel_mag",
-        "gyro_x",  "gyro_y",  "gyro_z",  "gyro_mag",
-        "temp_c"]] = (
-        df[["accel_x", "accel_y", "accel_z", "accel_mag",
-            "gyro_x",  "gyro_y",  "gyro_z",  "gyro_mag",
-            "temp_c"]].round(2)
-    )
-    df["humidity_pct"] = df["humidity_pct"].round(1)
+    # accel_jerk: magnitude of the rate of change of accel_mag between consecutive packets.
+    # dt is derived from the timestamp column (already in UTC). NaN on first row.
+    dt_s = df["timestamp"].diff().dt.total_seconds().replace(0, float("nan"))
+    df["accel_jerk"] = df["accel_mag"].diff().abs().div(dt_s)
 
-    # Compact ML dtypes.
+    # Round to wire precision: int16×100 → 2dp for g/dps/°C, int16×10 → 1dp for %RH.
+    # float16 halves per-column storage (2 B vs 4 B) with no meaningful precision loss
+    # for our data ranges (±2g accel, ±250dps gyro, 0-50°C temp, 0-100%RH).
+    sensor_cols = ("accel_x", "accel_y", "accel_z", "accel_mag", "accel_jerk",
+                   "gyro_x",  "gyro_y",  "gyro_z",  "gyro_mag",  "temp_c")
+    df[list(sensor_cols)] = df[list(sensor_cols)].round(2)
+    df["humidity_pct"]    = df["humidity_pct"].round(1)
+
+    # Compact dtypes: int types for identity/state, float16 for sensors, float32 for energy.
     df["shuttle_id"] = df["shuttle_id"].astype("int8")
     df["state"]      = df["state"].astype("int8")
     df["seq"]        = df["seq"].astype("int32")
-    for col in ("accel_x", "accel_y", "accel_z", "accel_mag",
-                "gyro_x",  "gyro_y",  "gyro_z",  "gyro_mag",
-                "temp_c",  "humidity_pct"):
-        df[col] = df[col].astype("float32")
+    df["energy_j"]   = df["energy_j"].astype("float32")  # keep float32: cumulative, wider range
+    for col in sensor_cols:
+        df[col] = df[col].astype("float16")
+    df["humidity_pct"] = df["humidity_pct"].astype("float16")
 
     # Drop all intermediate fields; enforce canonical column order.
     df = df[_PARQUET_COLS]
@@ -488,6 +485,8 @@ class TelemetryProtocol(asyncio.DatagramProtocol):
 
         _mission_energy_j.setdefault(shuttle_name, 0.0)
         _mission_energy_j[shuttle_name] += (power_mw / 1000.0) * elapsed_s  # mW→W × s = J
+        # Snapshot cumulative energy into the packet so Parquet records it per-row.
+        pkt["energy_j"] = _mission_energy_j[shuttle_name]
 
         # Mission boundary tracking: any MOVING packet resets the IDLE timer.
         if state == STATE_MOVING:

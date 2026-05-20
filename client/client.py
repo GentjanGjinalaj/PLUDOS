@@ -293,15 +293,18 @@ def load_buffered_data() -> tuple[np.ndarray, np.ndarray]:
     )
 
     # Backward-compatible backfill for columns added in schema upgrades.
-    # Old files (pre-ADR-016 v3) lack gyro and seq_gap — impute neutral values so
-    # the model can still train on them rather than crashing with KeyError.
+    # Old files missing these columns get neutral values so training doesn't crash.
     for gyro_col in ("gyro_x", "gyro_y", "gyro_z", "gyro_mag"):
         if gyro_col not in df.columns:
-            df[gyro_col] = 0.0  # 0 dps — neutral, treated as no rotation
-    if "seq_gap" not in df.columns:
-        df["seq_gap"] = 0  # 0 — no loss info for pre-seq_gap files
+            df[gyro_col] = np.float16(0)
     if "accel_mag" not in df.columns:
         df["accel_mag"] = (df["accel_x"]**2 + df["accel_y"]**2 + df["accel_z"]**2).pow(0.5)
+    if "accel_jerk" not in df.columns:
+        df["accel_jerk"] = np.float16(0)
+    if "seq_gap" not in df.columns:
+        df["seq_gap"] = np.int16(0)
+    if "energy_j" not in df.columns:
+        df["energy_j"] = np.float32(0)
 
     # ZUPT speed estimate: integrate horizontal accel magnitude (sqrt(ax²+ay²)) per shuttle.
     # Velocity resets to 0 at each IDLE→MOVING transition, bounding integration drift
@@ -334,12 +337,12 @@ def load_buffered_data() -> tuple[np.ndarray, np.ndarray]:
         df.loc[idx, "displacement_m"] = disps
 
     # Column names match data-engine.py _PARQUET_COLS — must stay in sync.
-    # seq_gap: proxy for WiFi quality at each sample point — positions near metal
-    # shelving or the elevator shaft show consistent non-zero gaps the model can learn.
     feature_cols = [
         "accel_x", "accel_y", "accel_z", "accel_mag",
+        "accel_jerk",
         "gyro_x",  "gyro_y",  "gyro_z",  "gyro_mag",
         "seq_gap",
+        "energy_j",
         "speed_ms", "displacement_m",
         "state",
     ]
