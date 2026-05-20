@@ -1,7 +1,7 @@
 services:
   # 0. Zero-Touch Provisioning VPN (Jetson <-> Server only)
   tailscale:
-    image: tailscale/tailscale:v1.66.0
+    image: docker.io/tailscale/tailscale:stable
     container_name: pludos-tailscale
     hostname: pludos-jetson
     profiles:
