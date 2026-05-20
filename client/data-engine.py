@@ -57,8 +57,8 @@ TEST_MODE       = os.getenv("TEST_MODE") == "1"
 TELEMETRY_PORT  = int(os.getenv("TELEMETRY_PORT", os.getenv("COAP_PORT", "5683")))
 
 # Per-shuttle buffer limits (independent of other shuttles).
-# At 50 Hz MOVING: SHUTTLE_SOFT_LIMIT=1000 → proactive flush after 20 s,
-# SHUTTLE_HARD_LIMIT=1500 → emergency flush after 30 s.
+# At 10 Hz MOVING: SHUTTLE_SOFT_LIMIT=1000 → proactive flush after ~100 s,
+# SHUTTLE_HARD_LIMIT=1500 → emergency flush after ~150 s.
 SHUTTLE_SOFT_LIMIT = int(os.getenv("SHUTTLE_SOFT_LIMIT", "1000"))
 SHUTTLE_HARD_LIMIT = int(os.getenv("SHUTTLE_HARD_LIMIT", "1500"))
 

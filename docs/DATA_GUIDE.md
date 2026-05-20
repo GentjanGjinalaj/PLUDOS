@@ -122,12 +122,13 @@ print(f"Mission energy: {df['energy_j'].iloc[-1]:.2f} J")
 
 | State | STM32 internal sample | What arrives at Jetson |
 |---|---|---|
-| IDLE | 10 Hz | 1 Hz (every 10th sample) |
-| MOVING | 50 Hz | 50 Hz (every sample) |
+| IDLE | 10 Hz (sensor loop) | 0.1 Hz — one packet every 10 s |
+| MOVING | 10 Hz | 10 Hz (every sample) |
 
-The STM32 decides the state based on accel_mag. Once MOVING, it stays
-MOVING until 5 consecutive samples are below the movement threshold.
-The Jetson just receives whatever comes in — it never controls the rate.
+The internal loop always runs at 10 Hz — movement detection (`MOVEMENT_DWELL_MS = 500 ms`)
+requires 5 consecutive above-threshold samples regardless of TX rate. The shuttle
+wakes up from IDLE within 500 ms of movement regardless of the 0.1 Hz transmit cadence.
+The Jetson just receives whatever arrives — it never controls the rate.
 
 ---
 

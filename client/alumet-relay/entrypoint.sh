@@ -11,6 +11,7 @@
 #   "relay-client"  — gRPC relay output (plugins/relay)
 #
 # InfluxDB TOML config keys (plugins/influxdb/README.md): host, token, org, bucket.
+# Jetson poll interval: plugins.jetson.poll_interval (default ~100ms; set to 5s here).
 
 set -e
 
@@ -37,5 +38,6 @@ attributes_as_tags = ["ina_channel_label"]
 TOML
     exec alumet-agent \
         --config "${CONFIG}" \
+        --config-override "plugins.jetson.poll_interval='5s'" \
         --plugins jetson,influxdb
 fi
