@@ -323,9 +323,12 @@ def load_buffered_data() -> tuple[np.ndarray, np.ndarray]:
         df.loc[idx, "displacement_m"] = disps
 
     # Column names match data-engine.py _PARQUET_COLS — must stay in sync.
+    # seq_gap: proxy for WiFi quality at each sample point — positions near metal
+    # shelving or the elevator shaft show consistent non-zero gaps the model can learn.
     feature_cols = [
         "accel_x", "accel_y", "accel_z", "accel_mag",
         "gyro_x",  "gyro_y",  "gyro_z",  "gyro_mag",
+        "seq_gap",
         "speed_ms", "displacement_m",
         "state",
     ]

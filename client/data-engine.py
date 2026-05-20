@@ -136,6 +136,8 @@ _PARQUET_COLS = [
     "timestamp",    # pd.Timestamp UTC — anchored STM32 tick via per-shuttle NTP offset
     "shuttle_id",   # int8  — 1-based integer matching wifi_credentials.h SHUTTLE_ID
     "seq",          # int32 — uint16 wire counter unwrapped across rollovers; sort key
+    "seq_gap",      # int16 — packets dropped before this row (seq[i]-seq[i-1]-1); 0=no loss
+    "interval_ms",  # float32 ms — wall-clock elapsed since previous packet; NaN for first row
     "state",        # int8  — 0=IDLE, 1=MOVING
     "accel_x",      # float32 g — ISM330 X axis, ±2g FS; NaN if unavailable
     "accel_y",      # float32 g — ISM330 Y axis
@@ -243,6 +245,17 @@ def _flush(buf: list[dict], prefix: str) -> None:
     # Anchor STM32 relative tick to gateway NTP wall clock → proper UTC Timestamp.
     df["timestamp"] = pd.to_datetime(df["timestamp_ms"], unit="ms", utc=True)
 
+    # seq_gap: how many packets were dropped before each received packet.
+    # diff() of 1 = consecutive = no gap. Clamp negative (reorder edge case) to 0.
+    # First row gets 0 — no prior packet to compare against.
+    df["seq_gap"] = df["seq"].diff().sub(1).clip(lower=0).fillna(0).astype("int16")
+
+    # interval_ms: actual wall-clock elapsed since the previous packet (ms).
+    # NaN for the first row — no prior timestamp. Reveals network jitter and WiFi dead zones.
+    df["interval_ms"] = (
+        df["timestamp"].diff().dt.total_seconds().mul(1000).round(1).astype("float32")
+    )
+
     # Magnitude proxies derived at flush; pandas propagates NaN through the arithmetic.
     df["accel_mag"] = (df["accel_x"]**2 + df["accel_y"]**2 + df["accel_z"]**2).pow(0.5)
     df["gyro_mag"]  = (df["gyro_x"]**2  + df["gyro_y"]**2  + df["gyro_z"]**2).pow(0.5)
@@ -269,9 +282,12 @@ def _flush(buf: list[dict], prefix: str) -> None:
     # Drop all intermediate fields; enforce canonical column order.
     df = df[_PARQUET_COLS]
 
-    shuttle_label = f"shuttle-{df['shuttle_id'].iloc[0]}"
-    ts        = int(time.time())
-    file_path = os.path.join(BUFFER_DIR, f"{prefix}_{ts}.parquet")
+    shuttle_id_val = int(df["shuttle_id"].iloc[0])
+    shuttle_label  = f"shuttle-{shuttle_id_val}"
+    # Include shuttle_id and millisecond timestamp in filename so concurrent flushes from
+    # different shuttles (or mid-mission pressure flushes for the same shuttle) never collide.
+    ts_ms     = int(time.time() * 1000)
+    file_path = os.path.join(BUFFER_DIR, f"{prefix}_s{shuttle_id_val}_{ts_ms}.parquet")
     tmp_path  = file_path + ".tmp"
     # PyArrow write is sync but only fires on flush — acceptable latency spike.
     df.to_parquet(tmp_path, engine="pyarrow", index=False)
