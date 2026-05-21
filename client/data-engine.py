@@ -56,15 +56,56 @@ logger = logging.getLogger("data-engine")
 TEST_MODE       = os.getenv("TEST_MODE") == "1"
 TELEMETRY_PORT  = int(os.getenv("TELEMETRY_PORT", os.getenv("COAP_PORT", "5683")))
 
-# Per-shuttle buffer limits (independent of other shuttles).
-# At 10 Hz MOVING: SHUTTLE_SOFT_LIMIT=1000 → proactive flush after ~100 s,
-# SHUTTLE_HARD_LIMIT=1500 → emergency flush after ~150 s.
-SHUTTLE_SOFT_LIMIT = int(os.getenv("SHUTTLE_SOFT_LIMIT", "1000"))
-SHUTTLE_HARD_LIMIT = int(os.getenv("SHUTTLE_HARD_LIMIT", "1500"))
+# ---------------------------------------------------------------------------
+# Buffer limits — hard-coded defaults vs RAM-percentage auto mode.
+#
+# Default strategy (SHUTTLE_LIMIT_MODE unset or "fixed"):
+#   Hard packet counts sized for 10 Hz MOVING TX rate on the Jetson 8 GB.
+#   At ~300 B Python dict overhead per packet:
+#     SHUTTLE_SOFT_LIMIT=3000  → ~5 min of MOVING before proactive flush (≈0.9 MB RAM)
+#     SHUTTLE_HARD_LIMIT=4500  → ~7.5 min before emergency flush          (≈1.4 MB RAM)
+#     GATEWAY_HARD_LIMIT=100000→ safety ceiling across all shuttles       (≈30 MB RAM)
+#   These defaults produce at most one Parquet write per 5-minute mission
+#   segment — far fewer eMMC writes than the old 1000/1500 limits.
+#
+# Auto strategy (SHUTTLE_LIMIT_MODE=auto):
+#   Reads available RAM via psutil at startup and sizes limits as fractions
+#   of available memory. Useful when deploying on non-Jetson hardware.
+#   Falls back to fixed defaults if psutil is not installed.
+#   Fractions: per-shuttle soft = 0.02% of avail RAM, hard = 1.5×soft,
+#              gateway ceiling = 0.3% of avail RAM.
+#
+# Override any limit explicitly via env var regardless of mode.
+# ---------------------------------------------------------------------------
 
-# Emergency safety ceiling across the entire gateway (all shuttles combined).
-# At 24 bytes/packet and 8 GB Jetson RAM, 50 000 packets ≈ 1.2 MB.
-GATEWAY_HARD_LIMIT = int(os.getenv("GATEWAY_HARD_LIMIT", "50000"))
+_PACKET_BYTES_EST = 300  # conservative Python dict overhead per in-memory packet
+
+def _compute_auto_limits() -> tuple[int, int, int]:
+    """Derive buffer limits from available RAM (psutil). Returns (soft, hard, gateway)."""
+    try:
+        import psutil  # optional — not in requirements.txt on non-Jetson targets
+        avail = psutil.virtual_memory().available
+        soft    = max(3000, int(avail * 0.0002 / _PACKET_BYTES_EST))
+        hard    = max(4500, int(soft * 1.5))
+        gateway = max(100000, int(avail * 0.003 / _PACKET_BYTES_EST))
+        logger.info(
+            "[CONFIG] auto limits from %.1f GB available RAM: soft=%d hard=%d gateway=%d",
+            avail / 1e9, soft, hard, gateway,
+        )
+        return soft, hard, gateway
+    except ImportError:
+        logger.warning("[CONFIG] psutil not installed — falling back to fixed defaults")
+        return 3000, 4500, 100000
+
+_LIMIT_MODE = os.getenv("SHUTTLE_LIMIT_MODE", "fixed").lower()
+if _LIMIT_MODE == "auto" and "SHUTTLE_SOFT_LIMIT" not in os.environ:
+    _auto_soft, _auto_hard, _auto_gw = _compute_auto_limits()
+else:
+    _auto_soft, _auto_hard, _auto_gw = 3000, 4500, 100000
+
+SHUTTLE_SOFT_LIMIT = int(os.getenv("SHUTTLE_SOFT_LIMIT", str(_auto_soft)))
+SHUTTLE_HARD_LIMIT = int(os.getenv("SHUTTLE_HARD_LIMIT", str(_auto_hard)))
+GATEWAY_HARD_LIMIT = int(os.getenv("GATEWAY_HARD_LIMIT", str(_auto_gw)))
 
 if SHUTTLE_HARD_LIMIT <= SHUTTLE_SOFT_LIMIT:
     raise ValueError(
@@ -288,10 +329,13 @@ def _flush(buf: list[dict], prefix: str) -> None:
     ts_ms     = int(time.time() * 1000)
     file_path = os.path.join(BUFFER_DIR, f"{prefix}_s{shuttle_id_val}_{ts_ms}.parquet")
     tmp_path  = file_path + ".tmp"
+    # zstd compression: 40-60% smaller files than snappy with similar write speed.
+    # level=3 balances compression ratio and CPU cost on the Jetson Cortex-A78.
     # PyArrow write is sync but only fires on flush — acceptable latency spike.
-    df.to_parquet(tmp_path, engine="pyarrow", index=False)
+    df.to_parquet(tmp_path, engine="pyarrow", index=False,
+                  compression="zstd", compression_level=3)
     os.replace(tmp_path, file_path)  # atomic rename: crash-safe on Linux
-    logger.info("[%s] Flushed %d records → %s", shuttle_label, len(df), file_path)
+    logger.info("[%s] Flushed %d records → %s (zstd)", shuttle_label, len(df), file_path)
     buf.clear()
 
 
@@ -738,8 +782,10 @@ def _consolidate_day(date_str: str) -> None:
         df.drop_duplicates(subset=["shuttle_id", "seq"], keep="last", inplace=True)
 
     tmp_path = daily_path + ".tmp"
+    # zstd: consistent compression across mission and daily files.
     # PyArrow write is sync but consolidation runs on an executor — acceptable.
-    df.to_parquet(tmp_path, engine="pyarrow", index=False)
+    df.to_parquet(tmp_path, engine="pyarrow", index=False,
+                  compression="zstd", compression_level=3)
     os.replace(tmp_path, daily_path)
 
     for f in day_files:
@@ -790,15 +836,27 @@ async def _daily_consolidate_task() -> None:
 
 async def main() -> None:
     logger.info("Gateway wall clock: %s UTC", pd.Timestamp.now(tz="UTC").isoformat())
+
+    # Log available RAM so operators can see how buffer limits relate to headroom.
+    try:
+        import psutil
+        vm = psutil.virtual_memory()
+        ram_info = f"RAM avail={vm.available/1e9:.1f}GB total={vm.total/1e9:.1f}GB"
+    except ImportError:
+        ram_info = "RAM info unavailable (psutil not installed)"
+
     logger.info(
         "PLUDOS Data Engine (ADR-016 v3 + gyro) starting | TEST_MODE=%s | UDP=%d | "
-        "pkt=%dB | shuttle soft=%d hard=%d | gateway hard=%d | mission_end_idle=%.0fs | "
-        "group=%s | dir=%s",
+        "pkt=%dB | limit_mode=%s | shuttle soft=%d (~%.0fMB) hard=%d | gateway hard=%d | "
+        "mission_end_idle=%.0fs | group=%s | dir=%s | %s",
         TEST_MODE, TELEMETRY_PORT, TELEMETRY_SIZE,
-        SHUTTLE_SOFT_LIMIT, SHUTTLE_HARD_LIMIT, GATEWAY_HARD_LIMIT,
+        _LIMIT_MODE,
+        SHUTTLE_SOFT_LIMIT, SHUTTLE_SOFT_LIMIT * _PACKET_BYTES_EST / 1e6,
+        SHUTTLE_HARD_LIMIT, GATEWAY_HARD_LIMIT,
         MISSION_END_IDLE_S,
         ",".join(str(i) for i in sorted(SHUTTLE_GROUP)) if SHUTTLE_GROUP else "any",
         BUFFER_DIR,
+        ram_info,
     )
 
     # Single UDP listener — replaces both the aiocoap /vib server and the

@@ -39,8 +39,8 @@
 /* 24-byte unified telemetry payload (ADR-016 v3 / wire_protocol.md §1).
  * Sensor floats replaced by int16_t scaled ×100 (accel g, gyro dps, temp °C) or
  * ×10 (humidity %RH) — halves per-field wire cost; adds ISM330 gyroscope.
- * Sentinel: 0x7FFF (INT16_MAX) for accel/gyro/humidity unavailable;
- *           0x8000 (INT16_MIN) for temp unavailable.
+ * Sentinel: 0x7FFF (INT16_MAX) for ALL unavailable int16 fields — accel, gyro,
+ *           temp, and humidity. See wire_protocol.md §1 and data-engine.py.
  * Python unpack: struct.unpack('<BHIBhhhhhhhh', data) */
 #pragma pack(push, 1)
 typedef struct {
@@ -54,7 +54,7 @@ typedef struct {
   int16_t  gyro_x;          /* dps × 100; 0x7FFF if ISM330 unavailable                  */
   int16_t  gyro_y;          /* dps × 100                                                  */
   int16_t  gyro_z;          /* dps × 100                                                  */
-  int16_t  temp_c;          /* °C × 100; 0x8000 if HTS221 unavailable                   */
+  int16_t  temp_c;          /* °C × 100; 0x7FFF if HTS221 unavailable                   */
   int16_t  humidity_pct;    /* %RH × 10;  0x7FFF if HTS221 unavailable                  */
 } __attribute__((packed)) PludosTelemetry_t;   /* total: 24 bytes                        */
 #pragma pack(pop)

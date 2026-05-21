@@ -59,15 +59,21 @@ services:
     restart: unless-stopped
 
   # 3. Alumet relay sidecar — ADR-011 Phase 2
-  # alumet-cli reads INA3221 natively via the Jetson plugin.
-  # Local mode  (ALUMET_SERVER_ADDR unset): writes directly to InfluxDB.
+  # Gated behind the 'energy' profile so plain `podman-compose up data-engine`
+  # skips this service. First build compiles Rust from source (20–30 min on Jetson).
+  # Start with: podman-compose --profile energy up alumet-relay
+  #
+  # alumet-agent reads INA3221 natively via the nvidia-jetson plugin.
+  # Local mode  (ALUMET_SERVER_ADDR unset): writes directly to server InfluxDB.
   # Relay mode  (ALUMET_SERVER_ADDR set):   forwards stream to server Alumet over gRPC.
-  # probe.py was removed — alumet-cli handles INA3221 without a Python shim.
+  # See ADR-011 in docs/decisions.md and docs/DEPLOYMENT_CHECKLIST.md for activation steps.
   alumet-relay:
     build:
       context: ./alumet-relay
       dockerfile: Containerfile
     container_name: pludos-alumet-relay
+    profiles:
+      - energy
     env_file:
       - .env
     environment:
