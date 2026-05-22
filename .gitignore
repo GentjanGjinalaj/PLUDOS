@@ -3,6 +3,7 @@ pludos_venv/
 __pycache__/
 *.py[cod]
 *.egg-info/
+build_pludos_dashboard
 
 # Data files (runtime output, never commit)
 *.parquet
@@ -36,10 +37,26 @@ STM_Shuttles/CLAUDE.md
 
 
 .github/
-docs/
 .vscode/
+
+# Root-level ops files — local use only (contain credentials / stale content)
+OPERATIONS.md
+QUICKSTART.md
+
+# Docs: only block the sensitive or internal-only files.
+# Technical reference docs (architecture, wire protocol, etc.) are intentionally public.
+docs/OPS_COMMANDS.md
+docs/DOWNLOAD.md
+docs/DEPLOYMENT_CHECKLIST.md
+docs/THESIS_KEYPOINTS.md
+docs/QUICK_REFERENCE.md
+docs/JETSON_DEPLOYMENT.md
+docs/current_problems.md
+docs/next_steps.md
+docs/future_options.md
 # Claude Code worktrees (isolation branches, not for repo)
 .claude/worktrees/
 .claude/
+
 
 

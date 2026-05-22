@@ -1,0 +1,203 @@
+# PLUDOS Architecture
+
+PLUDOS is a three-tier energy-aware federated learning system for predictive
+maintenance on warehouse shuttles. This document describes responsibilities,
+data flow, and current implementation status. Where claims in other docs
+diverge from the code, the code wins and the divergence is flagged.
+
+---
+
+## Tier 1 — Extreme Edge (STM32U5 on shuttle)
+
+**Hardware:** STMicroelectronics B-U585I-IOT02A (STM32U585AII6Q, Cortex-M33 @
+160 MHz, 786 KB SRAM (768 KB main + 16 KB SRAM4 backup domain), 2 MB Flash).
+Sensors in use: ISM330DLC accelerometer (I2C2), HTS221 temperature/humidity
+(I2C2), LPS22HH pressure (I2C2, read for local UART debug only — not on
+the wire), MXCHIP EMW3080 WiFi (SPI2). The STM32 no longer computes or
+transmits `power_mw` — the gateway derives it from the `state` field using
+`POWER_IDLE_MW` / `POWER_MOVING_MW` env vars. Real INA3221/Alumet
+measurement on the Jetson is tracked in ADR-011 (P2-2).
+
+**Firmware responsibilities (ADR-015 v2):**
+
+- Sample the accelerometer at 10 Hz (both states), run the idle/moving state
+  machine, and stream telemetry directly. No SRAM buffer — every sample
+  becomes a UDP packet at the state-appropriate TX rate (10 Hz MOVING,
+  0.1 Hz IDLE — every 100th sample). Commit 3e99444 reduced rates from the
+  original 50 Hz / 1 Hz to lower radio duty cycle.
+- Unified telemetry (accel xyz, gyro xyz, temp, humidity, state) goes out as a
+  single 24-byte `PludosTelemetry` v3 raw UDP datagram to
+  `udp://<gateway>:5683`. No CoAP, no second port, no ACK, no retry.
+- Refresh the env-sensor (HTS221/LPS22HH) cache every 500 ms off the hot
+  path; the cached value is stamped into every outgoing packet.
+
+**Implementation status:**
+
+- State machine: implemented — IDLE/MOVING with 20 s no-movement timeout,
+  500 ms dwell, 300 ms debounce (see `state_machine.md`).
+- Transmit path: implemented as fire-and-forget UDP. No application-layer
+  retry. ADR-015 documents the trade-off vs the retired CoAP CON path.
+- WiFi: working after EXTI ISR routing fix (`docs/WIFI_FIX_AND_BUILD.md`).
+  Non-blocking reconnect on `STA_DOWN` via status callback; reconnect
+  triggers a short beacon re-probe to handle network changes (≤500 ms).
+- Credentials: in `Core/Inc/wifi_credentials.h` (gitignored). Committed
+  template at `wifi_credentials.h.example`.
+- Beacon discovery: end-to-end. Gateway broadcasts
+  `PLUDOS-GW:<ip>[:csv-ids]` on UDP 5000. STM32 listens at boot (30 s
+  patient probe), on every WiFi reconnect (short probe), and periodically
+  every 30 s while IDLE; bonds only when its `SHUTTLE_ID` is in the
+  beacon's shuttle list (multi-Jetson pairing — see `DEPLOYMENT_3JETSON.md`).
+
+---
+
+## Tier 2 — Edge Gateway (Jetson Orin Nano per warehouse)
+
+**Hardware:** Jetson Orin Nano Super Developer Kit (8 GB module, 67 TOPS, 7-25 W envelope). One gateway per warehouse,
+designed for ≥100 shuttles per gateway.
+
+**Software (containerised under Podman, see `client/compose.yaml`):**
+
+- `data-engine` service: asyncio UDP listener bound to 0.0.0.0:5683;
+  ingests 24-byte `PludosTelemetry` packets from STM32 shuttles, buffers
+  in process memory (per-shuttle `dict[str, list[dict]]` keyed by shuttle
+  name — P2-9 fix), flushes to Parquet on a bind-mounted host directory
+  (`./ram_buffer`). Also broadcasts the beacon on UDP 5000.
+- `ai-worker` service: Flower client (`client.py`) that loads the most
+  recent `MAX_PARQUET_FILES` files (default 20), trains XGBoost locally,
+  and ships the booster bytes to the central server. Profiled by
+  `AlumetProfiler` (see below).
+- `alumet-relay` service: sidecar that runs `alumet-cli` to read the
+  Jetson INA3221 (ADR-011 Phase 2). Dormant on hardware until flag
+  verification is finished.
+- `tailscale` service: optional sidecar joining the gateway to the Tailnet
+  for Gateway↔Server reachability; activated via `--profile vpn`.
+
+**Buffering and flush policy (data-engine):**
+
+- Per-shuttle soft limit: `SHUTTLE_SOFT_LIMIT` (default 3000 packets,
+  ≈5 min of 10 Hz MOVING) — proactive flush, mission keeps buffering.
+- Per-shuttle hard limit: `SHUTTLE_HARD_LIMIT` (default 4500 packets,
+  ≈7.5 min) — emergency mid-mission flush.
+- Gateway-wide ceiling: `GATEWAY_HARD_LIMIT` (default 100 000 packets
+  across all shuttles combined) — last-resort safety valve.
+- Mission-end flush: detected on the gateway. After a run of state
+  ==MOVING packets, when the shuttle stays in state==IDLE for
+  `MISSION_END_IDLE_S` (default 30 s), that shuttle's buffer is sorted by
+  `(shuttle_id, sequence_monotonic)` and written to one Parquet file via
+  atomic `os.replace`. There is no `mission_active` wire flag — the
+  firmware (post-ADR-015) doesn't transmit one. Other shuttles' buffers
+  are unaffected.
+- Multi-Jetson pairing: when more than one Jetson is on the same WiFi,
+  set `SHUTTLE_GROUP=1,2` per Jetson — the value is appended to the
+  beacon (`PLUDOS-GW:<ip>:1,2`) so STMs bond only to their assigned
+  gateway, and also serves as an ingress filter that drops out-of-group
+  packets. Empty = accept all.
+
+**Temporal alignment (data-engine):**
+
+- The first packet from a given `shuttle_id` establishes the NTP offset:
+  `offset = receipt_time_ms - tick_ms`. Subsequent packets have an absolute
+  timestamp computed as `tick_ms + offset`.
+- The offset is refreshed every `NTP_REFRESH_INTERVAL` packets (default 100)
+  to bound STM32 crystal-drift accumulation. Drift delta is logged at each
+  refresh. The sort key is `(shuttle_id, sequence_id)`, not `timestamp_ms`,
+  so mid-mission offset corrections do not reorder Parquet rows. See ADR-009.
+
+**Energy profiling (AlumetProfiler in `client.py`):**
+
+- Spins a background thread at 10 Hz during `model.fit()` and writes two InfluxDB measurements:
+  `fl_energy` (continuous power samples tagged `fl_round`) and `fl_phases` (one summary point per
+  named phase: load / train / round_total with duration_ms, energy_j, avg_power_w).
+- **Phase 1 done:** reads `tegrastats --interval 100 --count 1` and parses `VDD_GPU`, `VDD_CPU`,
+  `VDD_SOC` rails on the Jetson. `nvpmodel -q` read once at init and attached as an InfluxDB tag.
+  `energy_j` integrated as `power_w × elapsed_s`. TEST_MODE uses random mock (laptop-safe).
+- **Phase 2 scaffolded (hardware pending):** `client/alumet-relay/` sidecar reads INA3221 sysfs
+  via Alumet and writes a shared metrics file; `_read_relay_metrics()` in `client.py` reads it
+  with `tegrastats` as fallback. Relay gRPC forwarding to the server is wired; alumet-cli flags
+  must be verified on hardware before activating. See ADR-011 in `decisions.md`.
+
+---
+
+## Tier 3 — Central Server (laptop, eventually a server)
+
+**Software (containerised under Podman, see `server/compose.yaml`):**
+
+- `influxdb`: InfluxDB 2.7, bucket `alumet_energy`, org `pludos`, default
+  admin token `pludos-secret-token` (rotate before any non-local deployment).
+- `grafana`: visualisation, default admin/admin.
+- The Flower `ServerApp` (`server.py`) is a separate process started via
+  `flwr run .` from the project root.
+
+**Federated learning round (server.py):**
+
+- 3 rounds, `min_fit_clients = 1`, `min_available_clients = 1`.
+- `on_fit_config_fn` passes `server_round` to the client so the
+  AlumetProfiler can tag energy samples by round.
+- Custom `XGBoostStrategy(FedAvg)` overrides `aggregate_fit` with horizontal
+  tree-set union (ADR-010 Option A). Each client's booster JSON is parsed, all
+  tree objects concatenated, IDs re-sequenced to prevent collisions, and the
+  merged booster validated with `xgb.Booster.load_model()` before broadcast.
+  Single-client rounds return the booster unchanged. Multi-gateway test pending.
+
+---
+
+## Data flow (steady state, single mission)
+
+1. Shuttle wakes; STM32 streams 0.1 Hz `PludosTelemetry` packets in IDLE,
+   transitions to MOVING when accelerometer deviation > 0.05 g² for
+   500 ms (with 300 ms debounce).
+2. In MOVING the STM32 emits one 24-byte UDP packet per accelerometer
+   sample to `udp://<gateway>:5683` at 10 Hz, fire-and-forget. No buffer,
+   no ACK.
+3. Gateway parses each packet, derives `timestamp_ms = tick_ms + ntp_offset`,
+   tracks per-shuttle uint16 sequence wraps, and appends to the per-shuttle
+   in-memory list.
+4. When the shuttle has been in state==IDLE for `MISSION_END_IDLE_S`
+   (default 30 s) after any MOVING run, the gateway sorts the buffer by
+   `sequence_monotonic` and writes one Parquet file atomically. A
+   `stm_mission` summary point (energy_j, packets, duration_ms) is also
+   pushed to InfluxDB on a daemon thread.
+5. Out of band (manual or scheduled), `flwr run .` starts an FL round; the
+   server signals each gateway-side `ai-worker`, which loads the most
+   recent `MAX_PARQUET_FILES` files, fits XGBoost, returns booster bytes.
+   `AlumetProfiler` pushes 10 Hz power samples to InfluxDB during the fit.
+6. Server aggregates via tree-set union (ADR-010 Option A): concatenates
+   booster trees from all clients, re-sequences IDs, validates merged
+   model, broadcasts to gateways. Energy-aware loop (ADR-014) adapts
+   `n_estimators` next round based on InfluxDB `fl_phases` data.
+
+---
+
+## Failure modes and current handling
+
+| Failure | Detection | Handling | Status |
+| --- | --- | --- | --- |
+| WiFi disconnect on shuttle | `wifi_station_ready` flag, MXCHIP events | FSM keeps sampling; UDP sends become no-ops (TELEMETRY_Send returns -1); on reconnect a short beacon probe re-bonds. Lost packets are accepted (ADR-015) | implemented |
+| Gateway unreachable | UDP is fire-and-forget — packets silently drop | No retry; the next 20 ms / 1 s packet replaces the lost one. STM32 keeps streaming | implemented (by design, ADR-015) |
+| Gateway process crash | none on STM32 side | STM32 keeps sending into the void; resumes when data-engine restarts | accepted |
+| Gateway directory loss on reboot | `./ram_buffer` is a host bind-mount, not tmpfs | Buffered Parquet survives a container restart; only un-flushed in-memory packets are lost | mitigated |
+| Server unreachable (FL round) | Flower retry / hang | Round fails; gateway client error | not hardened |
+| Clock drift between STM32 and gateway | NTP offset refreshed every 100 pkts | Drift delta logged; sort key is sequence_monotonic not timestamp | implemented (ADR-009) |
+| WiFi credentials in repo | gitignored header | `wifi_credentials.h` not committed | resolved |
+| STM bonds to wrong Jetson on multi-Jetson WiFi | Beacon shuttle-list mismatch | STM ignores beacons whose csv-id list omits its `SHUTTLE_ID`; gateway also drops out-of-group ingress | implemented |
+
+---
+
+## What is genuinely novel vs engineering
+
+For thesis-writing purposes, distinguish carefully:
+
+- **Engineering, not novel:** XGBoost over Flower (Flower has official XGBoost
+  examples), fire-and-forget UDP telemetry on the edge (standard IoT
+  pattern), file-backed buffering on edge gateways (standard sysadmin),
+  beacon-based service discovery (mDNS / SSDP variants for decades).
+- **Plausibly novel, with caveats:** SRAM-pressure-driven flush trigger from
+  the constrained edge rather than the gateway, *if* compared against
+  existing IoT backpressure literature and shown to outperform. Treating
+  the energy cost of an FL round as a tagged time-series for
+  energy-aware adaptation, *if* the loop is closed (server reads InfluxDB
+  to choose `n_estimators`, which is currently listed as future work).
+- **Now implemented:** "Federated XGBoost" via horizontal tree-set union (ADR-010 Option A).
+  Single-gateway test is working. Multi-gateway end-to-end test is pending.
+  The claim is defensible once multi-gateway data is collected. See `future_options.md §7`
+  for the full contribution checklist.

@@ -298,57 +298,78 @@ def load_buffered_data() -> tuple[np.ndarray, np.ndarray]:
     )
 
     # Backward-compatible backfill for columns added in schema upgrades.
-    # Old files missing these columns get neutral values so training doesn't crash.
-    for gyro_col in ("gyro_x", "gyro_y", "gyro_z", "gyro_mag"):
-        if gyro_col not in df.columns:
-            df[gyro_col] = np.float16(0)
+    # Old Parquet files missing a column get a neutral value so training doesn't crash.
+    _backfill_f16 = {
+        "gyro_x": 0, "gyro_y": 0, "gyro_z": 0, "gyro_mag": 0,
+        "accel_jerk": 0,
+        "horizontal_accel": 0,   # √(ax²+ay²); 0 = no horizontal motion assumed
+        "tilt_angle_deg":   0,   # 0° = flat; safe neutral for old files
+        "gyro_jerk":        0,
+        "rolling_accel_mean_10": 0,
+        "rolling_accel_std_10":  0,
+    }
+    for col, val in _backfill_f16.items():
+        if col not in df.columns:
+            df[col] = np.float16(val)
     if "accel_mag" not in df.columns:
         df["accel_mag"] = (df["accel_x"]**2 + df["accel_y"]**2 + df["accel_z"]**2).pow(0.5)
-    if "accel_jerk" not in df.columns:
-        df["accel_jerk"] = np.float16(0)
     if "seq_gap" not in df.columns:
         df["seq_gap"] = np.int16(0)
     if "energy_j" not in df.columns:
         df["energy_j"] = np.float32(0)
+    if "mission_elapsed_s" not in df.columns:
+        df["mission_elapsed_s"] = np.float32(0)
+    for col in ("moving_run_id", "pause_count", "is_long_pause"):
+        if col not in df.columns:
+            df[col] = np.int8(0)
+    for col in ("pause_duration_s", "moving_run_dur_s"):
+        if col not in df.columns:
+            df[col] = np.float32(0)
 
-    # ZUPT speed estimate: integrate horizontal accel magnitude (sqrt(ax²+ay²)) per shuttle.
-    # Velocity resets to 0 at each IDLE→MOVING transition, bounding integration drift
-    # to a single pick cycle. IDLE samples are held at speed=0 (shuttle is stationary).
-    # dt_s = 0.02 s because MOVING TX rate is 50 Hz; IDLE samples don't accumulate velocity.
-    dt_s = 0.02
-    df["speed_ms"]       = 0.0
-    df["displacement_m"] = 0.0
-    for sid, group in df.groupby("shuttle_id", sort=False):
-        idx     = group.sort_values("seq").index
-        states  = group.loc[idx, "state"].values.astype(int)
-        ax_vals = group.loc[idx, "accel_x"].values
-        ay_vals = group.loc[idx, "accel_y"].values
-        speeds, disps = [], []
-        vel, disp, prev = 0.0, 0.0, int(states[0])
-        for i in range(len(states)):
-            s = int(states[i])
-            if s == 1 and prev == 0:
-                vel = 0.0  # ZUPT: zero velocity at each IDLE→MOVING start
-            if s == 1 and not (np.isnan(ax_vals[i]) or np.isnan(ay_vals[i])):
-                a_h  = float(np.sqrt(ax_vals[i]**2 + ay_vals[i]**2))
-                vel  = max(0.0, vel + a_h * 9.81 * dt_s)
-                disp += vel * dt_s
-            else:
-                vel = 0.0
-            speeds.append(round(vel, 2))
-            disps.append(round(disp, 2))
-            prev = s
-        df.loc[idx, "speed_ms"]       = speeds
-        df.loc[idx, "displacement_m"] = disps
+    # ZUPT speed and displacement.
+    # New Parquet files (data-engine schema ≥ v3.1): pre-computed with correct measured dt.
+    # Old files: compute here with dt_s = 0.1 s (10 Hz MOVING TX rate).
+    if "speed_ms" not in df.columns:
+        dt_s = 0.1   # 10 Hz MOVING rate; old constant was 0.02 (50 Hz, wrong since commit 3e99444)
+        df["speed_ms"]       = 0.0
+        df["displacement_m"] = 0.0
+        for sid, group in df.groupby("shuttle_id", sort=False):
+            idx     = group.sort_values("seq").index
+            states  = group.loc[idx, "state"].values.astype(int)
+            ax_vals = group.loc[idx, "accel_x"].values
+            ay_vals = group.loc[idx, "accel_y"].values
+            speeds, disps = [], []
+            vel, disp, prev = 0.0, 0.0, int(states[0])
+            for i in range(len(states)):
+                s = int(states[i])
+                if s == 1 and prev == 0:
+                    vel = 0.0
+                if s == 1 and not (np.isnan(ax_vals[i]) or np.isnan(ay_vals[i])):
+                    a_h  = float(np.sqrt(ax_vals[i]**2 + ay_vals[i]**2))
+                    vel  = max(0.0, vel + a_h * 9.81 * dt_s)
+                    disp += vel * dt_s
+                else:
+                    vel = 0.0
+                speeds.append(round(vel, 3))
+                disps.append(round(disp, 3))
+                prev = s
+            df.loc[idx, "speed_ms"]       = speeds
+            df.loc[idx, "displacement_m"] = disps
+    elif "displacement_m" not in df.columns:
+        df["displacement_m"] = np.float32(0)
 
     # Column names match data-engine.py _PARQUET_COLS — must stay in sync.
     feature_cols = [
         "accel_x", "accel_y", "accel_z", "accel_mag",
-        "accel_jerk",
-        "gyro_x",  "gyro_y",  "gyro_z",  "gyro_mag",
+        "accel_jerk", "horizontal_accel", "tilt_angle_deg",
+        "gyro_x", "gyro_y", "gyro_z", "gyro_mag", "gyro_jerk",
+        "rolling_accel_mean_10", "rolling_accel_std_10",
         "seq_gap",
         "energy_j",
+        "mission_elapsed_s",
         "speed_ms", "displacement_m",
+        "moving_run_id", "pause_duration_s", "moving_run_dur_s",
+        "pause_count", "is_long_pause",
         "state",
     ]
     # Drop rows where any feature is NaN (sensor failure packets).

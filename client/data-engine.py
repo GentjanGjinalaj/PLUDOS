@@ -120,6 +120,10 @@ NTP_REFRESH_INTERVAL = int(os.getenv("NTP_REFRESH_INTERVAL", "100"))
 # any state==MOVING run, flush the shuttle's buffer as one Parquet file.
 MISSION_END_IDLE_S = float(os.getenv("MISSION_END_IDLE_S", "30"))
 
+# In-mission IDLE stops longer than this are flagged is_long_pause=1 (retry suspect:
+# shuttle waited unusually long without moving, suggesting a failed pick/place).
+RETRY_PAUSE_THRESHOLD_S = float(os.getenv("RETRY_PAUSE_THRESHOLD_S", "8.0"))
+
 # Per-second status log: roll up "tx rate" and last-seen sensor values rather
 # than logging every packet (50 Hz × 100 shuttles would drown the terminal).
 STATUS_LOG_PERIOD_S = float(os.getenv("STATUS_LOG_PERIOD_S", "1.0"))
@@ -182,17 +186,36 @@ _PARQUET_COLS = [
     "seq_gap",      # int16   — packets dropped before this row; 0=no loss
     "state",        # int8    — 0=IDLE, 1=MOVING
     "energy_j",     # float32 J — cumulative mission energy at this packet (power×elapsed)
-    "accel_x",      # float32 g — ISM330 X axis, ±2g FS; NaN if unavailable
-    "accel_y",      # float32 g — ISM330 Y axis
-    "accel_z",      # float32 g — ISM330 Z axis
-    "accel_mag",    # float32 g — √(x²+y²+z²); derived at flush
-    "accel_jerk",   # float32 g/s — |Δaccel_mag/Δt|; captures sudden impacts; derived at flush
-    "gyro_x",       # float32 dps — ISM330 roll rate, ±250 dps FS; NaN if unavailable
-    "gyro_y",       # float32 dps — ISM330 pitch rate
-    "gyro_z",       # float32 dps — ISM330 yaw rate
-    "gyro_mag",     # float32 dps — √(gx²+gy²+gz²); derived at flush
-    "temp_c",       # float32 °C — HTS221; NaN when unavailable
-    "humidity_pct", # float32 %  — HTS221 RH; NaN when unavailable
+    # Accelerometer (ISM330DHCX, ±2 g FS)
+    "accel_x",           # float16 g — X axis; NaN if sensor unavailable
+    "accel_y",           # float16 g — Y axis
+    "accel_z",           # float16 g — Z axis
+    "accel_mag",         # float16 g — √(x²+y²+z²); derived at flush
+    "accel_jerk",        # float16 g/s — |Δaccel_mag/Δt|; sudden-impact detector; derived at flush
+    "horizontal_accel",  # float16 g — √(ax²+ay²); pure horizontal motion, gravity removed
+    "tilt_angle_deg",    # float16 ° — arccos(az/accel_mag)×180/π; 0°=flat, 90°=sideways
+    # Gyroscope (ISM330DHCX, ±250 dps FS)
+    "gyro_x",            # float16 dps — roll rate; NaN if unavailable
+    "gyro_y",            # float16 dps — pitch rate
+    "gyro_z",            # float16 dps — yaw rate
+    "gyro_mag",          # float16 dps — √(gx²+gy²+gz²); derived at flush
+    "gyro_jerk",         # float16 dps/s — |Δgyro_mag/Δt|; sharpness of rotational events
+    # 1-second rolling context (window = 10 packets at 10 Hz MOVING rate)
+    "rolling_accel_mean_10", # float16 g — trailing mean of accel_mag; sustained-motion context
+    "rolling_accel_std_10",  # float16 g — trailing std; surface roughness / vibration proxy
+    # Environment (HTS221)
+    "temp_c",       # float16 °C — NaN when unavailable
+    "humidity_pct", # float16 %  — HTS221 RH; NaN when unavailable
+    # Kinematic estimates (ZUPT integration + mission context)
+    "mission_elapsed_s", # float32 s — time since first packet in this flush buffer
+    "speed_ms",          # float32 m/s — ZUPT horizontal speed; resets at each IDLE→MOVING
+    "displacement_m",    # float32 m — ZUPT cumulative horizontal displacement per mission
+    # Mission segmentation (derived from state transitions within the flush buffer)
+    "moving_run_id",     # int8    — 1-based travel leg; 0 = pre-mission IDLE (no MOVING yet)
+    "pause_duration_s",  # float32 s — duration of this in-mission stop; 0 if MOVING or pre/post-mission IDLE
+    "moving_run_dur_s",  # float32 s — duration of the MOVING run containing this packet; 0 for IDLE
+    "pause_count",       # int8    — cumulative in-mission pauses completed before this packet
+    "is_long_pause",     # int8    — 1 if pause_duration_s > RETRY_PAUSE_THRESHOLD_S (retry suspect)
 ]
 
 # ---------------------------------------------------------------------------
@@ -279,10 +302,12 @@ _tx_rate_window: dict[str, int] = {}
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _flush(buf: list[dict], prefix: str) -> None:
-    """Cast to ML-ready dtypes, compute derived columns, write clean Parquet atomically."""
+def _flush(buf: list[dict], prefix: str) -> tuple[float, float]:
+    """Cast to ML-ready dtypes, compute derived columns, write clean Parquet atomically.
+    Returns (final_displacement_m, max_speed_ms) for the mission-end InfluxDB summary.
+    Returns (0.0, 0.0) on empty buffer."""
     if not buf:
-        return
+        return 0.0, 0.0
     df = pd.DataFrame(buf)
     df.sort_values(by=["shuttle_id", "seq"], inplace=True)
 
@@ -297,27 +322,146 @@ def _flush(buf: list[dict], prefix: str) -> None:
     df["accel_mag"] = (df["accel_x"]**2 + df["accel_y"]**2 + df["accel_z"]**2).pow(0.5)
     df["gyro_mag"]  = (df["gyro_x"]**2  + df["gyro_y"]**2  + df["gyro_z"]**2).pow(0.5)
 
-    # accel_jerk: magnitude of the rate of change of accel_mag between consecutive packets.
-    # dt is derived from the timestamp column (already in UTC). NaN on first row.
+    # dt_s between consecutive packets — used for all per-packet time derivatives.
+    # replace(0) guards against duplicate timestamps on buffer-pressure boundary packets.
     dt_s = df["timestamp"].diff().dt.total_seconds().replace(0, float("nan"))
+
+    # accel_jerk: |Δaccel_mag / Δt| — captures sudden impacts. NaN on first row.
     df["accel_jerk"] = df["accel_mag"].diff().abs().div(dt_s)
 
-    # Round to wire precision: int16×100 → 2dp for g/dps/°C, int16×10 → 1dp for %RH.
-    # float16 halves per-column storage (2 B vs 4 B) with no meaningful precision loss
-    # for our data ranges (±2g accel, ±250dps gyro, 0-50°C temp, 0-100%RH).
-    sensor_cols = ("accel_x", "accel_y", "accel_z", "accel_mag", "accel_jerk",
-                   "gyro_x",  "gyro_y",  "gyro_z",  "gyro_mag",  "temp_c")
+    # horizontal_accel: √(ax²+ay²) — motion in the horizontal plane with gravity removed.
+    df["horizontal_accel"] = (df["accel_x"]**2 + df["accel_y"]**2).pow(0.5)
+
+    # tilt_angle_deg: arccos(az / accel_mag) in degrees.
+    # 0° = sensor flat/upright, 90° = sideways, >90° = inverted.
+    # clip(-1,1) prevents domain errors from floating-point accel_mag rounding.
+    df["tilt_angle_deg"] = (
+        df["accel_z"].div(df["accel_mag"].replace(0, float("nan")))
+        .clip(-1.0, 1.0)
+        .apply(lambda v: math.degrees(math.acos(v)) if not math.isnan(v) else float("nan"))
+    )
+
+    # gyro_jerk: |Δgyro_mag / Δt| — rate of change of angular velocity. NaN on first row.
+    df["gyro_jerk"] = df["gyro_mag"].diff().abs().div(dt_s)
+
+    # 1-second rolling context window (10 packets at 10 Hz MOVING rate).
+    # min_periods=1 avoids NaN at the start of a buffer; std needs ≥2 points.
+    df["rolling_accel_mean_10"] = df["accel_mag"].rolling(10, min_periods=1).mean()
+    df["rolling_accel_std_10"]  = df["accel_mag"].rolling(10, min_periods=2).std().fillna(0.0)
+
+    # mission_elapsed_s: seconds from the first packet in this flush buffer.
+    df["mission_elapsed_s"] = (
+        df["timestamp"] - df["timestamp"].iloc[0]
+    ).dt.total_seconds()
+
+    # ZUPT speed and displacement using actual measured packet dt (not a fixed constant).
+    # Velocity resets to 0.0 at each IDLE→MOVING boundary, bounding integration drift
+    # to a single pick cycle. IDLE samples: speed=0 (shuttle stationary).
+    dt_arr  = dt_s.fillna(0.1).values   # first-packet fallback: assume 10 Hz interval
+    states  = df["state"].values.astype(int)
+    ax_vals = df["accel_x"].values.astype(float)
+    ay_vals = df["accel_y"].values.astype(float)
+    speeds, disps = [], []
+    vel, disp, prev = 0.0, 0.0, states[0]
+    for i in range(len(states)):
+        s  = int(states[i])
+        dt = float(dt_arr[i])
+        if s == 1 and prev == 0:
+            vel = 0.0  # ZUPT: zero velocity at IDLE→MOVING transition
+        if s == 1 and not (math.isnan(ax_vals[i]) or math.isnan(ay_vals[i])):
+            a_h  = math.sqrt(ax_vals[i]**2 + ay_vals[i]**2)
+            vel  = max(0.0, vel + a_h * 9.81 * dt)
+            disp += vel * dt
+        else:
+            vel = 0.0
+        speeds.append(round(vel, 3))
+        disps.append(round(disp, 3))
+        prev = s
+    df["speed_ms"]       = speeds
+    df["displacement_m"] = disps
+
+    # Mission segmentation: label each packet with its travel leg and pause context.
+    # Two-pass scan over contiguous state runs; pure Python/lists — no numpy.
+    times_arr = df["mission_elapsed_s"].values.tolist()
+    n = len(states)  # `states` already computed above for the ZUPT loop
+
+    # Pass 1: collect contiguous state runs → [(state_val, start_idx, end_idx, duration_s), ...]
+    segments = []
+    i = 0
+    while i < n:
+        s_type  = int(states[i])
+        s_start = i
+        while i < n and int(states[i]) == s_type:
+            i += 1
+        # duration = elapsed time from first to last packet in this run
+        dur = float(times_arr[i - 1] - times_arr[s_start]) if i - 1 > s_start else 0.0
+        segments.append((s_type, s_start, i, dur))
+
+    # Pass 2: annotate per-packet output lists.
+    moving_run_id_arr  = [0] * n
+    pause_dur_arr      = [0.0] * n
+    moving_run_dur_arr = [0.0] * n
+    pause_count_arr    = [0] * n
+    is_long_pause_arr  = [0] * n
+
+    moving_run_count = 0
+    cum_pauses       = 0
+    for seg_idx, (s_type, s_start, s_end, dur_s) in enumerate(segments):
+        if s_type == STATE_MOVING:
+            moving_run_count += 1
+            for j in range(s_start, s_end):
+                moving_run_id_arr[j]  = moving_run_count
+                moving_run_dur_arr[j] = dur_s
+                pause_count_arr[j]    = cum_pauses
+        else:  # STATE_IDLE
+            # An in-mission pause is IDLE sandwiched between two MOVING runs.
+            has_before = any(seg[0] == STATE_MOVING for seg in segments[:seg_idx])
+            has_after  = any(seg[0] == STATE_MOVING for seg in segments[seg_idx + 1:])
+            if has_before and has_after:
+                cum_pauses += 1
+                long_flag   = 1 if dur_s > RETRY_PAUSE_THRESHOLD_S else 0
+                for j in range(s_start, s_end):
+                    pause_dur_arr[j]     = dur_s
+                    pause_count_arr[j]   = cum_pauses
+                    is_long_pause_arr[j] = long_flag
+            else:  # pre/post-mission IDLE: inherit current cumulative pause count
+                for j in range(s_start, s_end):
+                    pause_count_arr[j] = cum_pauses
+
+    df["moving_run_id"]    = moving_run_id_arr
+    df["pause_duration_s"] = pause_dur_arr
+    df["moving_run_dur_s"] = moving_run_dur_arr
+    df["pause_count"]      = pause_count_arr
+    df["is_long_pause"]    = is_long_pause_arr
+
+    # Round to wire precision before downcasting to float16.
+    # float16 halves storage (2 B vs 4 B) with no meaningful precision loss
+    # for our data ranges (±2g accel, ±250 dps gyro, 0-50°C, 0-100%RH).
+    sensor_cols = (
+        "accel_x", "accel_y", "accel_z", "accel_mag", "accel_jerk",
+        "horizontal_accel", "tilt_angle_deg",
+        "gyro_x", "gyro_y", "gyro_z", "gyro_mag", "gyro_jerk",
+        "rolling_accel_mean_10", "rolling_accel_std_10",
+        "temp_c",
+    )
     df[list(sensor_cols)] = df[list(sensor_cols)].round(2)
     df["humidity_pct"]    = df["humidity_pct"].round(1)
 
-    # Compact dtypes: int types for identity/state, float16 for sensors, float32 for energy.
+    # Compact dtypes: int for identity/state, float16 for sensors, float32 for accumulators.
     df["shuttle_id"] = df["shuttle_id"].astype("int8")
     df["state"]      = df["state"].astype("int8")
     df["seq"]        = df["seq"].astype("int32")
-    df["energy_j"]   = df["energy_j"].astype("float32")  # keep float32: cumulative, wider range
+    df["energy_j"]   = df["energy_j"].astype("float32")
     for col in sensor_cols:
         df[col] = df[col].astype("float16")
     df["humidity_pct"] = df["humidity_pct"].astype("float16")
+    for col in ("mission_elapsed_s", "speed_ms", "displacement_m"):
+        df[col] = df[col].astype("float32")
+    df["moving_run_id"] = df["moving_run_id"].astype("int8")
+    df["pause_count"]   = df["pause_count"].astype("int8")
+    df["is_long_pause"] = df["is_long_pause"].astype("int8")
+    for col in ("pause_duration_s", "moving_run_dur_s"):
+        df[col] = df[col].astype("float32")
 
     # Drop all intermediate fields; enforce canonical column order.
     df = df[_PARQUET_COLS]
@@ -336,7 +480,11 @@ def _flush(buf: list[dict], prefix: str) -> None:
                   compression="zstd", compression_level=3)
     os.replace(tmp_path, file_path)  # atomic rename: crash-safe on Linux
     logger.info("[%s] Flushed %d records → %s (zstd)", shuttle_label, len(df), file_path)
+    # Extract summary stats before clearing — returned to mission-end caller for InfluxDB.
+    final_disp = round(float(df["displacement_m"].iloc[-1]), 2)
+    max_spd    = round(float(df["speed_ms"].max()), 2)
     buf.clear()
+    return final_disp, max_spd
 
 
 def _write_mission_summary(
@@ -344,6 +492,8 @@ def _write_mission_summary(
     energy_j: float,
     packets: int,
     duration_ms: float,
+    displacement_m: float = 0.0,
+    max_speed_ms: float = 0.0,
 ) -> None:
     # Fire-and-forget background thread so the asyncio loop is never blocked by InfluxDB I/O.
     def _write() -> None:
@@ -353,17 +503,19 @@ def _write_mission_summary(
                 Point("stm_mission")
                 .tag("shuttle_id", shuttle_id)
                 .tag("gateway",    _GATEWAY_TAG)
-                .field("energy_j",    energy_j)
-                .field("packets",     packets)
-                .field("duration_ms", duration_ms)
+                .field("energy_j",       energy_j)
+                .field("packets",        packets)
+                .field("duration_ms",    duration_ms)
+                .field("displacement_m", displacement_m)
+                .field("max_speed_ms",   max_speed_ms)
                 .time(time.time_ns(), WritePrecision.NS)
             )
             client.write_api(write_options=SYNCHRONOUS).write(
                 bucket=_INFLUXDB_BUCKET, record=point
             )
             logger.info(
-                "[INFLUXDB] stm_mission shuttle=%s energy=%.4fJ pkts=%d dur=%.0fms",
-                shuttle_id, energy_j, packets, duration_ms,
+                "[INFLUXDB] stm_mission shuttle=%s energy=%.4fJ pkts=%d dur=%.0fms disp=%.1fm spd=%.2fm/s",
+                shuttle_id, energy_j, packets, duration_ms, displacement_m, max_speed_ms,
             )
         except Exception as exc:
             logger.warning("[INFLUXDB] stm_mission write failed (%s): %s", shuttle_id, exc)
@@ -436,8 +588,8 @@ def _maybe_flush_mission(shuttle_id: str, now: float) -> None:
     )
 
     # Pop the buffer before reset so _reset_shuttle_state's pop is a no-op.
-    _flush(_telemetry_buf.pop(shuttle_id, []), "mission")
-    _write_mission_summary(shuttle_id, energy, pkts, duration_ms)
+    final_disp, max_spd = _flush(_telemetry_buf.pop(shuttle_id, []), "mission")
+    _write_mission_summary(shuttle_id, energy, pkts, duration_ms, final_disp, max_spd)
     _reset_shuttle_state(shuttle_id)
 
 
@@ -641,18 +793,25 @@ async def _status_log_task() -> None:
             if not _INFLUXDB_TOKEN:
                 continue
             # Live telemetry point for Grafana — one per active shuttle per second.
-            accel_mag = math.sqrt(ax**2 + ay**2 + az**2)
+            accel_mag      = math.sqrt(ax**2 + ay**2 + az**2)
+            h_accel        = math.sqrt(ax**2 + ay**2)
+            tilt_deg       = (
+                math.degrees(math.acos(max(-1.0, min(1.0, az / accel_mag))))
+                if accel_mag > 1e-6 else 0.0
+            )
             point = (
                 Point("stm_telemetry")
                 .tag("shuttle_id", str(sample["shuttle_id"]))
                 .tag("gateway",    _GATEWAY_TAG)
-                .field("state",      sample["state"])
-                .field("accel_x",    round(ax, 2))
-                .field("accel_y",    round(ay, 2))
-                .field("accel_z",    round(az, 2))
-                .field("accel_mag",  round(accel_mag, 2))
-                .field("tx_rate_hz", rate)
-                .field("energy_j",   round(energy, 3))
+                .field("state",             sample["state"])
+                .field("accel_x",           round(ax, 2))
+                .field("accel_y",           round(ay, 2))
+                .field("accel_z",           round(az, 2))
+                .field("accel_mag",         round(accel_mag, 2))
+                .field("horizontal_accel",  round(h_accel, 2))
+                .field("tilt_angle_deg",    round(tilt_deg, 1))
+                .field("tx_rate_hz",        rate)
+                .field("energy_j",          round(energy, 3))
                 .time(time.time_ns(), WritePrecision.NS)
             )
             if gyro_ok:

@@ -36,6 +36,12 @@ services:
     environment:
       - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER}
       - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD}
+      # Anonymous viewer access — anyone who can reach port 3000 can see dashboards
+      # without logging in. Admins still log in at /login for edit access.
+      # Combine with `tailscale funnel 3000` to publish a read-only public URL.
+      - GF_AUTH_ANONYMOUS_ENABLED=${GF_ANON_ENABLED:-true}
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+      - GF_AUTH_DISABLE_LOGIN_FORM=false
     depends_on:
       - influxdb
     restart: unless-stopped

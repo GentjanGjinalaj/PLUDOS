@@ -25,41 +25,41 @@ PLUDOS (**P**ower-aware **L**ightweight **U**DP **D**ata **O**rchestration **S**
 ┌──────────────────────────────────────────────────────────────────────────────┐
 │                         PLUDOS Three-Tier Architecture                        │
 │                                                                              │
-│  ┌─────────────────────┐  CoAP CON (5683)   ┌──────────────────────────────┐│
-│  │  STM32U585 Shuttle  │ ─────────────────► │  Jetson Orin Nano Gateway    ││
-│  │                     │  raw UDP (5684)     │                              ││
-│  │  • INA219 power mon │ ─────────────────► │  data-engine  ──► Parquet    ││
-│  │  • 3-axis accel     │                     │  ai-worker    ──► XGBoost   ││
-│  │  • FreeRTOS FSM     │ ◄─────────────────  │  alumet-relay ──► InfluxDB  ││
-│  │                     │  beacon UDP (5000)   │                              ││
-│  └─────────────────────┘                     └──────────┬───────────────────┘│
-│                                                         │ Tailscale VPN       │
-│                                                         ▼                     │
-│                                              ┌──────────────────────────────┐ │
-│                                              │  Central Server              │ │
-│                                              │                              │ │
-│                                              │  Flower ServerApp            │ │
-│                                              │  XGBoost tree-set union      │ │
-│                                              │  InfluxDB 2.7 + Grafana      │ │
-│                                              └──────────────────────────────┘ │
+│  ┌─────────────────────┐  raw UDP 5683        ┌──────────────────────────────┐│
+│  │  STM32U585 Shuttle  │ ────────────────────► │  Jetson Orin Nano Gateway    ││
+│  │                     │  (24-byte             │                              ││
+│  │  • ISM330DHCX IMU   │   PludosTelemetry)    │  data-engine  ──► Parquet    ││
+│  │  • 6-axis accel+gyro│                       │  ai-worker    ──► XGBoost   ││
+│  │  • HTS221 temp/hum  │ ◄──────────────────── │  alumet-relay ──► InfluxDB  ││
+│  │  • FreeRTOS FSM     │  beacon UDP (5000)     │                              ││
+│  └─────────────────────┘                       └──────────┬───────────────────┘│
+│                                                           │ Tailscale VPN       │
+│                                                           ▼                     │
+│                                                ┌──────────────────────────────┐ │
+│                                                │  Central Server              │ │
+│                                                │                              │ │
+│                                                │  Flower ServerApp            │ │
+│                                                │  XGBoost tree-set union      │ │
+│                                                │  InfluxDB 2.7 + Grafana      │ │
+│                                                └──────────────────────────────┘ │
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Layer 1 — Edge Provisioning (STM32 Shuttle)
 
 - **Hardware:** STM32U585AII6Q on B-U585I-IOT02A (Cortex-M33 @ 160 MHz, TrustZone non-secure)
-- **Sensor pipeline:** 3-axis accelerometer (ISM330DHCX), INA219 power monitor
-- **State machine:** IDLE (2 Hz) / MOVING (50 Hz) FSM based on vibration threshold
-- **Transport:** CoAP CON for critical vibration + power data; raw UDP for environmental telemetry
+- **Sensor pipeline:** ISM330DHCX 6-axis IMU (accel + gyro), HTS221 temperature/humidity
+- **State machine:** IDLE (0.1 Hz TX / 10 Hz internal) / MOVING (10 Hz TX) FSM based on vibration threshold
+- **Transport:** 24-byte `PludosTelemetry` raw UDP to port 5683, fire-and-forget (ADR-015)
 - **Zero-touch provisioning:** Auto-discovers gateway IP via UDP beacon on port 5000
 
 ### Layer 2 — Edge Gateway (Jetson Orin Nano)
 
-- **`data-engine`:** asyncio CoAP server — receives, timestamps (NTP-anchored), buffers per-shuttle, flushes to Parquet on mission-end or buffer threshold
+- **`data-engine`:** asyncio UDP server — receives, timestamps (NTP-anchored), buffers per-shuttle, flushes to Parquet on mission-end or buffer threshold
 - **`ai-worker`:** Flower `ClientApp` — loads Parquet, trains XGBoost on NVIDIA Ampere GPU, streams phase-level energy telemetry to InfluxDB
-- **`alumet-relay`:** Sidecar container — reads INA3221 hardware power rails via Alumet, exposes Prometheus metrics; provides real energy readings as replacement for `tegrastats`
-- **Buffer policy:** 400-packet soft limit, 500-packet hard limit; per-shuttle dict (supports multi-shuttle missions)
-- **Storage:** tmpfs RAM disk for zero-wear Parquet buffering; PyArrow for fast columnar serialization
+- **`alumet-relay`:** Sidecar container — reads INA3221 hardware power rails via Alumet; Phase 2 (ADR-011), gated by `--profile energy`
+- **Buffer policy:** 3000-packet soft limit, 4500-packet hard limit; per-shuttle dict (supports multi-shuttle missions)
+- **Storage:** host bind-mount `ram_buffer/` for zero-wear Parquet buffering; PyArrow for fast columnar serialization
 
 ### Layer 3 — Central Server
 
@@ -76,7 +76,7 @@ PLUDOS instruments energy at three levels simultaneously:
 
 | Measurement | Source | Granularity |
 |---|---|---|
-| `stm_mission` | STM32 INA219 (estimated via power_mw × elapsed_s) | Per shuttle, per mission |
+| `stm_mission` | Gateway-derived (state × `POWER_IDLE/MOVING_MW` × elapsed_s) | Per shuttle, per mission |
 | `fl_energy` | Jetson INA3221 via Alumet relay (tegrastats fallback) | 10 Hz during FL rounds |
 | `fl_phases` | Derived from `fl_energy` accumulator | Per FL phase (load / train / round_total) |
 
@@ -97,7 +97,7 @@ source pludos_venv/bin/activate   # Windows: pludos_venv\Scripts\activate
 pip install -e .
 
 # 2. Generate test data (creates a Parquet file in ram_buffer/)
-python tools/mock_stm32.py        # emits CoAP packets matching wire_protocol.md
+python tools/mock_stm32.py        # emits 24-byte UDP PludosTelemetry matching wire_protocol.md
 
 # 3. Run a federated learning simulation (3 rounds, 1 virtual client)
 TEST_MODE=1 flwr run .

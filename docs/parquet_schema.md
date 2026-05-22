@@ -32,10 +32,10 @@ the bug that caused one shuttle's file to overwrite the other's.
 
 | Trigger | Condition | State reset? |
 |---|---|---|
-| Mission end | shuttle stays IDLE for ≥ 30 s after any MOVING run | Yes |
-| Soft limit | shuttle buffer reaches 1 000 packets (≈ 20 s at 50 Hz) | No — mission continues |
-| Hard limit | shuttle buffer reaches 1 500 packets (≈ 30 s at 50 Hz) | No — mission continues |
-| Gateway ceiling | all-shuttle total reaches 50 000 packets | No |
+| Mission end | shuttle stays IDLE for ≥ 30 s after any MOVING run (`MISSION_END_IDLE_S`) | Yes |
+| Soft limit | shuttle buffer reaches 3 000 packets (≈ 5 min at 10 Hz MOVING) | No — mission continues |
+| Hard limit | shuttle buffer reaches 4 500 packets (≈ 7.5 min at 10 Hz MOVING) | No — mission continues |
+| Gateway ceiling | all-shuttle total reaches 100 000 packets | No |
 | Shutdown | `podman stop` (SIGTERM) — **not** caught; in-flight buffer is lost | — |
 
 Soft and hard limit flushes produce additional files for the same mission.
@@ -54,13 +54,13 @@ mission in sequence order.
 | `shuttle_id` | int8 | — | 1-based integer. Set via `SHUTTLE_ID` in `wifi_credentials.h`. Maps to a human name via `SHUTTLE_NAMES` env var (default `shuttle-N`). |
 | `seq` | int32 | — | Monotonic packet counter. The uint16 wire value (wraps at 65 535) is unwrapped by the gateway into a globally unique sort key. Always use `seq` for ordering, not `timestamp`. |
 | `seq_gap` | int16 | packets | Packets lost **before** this row = `seq[i] − seq[i−1] − 1`. Zero means no loss; 1 means one packet was dropped. First row in each file is always 0. Non-zero values cluster at WiFi dead zones (metal shelving, elevator shaft entry) — this is a position-correlated ML feature. |
-| `interval_ms` | float32 | ms | Actual wall-clock elapsed since the previous packet. Nominal: 20 ms (MOVING, 50 Hz) or 1 000 ms (IDLE, 1 Hz). NaN for the first row. Large spikes indicate network congestion or STM32 timing jitter. |
+| `interval_ms` | float32 | ms | **Deprecated (v2 schema only).** Superseded by deriving `dt` from actual NTP-anchored timestamps at flush time. Not present in v3 (ADR-016) files. |
 
 ### Motion state
 
 | Column | Type | Unit | Description |
 |---|---|---|---|
-| `state` | int8 | — | `0` = IDLE (shuttle stationary, 1 Hz TX), `1` = MOVING (shuttle in transit, 50 Hz TX). Derived from the STM32 FSM — see `docs/state_machine.md`. |
+| `state` | int8 | — | `0` = IDLE (shuttle stationary, 0.1 Hz TX), `1` = MOVING (shuttle in transit, 10 Hz TX). Derived from the STM32 FSM — see `docs/state_machine.md`. |
 
 ### Accelerometer (ISM330DHCX)
 
@@ -104,7 +104,7 @@ training. They are **not stored** in the Parquet files.
 
 | Column | Description |
 |---|---|
-| `speed_ms` | Estimated horizontal speed (m/s) via ZUPT integration: `vel += sqrt(ax²+ay²) × 9.81 × 0.02` on MOVING packets; resets to 0 at each IDLE→MOVING transition to bound drift. Coarse proxy — not calibrated against ground truth. |
+| `speed_ms` | Estimated horizontal speed (m/s) via ZUPT integration: `vel += sqrt(ax²+ay²) × 9.81 × dt` on MOVING packets (where `dt` is the actual inter-packet elapsed time, not a fixed constant); resets to 0 at each IDLE→MOVING transition to bound drift. Coarse proxy — not calibrated against ground truth. |
 | `displacement_m` | Cumulative distance travelled since IDLE→MOVING, in metres. Same caveats as `speed_ms`. |
 
 ---
