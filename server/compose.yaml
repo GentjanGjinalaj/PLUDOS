@@ -71,9 +71,11 @@ services:
       - ALUMET_DEVICE_TAG=server
       # Phase 2: relay port (Jetson Alumet relays forward metrics here)
       - ALUMET_RELAY_PORT=${ALUMET_RELAY_PORT:-50051}
+    # privileged + full /sys mount needed for RAPL in rootless Podman (dev laptop only).
+    privileged: true
     volumes:
-      # Read-only RAPL sysfs for server CPU energy measurement
-      - /sys/class/powercap:/sys/class/powercap:ro
+      # /sys/class/powercap symlinks resolve to /sys/devices/virtual — mount full sysfs.
+      - /sys:/sys:ro
     ports:
       # gRPC relay port — Jetson alumet-relay sidecars forward INA3221 streams here.
       - "${ALUMET_RELAY_PORT:-50051}:50051"
