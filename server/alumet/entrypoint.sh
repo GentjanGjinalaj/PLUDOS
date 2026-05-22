@@ -18,8 +18,10 @@ CONFIG=/tmp/alumet-config.toml
 # Generate TOML config from environment variables at container start.
 cat > "${CONFIG}" <<TOML
 [plugins.rapl]
-poll_interval  = "1s"
-flush_interval = "5s"
+poll_interval    = "1s"
+flush_interval   = "5s"
+# Required by rapl v0.3.1 — disable perf_events fallback (not needed for RAPL sysfs).
+no_perf_events   = true
 
 [plugins.relay-server]
 # Accept metric streams from all Jetson alumet-relay sidecars.

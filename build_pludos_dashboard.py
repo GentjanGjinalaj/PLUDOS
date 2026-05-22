@@ -10,7 +10,7 @@ import base64
 GF_URL   = "http://localhost:3000"
 GF_USER  = "admin"
 GF_PASS  = "admin"
-DS_UID   = "efmmelxiubk00f"
+DS_UID   = "efmtstss6rcw0d"
 BUCKET   = "alumet_energy"
 
 DS = {"type": "influxdb", "uid": DS_UID}
