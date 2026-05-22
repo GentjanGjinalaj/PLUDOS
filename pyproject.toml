@@ -20,8 +20,8 @@ dependencies = [
 publisher = "ggjinalaj"
 
 [tool.flwr.app.components]
-serverapp = "server:app"
-clientapp = "client:app"
+serverapp = "server.server:app"
+clientapp = "client.client:app"
 
 # -----------------------------------------------------------------------
 # FEDERATION MODE 1 — Simulation (default for development / CI)
