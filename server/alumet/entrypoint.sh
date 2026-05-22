@@ -34,7 +34,7 @@ attributes_as = "field"
 
 [plugins.prometheus-exporter]
 host                    = "0.0.0.0"
-port                    = 9091
+port                    = 9094
 prefix                  = ""
 suffix                  = "_alumet"
 add_attributes_to_labels = true

@@ -80,7 +80,7 @@ services:
       # gRPC relay port — Jetson alumet-relay sidecars forward INA3221 streams here.
       - "${ALUMET_RELAY_PORT:-50051}:50051"
       # Prometheus scrape endpoint — Grafana pulls live energy metrics from here.
-      - "9091:9091"
+      - "9094:9094"
     depends_on:
       - influxdb
     restart: unless-stopped
