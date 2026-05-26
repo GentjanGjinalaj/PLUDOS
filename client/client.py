@@ -5,6 +5,8 @@ Runs on the Jetson Orin Nano. Responsibilities:
 1. Load all recent mission Parquet files from the RAM buffer (concatenated).
 2. Generate anomaly labels via the selected backend (ANOMALY_MODEL env var):
      isolation_forest_xgb (default) — IsolationForest on MOVING packets → pseudo-labels
+     lstm_autoencoder               — LSTM autoencoder on sliding windows of MOVING
+                                      packets; reconstruction error = anomaly score
      threshold                       — legacy accel_z > ANOMALY_THRESHOLD_G rule
 3. Train an XGBoost classifier on those labels (federated via Flower).
 4. Profile energy consumption per FL phase via AlumetProfiler.
@@ -14,9 +16,10 @@ Runs on the Jetson Orin Nano. Responsibilities:
 n_estimators is set by the server each round via fit_config() based on the
 previous round's measured energy — this closes the energy-aware FL loop (ADR-014).
 
-Anomaly model switching: set ANOMALY_MODEL=threshold to revert to the legacy label.
-A future ANOMALY_MODEL=lstm_autoencoder backend (feature/lstm-autoencoder branch)
-will use a sequence-level reconstruction error instead of per-sample classification.
+Anomaly model switching:
+  ANOMALY_MODEL=lstm_autoencoder — sequence-level LSTM reconstruction error (this branch)
+  ANOMALY_MODEL=isolation_forest_xgb — per-sample IsolationForest (default, main branch)
+  ANOMALY_MODEL=threshold — legacy accel_z threshold rule
 """
 
 import flwr as fl
@@ -108,6 +111,18 @@ IF_MIN_MOVING_SAMPLES = int(os.getenv("IF_MIN_MOVING_SAMPLES", "50"))
 # Legacy threshold label fallback (used when ANOMALY_MODEL=threshold or IF data too sparse).
 # Default 2.0g: gravity alone reads ~1.0g, so 2.0g catches genuine shocks only.
 ANOMALY_THRESHOLD_G = float(os.getenv("ANOMALY_THRESHOLD_G", "2.0"))
+
+# LSTM autoencoder constants — only used when ANOMALY_MODEL=lstm_autoencoder.
+# Window of 50 packets = 5 s at 10 Hz MOVING TX rate; covers one acceleration ramp-up.
+LSTM_WINDOW_SIZE         = int(os.getenv("LSTM_WINDOW_SIZE",         "50"))
+# Hidden dimension: 32 is enough to capture shuttle motion structure; larger = slower.
+LSTM_HIDDEN_DIM          = int(os.getenv("LSTM_HIDDEN_DIM",          "32"))
+# 20 epochs is fast on Jetson CPU (~10 s for typical round data volume).
+LSTM_EPOCHS              = int(os.getenv("LSTM_EPOCHS",              "20"))
+LSTM_BATCH_SIZE          = int(os.getenv("LSTM_BATCH_SIZE",          "32"))
+# Need at least 4 non-overlapping windows (2×window_size with 50% stride overlap) to
+# train a meaningful autoencoder; below this, fall back to IsolationForest.
+LSTM_MIN_MOVING_SAMPLES  = int(os.getenv("LSTM_MIN_MOVING_SAMPLES",  "200"))
 
 # Where to persist the received global model for standalone (no-server) inference.
 # Lives inside BUFFER_DIR so it survives on the host bind-mount across container
@@ -519,35 +534,178 @@ _IF_FEATURES = [
     "accel_z",              # vertical channel — floor surface + bearing noise
 ]
 
+# Features used by the LSTM autoencoder — raw 6-DOF motion plus magnitude.
+# Raw axes are preferred over derived stats so the autoencoder learns temporal
+# patterns in the signal itself, not features already computed across time.
+_LSTM_FEATURES = [
+    "accel_x", "accel_y", "accel_z",
+    "gyro_x",  "gyro_y",  "gyro_z",
+    "accel_mag",
+]
+
 
 def _make_anomaly_labels(df_clean: pd.DataFrame) -> np.ndarray:
     """
-    Generate binary anomaly labels for XGBoost training.
+    Dispatch to the active anomaly labelling backend (ANOMALY_MODEL env var).
 
-    isolation_forest_xgb (default): fits IsolationForest on MOVING-only packets,
-    uses anomaly scores as pseudo-labels. IDLE packets are always labelled 0
-    (no bearing load, no shock expected). Falls back to threshold if MOVING
-    sample count is below IF_MIN_MOVING_SAMPLES.
-
-    threshold (legacy): accel_z > ANOMALY_THRESHOLD_G, applied to all rows.
+    lstm_autoencoder     — sequence-level LSTM reconstruction error (this branch)
+    isolation_forest_xgb — per-sample IsolationForest (default)
+    threshold            — legacy accel_z > ANOMALY_THRESHOLD_G rule
     """
+    if ANOMALY_MODEL == "lstm_autoencoder":
+        return _make_anomaly_labels_lstm(df_clean)
     if ANOMALY_MODEL == "threshold":
         return (df_clean["accel_z"] > ANOMALY_THRESHOLD_G).astype(int).values
+    # Default: isolation_forest_xgb
+    return _make_anomaly_labels_if(df_clean)
 
-    # Isolation Forest path.
+
+def _make_anomaly_labels_lstm(df_clean: pd.DataFrame) -> np.ndarray:
+    """
+    LSTM autoencoder anomaly labelling for XGBoost training.
+
+    Trains a small seq2seq LSTM autoencoder on sliding windows of MOVING
+    packets. Windows with high reconstruction error are anomalous — they
+    represent motion patterns the model has not learned to compress, which
+    on warehouse shuttles corresponds to vibration or shock signatures.
+
+    Falls back to IsolationForest if there are fewer than LSTM_MIN_MOVING_SAMPLES
+    MOVING packets (too few windows to train a useful autoencoder).
+
+    Returns the same binary label array shape as _make_anomaly_labels().
+    """
+    # Lazy import — torch is only required on this branch.
+    try:
+        import torch
+        import torch.nn as nn
+    except ImportError:
+        logger.error("[ANOMALY] torch not installed — falling back to IsolationForest")
+        return _make_anomaly_labels_if(df_clean)
+
+    moving_mask = df_clean["state"].astype(int) == 1
+    n_moving = int(moving_mask.sum())
+
+    if n_moving < LSTM_MIN_MOVING_SAMPLES:
+        logger.warning(
+            "[ANOMALY] LSTM: only %d MOVING samples (need %d) — falling back to IsolationForest",
+            n_moving, LSTM_MIN_MOVING_SAMPLES,
+        )
+        return _make_anomaly_labels_if(df_clean)
+
+    available = [c for c in _LSTM_FEATURES if c in df_clean.columns]
+    # Sort MOVING rows by sequence to preserve temporal order within the mission.
+    df_moving = df_clean.loc[moving_mask].sort_values("seq") if "seq" in df_clean.columns \
+                else df_clean.loc[moving_mask]
+    X_moving = df_moving[available].values.astype(np.float32)   # (N, D)
+
+    # Build overlapping windows with 50% stride — more training signal than non-overlapping.
+    stride = max(1, LSTM_WINDOW_SIZE // 2)
+    starts = list(range(0, n_moving - LSTM_WINDOW_SIZE + 1, stride))
+    if not starts:
+        logger.warning("[ANOMALY] LSTM: not enough packets for even one window — falling back")
+        return _make_anomaly_labels_if(df_clean)
+
+    windows = np.stack([X_moving[s:s + LSTM_WINDOW_SIZE] for s in starts])  # (W, T, D)
+
+    # Normalize each feature to zero mean / unit std across the full window set.
+    mean = windows.mean(axis=(0, 1), keepdims=True)
+    std  = windows.std(axis=(0, 1), keepdims=True) + 1e-8
+    X_norm = (windows - mean) / std
+
+    tensor = torch.tensor(X_norm)   # (W, T, D)
+    n_features = tensor.shape[2]
+
+    # Seq2seq LSTM autoencoder: encoder compresses to hidden state,
+    # decoder reconstructs the sequence from that context vector.
+    class _LSTMAutoencoder(nn.Module):
+        def __init__(self, n_feat: int, hidden: int) -> None:
+            super().__init__()
+            self.encoder = nn.LSTM(n_feat,  hidden, batch_first=True)
+            self.decoder = nn.LSTM(hidden,  n_feat,  batch_first=True)
+
+        def forward(self, x: "torch.Tensor") -> "torch.Tensor":
+            # Encode: collapse sequence to (batch, 1, hidden).
+            _, (h, _) = self.encoder(x)
+            # Expand hidden state across all time steps so the decoder
+            # sees the same context at every position.
+            ctx = h.permute(1, 0, 2).expand(-1, x.size(1), -1).contiguous()
+            out, _ = self.decoder(ctx)
+            return out
+
+    model = _LSTMAutoencoder(n_features, LSTM_HIDDEN_DIM)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    criterion = nn.MSELoss()
+
+    dataset = torch.utils.data.TensorDataset(tensor)
+    loader  = torch.utils.data.DataLoader(
+        dataset, batch_size=LSTM_BATCH_SIZE, shuffle=True, drop_last=False,
+    )
+
+    logger.info(
+        "[ANOMALY] LSTM: training autoencoder — %d windows, T=%d, D=%d, hidden=%d, epochs=%d",
+        len(starts), LSTM_WINDOW_SIZE, n_features, LSTM_HIDDEN_DIM, LSTM_EPOCHS,
+    )
+    model.train()
+    for epoch in range(LSTM_EPOCHS):
+        epoch_loss = 0.0
+        for (batch,) in loader:
+            optimizer.zero_grad()
+            loss = criterion(model(batch), batch)
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
+        if (epoch + 1) % 5 == 0:
+            logger.info("[ANOMALY] LSTM epoch %02d/%d loss=%.4f",
+                        epoch + 1, LSTM_EPOCHS, epoch_loss / len(loader))
+
+    # Compute per-window MSE reconstruction error.
+    model.eval()
+    with torch.no_grad():
+        recon  = model(tensor)
+        errors = ((tensor - recon) ** 2).mean(dim=(1, 2)).numpy()   # (W,)
+
+    # Accumulate per-packet scores by averaging over all windows that include it.
+    # Uses the same stride as the window construction loop.
+    packet_scores = np.zeros(n_moving, dtype=np.float32)
+    packet_counts = np.zeros(n_moving, dtype=np.float32)
+    for i, s in enumerate(starts):
+        packet_scores[s:s + LSTM_WINDOW_SIZE] += errors[i]
+        packet_counts[s:s + LSTM_WINDOW_SIZE] += 1.0
+
+    # Packets not covered by any window (tail < LSTM_WINDOW_SIZE) stay score=0.
+    covered = packet_counts > 0
+    avg_scores = np.where(covered, packet_scores / np.maximum(packet_counts, 1), 0.0)
+
+    # Flag the top IF_CONTAMINATION fraction of covered packets as anomalous.
+    threshold = np.percentile(avg_scores[covered], 100.0 * (1.0 - IF_CONTAMINATION))
+    moving_labels = (avg_scores >= threshold).astype(int)
+
+    n_anomalous = int(moving_labels.sum())
+    logger.info(
+        "[ANOMALY] LSTM: %d/%d MOVING packets flagged anomalous (%.1f%%), threshold=%.6f",
+        n_anomalous, n_moving, 100.0 * n_anomalous / n_moving, threshold,
+    )
+
+    # df_moving.index holds df_clean integer positions in seq-sorted order;
+    # moving_labels[i] corresponds to df_moving.iloc[i], so this assignment is safe.
+    y = np.zeros(len(df_clean), dtype=int)
+    y[df_moving.index] = moving_labels
+    return y
+
+
+def _make_anomaly_labels_if(df_clean: pd.DataFrame) -> np.ndarray:
+    """IsolationForest path extracted for reuse as a fallback from LSTM."""
     y = np.zeros(len(df_clean), dtype=int)
     moving_mask = df_clean["state"].astype(int) == 1
     n_moving = moving_mask.sum()
 
     if n_moving < IF_MIN_MOVING_SAMPLES:
-        # Too little MOVING data — IF would overfit noise. Use threshold fallback.
         logger.warning(
             "[ANOMALY] only %d MOVING samples (need %d) — falling back to threshold label",
             n_moving, IF_MIN_MOVING_SAMPLES,
         )
         return (df_clean["accel_z"] > ANOMALY_THRESHOLD_G).astype(int).values
 
-    # Fit only on MOVING packets; use whichever IF features are present.
     available = [c for c in _IF_FEATURES if c in df_clean.columns]
     X_moving = df_clean.loc[moving_mask, available].values
 
@@ -555,11 +713,10 @@ def _make_anomaly_labels(df_clean: pd.DataFrame) -> np.ndarray:
         contamination=IF_CONTAMINATION,
         n_estimators=100,
         random_state=42,
-        n_jobs=-1,  # use all cores — safe on Jetson 6-core A78AE
+        n_jobs=-1,
     )
-    # IsolationForest.fit_predict: -1 = anomaly, 1 = normal → convert to 0/1
     moving_labels = (iso.fit_predict(X_moving) == -1).astype(int)
-    y[moving_mask.values] = moving_labels  # IDLE rows stay 0
+    y[moving_mask.values] = moving_labels
 
     n_anomalous = moving_labels.sum()
     logger.info(
