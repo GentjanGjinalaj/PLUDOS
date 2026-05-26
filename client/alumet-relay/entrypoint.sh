@@ -46,10 +46,21 @@ token  = "${INFLUXDB_TOKEN:-}"
 org    = "${INFLUXDB_ORG:-pludos}"
 bucket = "${INFLUXDB_BUCKET:-alumet_energy}"
 attributes_as = "field"
+
+# CSV output — written to the bind-mounted logs dir so it's inspectable on the host.
+# Columns: timestamp, metric name (with unit), channel label, value.
+# Delimiter is semicolon to avoid collision with decimal commas in French locales.
+[plugins.csv]
+output_path              = "${LOG_DIR}/alumet_readings.csv"
+force_flush              = true
+append_unit_to_metric_name = true
+use_unit_display_name    = true
+csv_delimiter            = ";"
+csv_late_delimiter       = ","
 TOML
 
-# Build plugin list: always jetson + prometheus-exporter, optionally influxdb/relay-client.
-PLUGINS="jetson,prometheus-exporter"
+# Build plugin list: always jetson + prometheus-exporter + csv, optionally influxdb/relay-client.
+PLUGINS="jetson,prometheus-exporter,csv"
 [ -n "${INFLUXDB_TOKEN:-}" ]     && PLUGINS="${PLUGINS},influxdb"
 [ -n "${ALUMET_SERVER_ADDR:-}" ] && PLUGINS="${PLUGINS},relay-client"
 
