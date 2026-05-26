@@ -65,20 +65,20 @@ services:
   # use the cached image. Image must be built before this service can start:
   #   podman-compose build alumet-relay
   #
-  # data-engine uses network_mode: host, so localhost:9095 inside that container
-  # reaches the published port here — no extra networking needed.
+  # network_mode: host — avoids CNI firewall plugin version mismatch on rootless
+  # Podman (JetPack 5.x). Port 9095 is bound directly on the host; data-engine
+  # and client.py reach it at localhost:9095 with no CNI involved.
   alumet-relay:
     build:
       context: ./alumet-relay
       dockerfile: Containerfile
     container_name: pludos-alumet-relay
+    network_mode: host
     env_file:
       - .env
     environment:
       - ALUMET_SERVER_ADDR=${ALUMET_SERVER_ADDR:-}
       - ALUMET_PROMETHEUS_PORT=${ALUMET_PROMETHEUS_PORT:-9095}
-    ports:
-      - "${ALUMET_PROMETHEUS_PORT:-9095}:${ALUMET_PROMETHEUS_PORT:-9095}"
     privileged: true
     volumes:
       # Full sysfs access required for INA3221 and RAPL reads.
