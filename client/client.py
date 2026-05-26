@@ -90,14 +90,15 @@ ALUMET_RELAY_METRICS_FILE = os.getenv("ALUMET_RELAY_METRICS_FILE", "")
 # pressure flushes are included rather than training on just the latest tail file.
 MAX_PARQUET_FILES = int(os.getenv("MAX_PARQUET_FILES", "20"))
 
-# Anomaly model selector. Two backends are available:
-#   "isolation_forest_xgb" (default) — Isolation Forest generates per-round pseudo-labels
-#       on MOVING-only packets; XGBoost trains on those. No labelled data required.
-#       Fallback to threshold label if fewer than IF_MIN_MOVING_SAMPLES moving packets
-#       are available (first run on a fresh Jetson with little data).
-#   "threshold" — legacy: accel_z > ANOMALY_THRESHOLD_G. Kept for debugging and
-#       comparison only. Will be superseded by "lstm_autoencoder" on the feature branch.
-ANOMALY_MODEL = os.getenv("ANOMALY_MODEL", "isolation_forest_xgb")
+# Anomaly model selector — controls pseudo-label generation for XGBoost training.
+#   "lstm_autoencoder" (default) — LSTM autoencoder on 50-packet sliding windows of
+#       MOVING data; reconstruction error = anomaly score. Catches temporal patterns
+#       (abnormal ramp-up, sustained jitter) that per-sample methods miss.
+#       Falls back to isolation_forest_xgb if torch is unavailable or data is sparse.
+#   "isolation_forest_xgb" — IsolationForest on per-packet vibration features.
+#       Faster (~1 s vs ~10 s per round), no torch dependency.
+#   "threshold" — legacy: accel_z > ANOMALY_THRESHOLD_G. Debug/comparison only.
+ANOMALY_MODEL = os.getenv("ANOMALY_MODEL", "lstm_autoencoder")
 
 # Isolation Forest: fraction of MOVING packets expected to be anomalous.
 # 0.05 = conservative prior (5% of warehouse shuttle samples are shock/wear events).
@@ -117,8 +118,9 @@ ANOMALY_THRESHOLD_G = float(os.getenv("ANOMALY_THRESHOLD_G", "2.0"))
 LSTM_WINDOW_SIZE         = int(os.getenv("LSTM_WINDOW_SIZE",         "50"))
 # Hidden dimension: 32 is enough to capture shuttle motion structure; larger = slower.
 LSTM_HIDDEN_DIM          = int(os.getenv("LSTM_HIDDEN_DIM",          "32"))
-# 20 epochs is fast on Jetson CPU (~10 s for typical round data volume).
-LSTM_EPOCHS              = int(os.getenv("LSTM_EPOCHS",              "20"))
+# 30 epochs: ~4 batches/epoch at 3000 MOVING packets (stride 25) = 120 steps — enough
+# for convergence without being slow. 20 was borderline; keep ≥25 in practice.
+LSTM_EPOCHS              = int(os.getenv("LSTM_EPOCHS",              "30"))
 LSTM_BATCH_SIZE          = int(os.getenv("LSTM_BATCH_SIZE",          "32"))
 # Need at least 4 non-overlapping windows (2×window_size with 50% stride overlap) to
 # train a meaningful autoencoder; below this, fall back to IsolationForest.
@@ -593,9 +595,10 @@ def _make_anomaly_labels_lstm(df_clean: pd.DataFrame) -> np.ndarray:
         return _make_anomaly_labels_if(df_clean)
 
     available = [c for c in _LSTM_FEATURES if c in df_clean.columns]
-    # Sort MOVING rows by sequence to preserve temporal order within the mission.
-    df_moving = df_clean.loc[moving_mask].sort_values("seq") if "seq" in df_clean.columns \
-                else df_clean.loc[moving_mask]
+    # Parquet files are written sorted by sequence_monotonic (data-engine flush), and
+    # load_buffered_data concatenates them in mtime order, so MOVING rows are already
+    # in chronological per-mission blocks — no additional sort needed here.
+    df_moving = df_clean.loc[moving_mask]
     X_moving = df_moving[available].values.astype(np.float32)   # (N, D)
 
     # Build overlapping windows with 50% stride — more training signal than non-overlapping.
@@ -686,7 +689,7 @@ def _make_anomaly_labels_lstm(df_clean: pd.DataFrame) -> np.ndarray:
         n_anomalous, n_moving, 100.0 * n_anomalous / n_moving, threshold,
     )
 
-    # df_moving.index holds df_clean integer positions in seq-sorted order;
+    # df_moving.index holds the df_clean integer positions of MOVING rows;
     # moving_labels[i] corresponds to df_moving.iloc[i], so this assignment is safe.
     y = np.zeros(len(df_clean), dtype=int)
     y[df_moving.index] = moving_labels
