@@ -27,8 +27,8 @@ LOG_FILE="${LOG_DIR}/alumet-$(date '+%Y%m%d_%H%M%S').log"
 # All sections are always written; which plugins activate is controlled via --plugins.
 cat > "${CONFIG}" <<TOML
 [plugins.jetson]
-poll_interval  = "5s"
-flush_interval = "5s"
+poll_interval  = "1s"
+flush_interval = "1s"
 
 [plugins.prometheus-exporter]
 host                     = "0.0.0.0"

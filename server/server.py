@@ -66,7 +66,7 @@ INFLUXDB_BUCKET = os.getenv("INFLUXDB_BUCKET", "alumet_energy")
 N_ESTIMATORS_DEFAULT = int(os.getenv("FL_N_ESTIMATORS_DEFAULT", "10"))
 N_ESTIMATORS_MIN     = int(os.getenv("FL_N_ESTIMATORS_MIN",     "5"))
 N_ESTIMATORS_MAX     = int(os.getenv("FL_N_ESTIMATORS_MAX",     "20"))
-ENERGY_BUDGET_J      = float(os.getenv("FL_ENERGY_BUDGET_J",    "50.0"))
+ENERGY_BUDGET_J      = float(os.getenv("FL_ENERGY_BUDGET_J",    "200.0"))
 
 # Tracks n_estimators across rounds — starts at default, adapted by energy feedback.
 _current_n_estimators: int = N_ESTIMATORS_DEFAULT
@@ -191,6 +191,9 @@ def _merge_boosters(raw_streams: list[bytes]) -> bytes:
     gb_model["trees"]     = all_trees
     gb_model["tree_info"] = [0] * len(all_trees)
     gb_model["gbtree_model_param"]["num_trees"] = str(len(all_trees))
+    # Binary classification: one tree per round. iteration_indptr must match
+    # num_trees exactly or XGBoost raises "iteration_indptr.back() != num_trees".
+    gb_model["iteration_indptr"] = list(range(len(all_trees) + 1))
 
     return json.dumps(base_model).encode("utf-8")
 
