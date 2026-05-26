@@ -689,10 +689,11 @@ def _make_anomaly_labels_lstm(df_clean: pd.DataFrame) -> np.ndarray:
         n_anomalous, n_moving, 100.0 * n_anomalous / n_moving, threshold,
     )
 
-    # df_moving.index holds the df_clean integer positions of MOVING rows;
-    # moving_labels[i] corresponds to df_moving.iloc[i], so this assignment is safe.
+    # df_moving preserves df_clean's order (no sort), so moving_labels[i] maps to
+    # the i-th True position in moving_mask. Use the boolean mask for assignment —
+    # df_moving.index contains original (pre-dropna) row numbers which exceed len(y).
     y = np.zeros(len(df_clean), dtype=int)
-    y[df_moving.index] = moving_labels
+    y[moving_mask.values] = moving_labels
     return y
 
 
