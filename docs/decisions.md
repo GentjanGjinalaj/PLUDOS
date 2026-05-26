@@ -166,7 +166,7 @@ without touching any other part of `server.py`.
 ---
 
 ## ADR-011 — Real Alumet energy integration
-**Status:** OPEN — Phase 1 complete; Phase 2 relay scaffolded and flags confirmed; hardware build pending
+**Status:** OPEN — Phase 2 operational (INA3221 live, Prometheus + InfluxDB + CSV outputs confirmed); relay-client architecture decision pending (see below)
 
 **Architecture:**
 ```
@@ -248,6 +248,37 @@ plugin is unavailable. See `client/alumet-relay/probe.py` for details.
    `--output prometheus`; verify this flag name on the installed version).
 
 See the `pludos-alumet` skill for Grafana query examples and phase breakdown guidance.
+
+**Phase 2 confirmed working (2026-05-26):**
+- `alumet-relay` container runs `jetson + prometheus-exporter + influxdb + csv` plugins.
+- `network_mode: host` — required on JetPack 5.x rootless Podman to bypass CNI firewall
+  plugin version mismatch that silently blocks port-mapped containers.
+- INA3221 channels confirmed: `VDD_IN` (total), `VDD_CPU_GPU_CV` (CPU+GPU), `VDD_SOC` (SoC).
+- Prometheus scrape at `localhost:9095/metrics` — read by `client.py _read_alumet_prometheus()`.
+- CSV output at `client/logs/alumet/alumet_readings.csv` (bind-mounted, gitignored).
+- Energy-aware adaptation confirmed: server reads InfluxDB `alumet_energy` bucket after each
+  round and adjusts `n_estimators` — tested, values flow correctly.
+
+**Open decision — relay-client architecture (not yet decided):**
+
+Two options for forwarding Jetson power telemetry to the server, currently unresolved:
+
+| Option | How | Pro | Con |
+|--------|-----|-----|-----|
+| A — Direct InfluxDB push (current) | `influxdb` plugin writes directly from Jetson | Simple, no gRPC hop, works without Tailscale | No server-side aggregation across Jetsons |
+| B — alumet relay-client | `relay-client` → server `relay-server` → InfluxDB | Server can aggregate/process streams from all 3 Jetsons in one place, enables carbon attribution | Requires Tailscale active, server alumet needs `relay-server` plugin configured, more moving parts |
+
+**Constraint:** must work standalone (Jetson without server reachable) AND with server when available.
+Option A satisfies standalone trivially. Option B requires a fallback to direct InfluxDB push when
+`ALUMET_SERVER_ADDR` is unset — which `entrypoint.sh` already supports conditionally.
+
+**To activate relay-client (when decided):**
+1. Set `ALUMET_SERVER_ADDR=<server-tailscale-ip>:50051` in `client/.env`.
+2. Add `relay-server` plugin to `server/alumet/` entrypoint (not yet written).
+3. `entrypoint.sh` already adds `relay-client` to PLUGINS when `ALUMET_SERVER_ADDR` is set — no rebuild needed.
+
+**Recommendation (deferred):** start with Option A (current state). Revisit when scaling to 3 Jetsons
+or when server-side energy aggregation is needed for thesis experiments.
 
 ---
 

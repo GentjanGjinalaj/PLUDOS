@@ -53,11 +53,11 @@ docs/JETSON_DEPLOYMENT.md
 docs/current_problems.md
 docs/next_steps.md
 docs/future_options.md
-# FL round logs — written by server.py to logs/ at round start.
-# Alumet logs — written by entrypoint.sh inside the alumet-relay container.
-# Keep the directories (.gitkeep) but ignore the log files themselves.
-logs/*.log
-client/logs/alumet/*.log
+# Log directories — auto-created at runtime, never committed.
+# server.py creates logs/ via mkdir(parents=True, exist_ok=True).
+# entrypoint.sh creates client/logs/alumet/ via mkdir -p.
+logs/
+client/logs/
 
 # Claude Code worktrees (isolation branches, not for repo)
 .claude/worktrees/
