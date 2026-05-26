@@ -308,12 +308,18 @@ def fit_config(server_round: int) -> dict:
     return {"server_round": server_round, "n_estimators": _current_n_estimators}
 
 
+def evaluate_config(server_round: int) -> dict:
+    # Pass round number to evaluate() so the client can tag the heartbeat correctly.
+    return {"server_round": server_round}
+
+
 def server_fn(context: fl.common.Context):
     strategy = XGBoostStrategy(
         min_available_clients=MIN_FIT_CLIENTS,
         min_fit_clients=MIN_FIT_CLIENTS,
         min_evaluate_clients=MIN_FIT_CLIENTS,
         on_fit_config_fn=fit_config,
+        on_evaluate_config_fn=evaluate_config,
     )
     config = fl.server.ServerConfig(num_rounds=NUM_ROUNDS)
     return fl.server.ServerAppComponents(strategy=strategy, config=config)
