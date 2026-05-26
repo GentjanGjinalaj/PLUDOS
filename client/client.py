@@ -45,7 +45,34 @@ logger = logging.getLogger(__name__)
 # ==========================================
 TEST_MODE  = os.getenv("TEST_MODE") == "1"
 BUFFER_DIR = "./ram_buffer" if TEST_MODE else "/app/ram_buffer"
-DEVICE     = "cpu" if TEST_MODE else "cuda"
+
+
+def _detect_xgb_device() -> str:
+    # Try CUDA only if a GPU device node is present (Jetson: nvhost-ctrl-gpu;
+    # discrete: nvidia0). Falls back to CPU silently rather than letting XGBoost
+    # emit a noisy warning. Podman 3.4.x on JetPack 5.x doesn't support CDI,
+    # so GPU device passthrough requires Podman ≥ 4.1 — tracked as a follow-up.
+    if TEST_MODE:
+        return "cpu"
+    gpu_present = (
+        os.path.exists("/dev/nvidia0") or
+        os.path.exists("/dev/nvhost-ctrl-gpu")
+    )
+    if not gpu_present:
+        return "cpu"
+    try:
+        import xgboost as xgb
+        import numpy as np
+        xgb.XGBClassifier(device="cuda", n_estimators=1).fit(
+            np.array([[1.0, 2.0], [3.0, 4.0]]), np.array([0, 1])
+        )
+        return "cuda"
+    except Exception:
+        return "cpu"
+
+
+DEVICE = _detect_xgb_device()
+logger.info("[CONFIG] XGBoost device: %s", DEVICE)
 
 # Phase 2 relay file path — written by alumet-relay probe.py (now dormant).
 # Leave empty to fall back to tegrastats. Will be replaced by a Prometheus
@@ -115,13 +142,19 @@ def _read_nvpmodel() -> str:
 
 def _read_tegrastats() -> dict[str, float]:
     # One-shot tegrastats sample; parses VDD_GPU, VDD_CPU, VDD_SOC rails.
+    # tegrastats on JetPack 5.x has no --count flag — start it, read one line,
+    # kill it. Binary is bind-mounted from the host at /usr/bin/tegrastats.
     # Returns zeros on any failure — caller always gets a safe dict.
     try:
-        r = subprocess.run(
-            ["tegrastats", "--interval", "100", "--count", "1"],
-            capture_output=True, text=True, timeout=3,
+        proc = subprocess.Popen(
+            ["tegrastats", "--interval", "100"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
         )
-        line = r.stdout.strip()
+        try:
+            line = proc.stdout.readline()  # type: ignore[union-attr]
+        finally:
+            proc.kill()
+            proc.wait()
         gpu = int(m.group(1)) if (m := re.search(r"VDD_GPU\S*\s+(\d+)mW", line)) else 0
         cpu = int(m.group(1)) if (m := re.search(r"VDD_CPU\S*\s+(\d+)mW", line)) else 0
         soc = int(m.group(1)) if (m := re.search(r"VDD_SOC\S*\s+(\d+)mW", line)) else 0

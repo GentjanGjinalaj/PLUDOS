@@ -30,6 +30,9 @@ services:
       - ./ram_buffer:/app/ram_buffer
       - /etc/localtime:/etc/localtime:ro
       - /etc/timezone:/etc/timezone:ro
+      # tegrastats bind-mount: lets client.py AlumetProfiler read Jetson power rails.
+      # The binary is host-only; container image (python:3.10-slim) does not include it.
+      - /usr/bin/tegrastats:/usr/bin/tegrastats:ro
     restart: unless-stopped
 
   # 2. The AI Worker (Jetson <-> Server relay path via Tailscale)
@@ -42,17 +45,15 @@ services:
       - .env
     profiles:
       - vpn
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
+    # GPU note: CDI device passthrough (nvidia.com/gpu=all) requires Podman ≥ 4.1.
+    # Jetson currently runs Podman 3.4.4 (JetPack 5.x). XGBoost auto-detects
+    # GPU availability at startup and falls back to CPU if CUDA is inaccessible.
+    # Upgrade path: podman ≥ 4.1 + nvidia-ctk cdi generate → add devices: [nvidia.com/gpu=all]
     volumes:
       - ./ram_buffer:/app/ram_buffer
       - /etc/localtime:/etc/localtime:ro
       - /etc/timezone:/etc/timezone:ro
+      - /usr/bin/tegrastats:/usr/bin/tegrastats:ro
     depends_on:
       - data-engine
       - tailscale

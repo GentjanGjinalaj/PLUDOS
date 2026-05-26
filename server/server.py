@@ -9,6 +9,7 @@ energy from InfluxDB fl_phases measurement (ADR-014).
 import json
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -24,6 +25,20 @@ from influxdb_client import InfluxDBClient  # type: ignore
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Round log file — written to logs/ relative to the working directory of
+# `flwr run .` (normally the repo root). Override with FL_LOG_DIR env var.
+# Files are gitignored (logs/*.log); the logs/ dir itself is committed.
+# ---------------------------------------------------------------------------
+_LOG_DIR = Path(os.getenv("FL_LOG_DIR", "logs"))
+_LOG_DIR.mkdir(parents=True, exist_ok=True)
+_log_ts   = time.strftime("%Y%m%d_%H%M%S")
+_log_path = _LOG_DIR / f"fl_round_{_log_ts}.log"
+_fh = logging.FileHandler(_log_path)
+_fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+logging.getLogger().addHandler(_fh)
+logger.info("[LOG] round log → %s", _log_path)
 
 # ---------------------------------------------------------------------------
 # FL topology config — tunable via shell env before `flwr run .`

@@ -53,6 +53,10 @@ docs/JETSON_DEPLOYMENT.md
 docs/current_problems.md
 docs/next_steps.md
 docs/future_options.md
+# FL round logs — written by server.py to logs/ at round start.
+# Keep the directory (logs/.gitkeep) but ignore the log files.
+logs/*.log
+
 # Claude Code worktrees (isolation branches, not for repo)
 .claude/worktrees/
 .claude/
