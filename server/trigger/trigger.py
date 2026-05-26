@@ -114,11 +114,14 @@ def _clear_pidfile() -> None:
 # ---------------------------------------------------------------------------
 
 def _last_run_ts() -> float:
-    # Epoch seconds of the previous successful FL run, or 0 if none yet.
+    # Epoch seconds of the last *successful* FL run only. Failed runs return 0
+    # so the readiness window resets and the trigger retries on the next tick.
     if not LAST_RUN_FILE.exists():
         return 0.0
     try:
         data = json.loads(LAST_RUN_FILE.read_text())
+        if data.get("exit_code", 1) != 0:
+            return 0.0
         return float(data.get("finished_at_epoch", 0.0))
     except (json.JSONDecodeError, OSError, ValueError) as exc:
         logger.warning("[STATE] last_run.json unreadable (%s) — treating as never-run", exc)
