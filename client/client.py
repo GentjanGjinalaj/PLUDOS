@@ -641,14 +641,20 @@ class PLUDOSClient(fl.client.NumPyClient):
             except Exception as save_exc:
                 logger.warning("[MODEL] failed to save global model locally: %s", save_exc)
 
-            preds    = (booster.predict(xgb.DMatrix(X_test)) > 0.5).astype(int)
+            y_prob   = booster.predict(xgb.DMatrix(X_test))
+            preds    = (y_prob > 0.5).astype(int)
             accuracy = float((preds == y_test).mean())
-            logger.info("[EVAL] round=%s test_samples=%d accuracy=%.3f",
-                        config.get("server_round", "?"), len(X_test), accuracy)
+            # Binary cross-entropy (log-loss) — lets Flower track model improvement.
+            eps  = 1e-7
+            loss = float(-np.mean(
+                y_test * np.log(y_prob + eps) + (1 - y_test) * np.log(1 - y_prob + eps)
+            ))
+            logger.info("[EVAL] round=%s test_samples=%d accuracy=%.3f loss=%.4f",
+                        config.get("server_round", "?"), len(X_test), accuracy, loss)
             # Heartbeat on successful round completion — server trigger reads this
             # to know the gateway is alive and what state its buffer is in.
             _write_gw_status_heartbeat(last_round=config.get("server_round"))
-            return 0.0, len(X_test), {"accuracy": accuracy}
+            return loss, len(X_test), {"accuracy": accuracy}
         except Exception as exc:
             logger.warning("[EVAL] evaluation failed: %s", exc)
             return 0.0, 1, {"accuracy": 0.0}

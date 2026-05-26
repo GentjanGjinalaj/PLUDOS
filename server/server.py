@@ -36,7 +36,9 @@ MIN_FIT_CLIENTS = int(os.getenv("FL_MIN_FIT_CLIENTS", "1"))
 # These must match the values in server/.env (same machine, InfluxDB runs locally).
 # ---------------------------------------------------------------------------
 INFLUXDB_URL    = os.getenv("INFLUXDB_URL",    "http://127.0.0.1:8086")
-INFLUXDB_TOKEN  = os.getenv("INFLUXDB_TOKEN",  "pludos-secret-token")
+# Default matches the token set in server/.env — the ServerApp runs inside the
+# SuperLink process which may not inherit the shell env from `flwr run .`.
+INFLUXDB_TOKEN  = os.getenv("INFLUXDB_TOKEN",  "pludos-dev-token")
 INFLUXDB_ORG    = os.getenv("INFLUXDB_ORG",    "pludos")
 INFLUXDB_BUCKET = os.getenv("INFLUXDB_BUCKET", "alumet_energy")
 
