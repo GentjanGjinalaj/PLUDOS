@@ -3,13 +3,20 @@ PLUDOS AI Worker: Federated Learning Client
 -------------------------------------------
 Runs on the Jetson Orin Nano. Responsibilities:
 1. Load all recent mission Parquet files from the RAM buffer (concatenated).
-2. Train an XGBoost model locally on the NVIDIA GPU.
-3. Profile energy consumption per FL phase via AlumetProfiler.
-4. Stream energy telemetry to InfluxDB (fl_energy, fl_phases measurements).
-5. Evaluate the server's global model on a local held-out test set.
+2. Generate anomaly labels via the selected backend (ANOMALY_MODEL env var):
+     isolation_forest_xgb (default) — IsolationForest on MOVING packets → pseudo-labels
+     threshold                       — legacy accel_z > ANOMALY_THRESHOLD_G rule
+3. Train an XGBoost classifier on those labels (federated via Flower).
+4. Profile energy consumption per FL phase via AlumetProfiler.
+5. Stream energy telemetry to InfluxDB (fl_energy, fl_phases measurements).
+6. Evaluate the server's global model on a local held-out test set.
 
 n_estimators is set by the server each round via fit_config() based on the
 previous round's measured energy — this closes the energy-aware FL loop (ADR-014).
+
+Anomaly model switching: set ANOMALY_MODEL=threshold to revert to the legacy label.
+A future ANOMALY_MODEL=lstm_autoencoder backend (feature/lstm-autoencoder branch)
+will use a sequence-level reconstruction error instead of per-sample classification.
 """
 
 import flwr as fl
@@ -25,6 +32,7 @@ import subprocess
 import threading
 import random
 from pathlib import Path
+from sklearn.ensemble import IsolationForest
 
 from influxdb_client import InfluxDBClient, Point, WritePrecision  # type: ignore
 from influxdb_client.client.write_api import SYNCHRONOUS           # type: ignore
@@ -48,11 +56,26 @@ ALUMET_RELAY_METRICS_FILE = os.getenv("ALUMET_RELAY_METRICS_FILE", "")
 # pressure flushes are included rather than training on just the latest tail file.
 MAX_PARQUET_FILES = int(os.getenv("MAX_PARQUET_FILES", "20"))
 
-# Anomaly classification threshold for the Z-axis accelerometer channel (g).
+# Anomaly model selector. Two backends are available:
+#   "isolation_forest_xgb" (default) — Isolation Forest generates per-round pseudo-labels
+#       on MOVING-only packets; XGBoost trains on those. No labelled data required.
+#       Fallback to threshold label if fewer than IF_MIN_MOVING_SAMPLES moving packets
+#       are available (first run on a fresh Jetson with little data).
+#   "threshold" — legacy: accel_z > ANOMALY_THRESHOLD_G. Kept for debugging and
+#       comparison only. Will be superseded by "lstm_autoencoder" on the feature branch.
+ANOMALY_MODEL = os.getenv("ANOMALY_MODEL", "isolation_forest_xgb")
+
+# Isolation Forest: fraction of MOVING packets expected to be anomalous.
+# 0.05 = conservative prior (5% of warehouse shuttle samples are shock/wear events).
+# Tune upward if the shuttle is known to be in poor condition.
+IF_CONTAMINATION = float(os.getenv("IF_CONTAMINATION", "0.05"))
+
+# Minimum MOVING packets required to trust the Isolation Forest fit.
+# Below this, fall back to the threshold label to avoid fitting noise.
+IF_MIN_MOVING_SAMPLES = int(os.getenv("IF_MIN_MOVING_SAMPLES", "50"))
+
+# Legacy threshold label fallback (used when ANOMALY_MODEL=threshold or IF data too sparse).
 # Default 2.0g: gravity alone reads ~1.0g, so 2.0g catches genuine shocks only.
-# 0.8g (old default) was below gravity — flagged every sample as anomalous.
-# IMPORTANT: uncalibrated — must be validated against labelled fault data from
-# Savoye before any thesis accuracy claim. See docs/future_options.md §3.3.
 ANOMALY_THRESHOLD_G = float(os.getenv("ANOMALY_THRESHOLD_G", "2.0"))
 
 # Where to persist the received global model for standalone (no-server) inference.
@@ -386,10 +409,68 @@ def load_buffered_data() -> tuple[np.ndarray, np.ndarray]:
     df_clean = df[feature_cols].dropna()
     X_train = df_clean.values
 
-    # Anomaly label: Z-axis > ANOMALY_THRESHOLD_G — high vertical shock.
-    y_train = (df.loc[df_clean.index, "accel_z"] > ANOMALY_THRESHOLD_G).astype(int).values
-
+    y_train = _make_anomaly_labels(df_clean)
     return X_train, y_train
+
+
+# Features used by Isolation Forest — vibration and shock channels only.
+# IDLE packets are excluded from the IF fit (no bearing load at rest).
+_IF_FEATURES = [
+    "accel_mag",            # total shock magnitude
+    "rolling_accel_std_10", # sustained vibration (bearing wear signature)
+    "gyro_x",               # torsional vibration (motor/bearing)
+    "gyro_mag",             # overall rotation magnitude
+    "accel_z",              # vertical channel — floor surface + bearing noise
+]
+
+
+def _make_anomaly_labels(df_clean: pd.DataFrame) -> np.ndarray:
+    """
+    Generate binary anomaly labels for XGBoost training.
+
+    isolation_forest_xgb (default): fits IsolationForest on MOVING-only packets,
+    uses anomaly scores as pseudo-labels. IDLE packets are always labelled 0
+    (no bearing load, no shock expected). Falls back to threshold if MOVING
+    sample count is below IF_MIN_MOVING_SAMPLES.
+
+    threshold (legacy): accel_z > ANOMALY_THRESHOLD_G, applied to all rows.
+    """
+    if ANOMALY_MODEL == "threshold":
+        return (df_clean["accel_z"] > ANOMALY_THRESHOLD_G).astype(int).values
+
+    # Isolation Forest path.
+    y = np.zeros(len(df_clean), dtype=int)
+    moving_mask = df_clean["state"].astype(int) == 1
+    n_moving = moving_mask.sum()
+
+    if n_moving < IF_MIN_MOVING_SAMPLES:
+        # Too little MOVING data — IF would overfit noise. Use threshold fallback.
+        logger.warning(
+            "[ANOMALY] only %d MOVING samples (need %d) — falling back to threshold label",
+            n_moving, IF_MIN_MOVING_SAMPLES,
+        )
+        return (df_clean["accel_z"] > ANOMALY_THRESHOLD_G).astype(int).values
+
+    # Fit only on MOVING packets; use whichever IF features are present.
+    available = [c for c in _IF_FEATURES if c in df_clean.columns]
+    X_moving = df_clean.loc[moving_mask, available].values
+
+    iso = IsolationForest(
+        contamination=IF_CONTAMINATION,
+        n_estimators=100,
+        random_state=42,
+        n_jobs=-1,  # use all cores — safe on Jetson 6-core A78AE
+    )
+    # IsolationForest.fit_predict: -1 = anomaly, 1 = normal → convert to 0/1
+    moving_labels = (iso.fit_predict(X_moving) == -1).astype(int)
+    y[moving_mask.values] = moving_labels  # IDLE rows stay 0
+
+    n_anomalous = moving_labels.sum()
+    logger.info(
+        "[ANOMALY] IsolationForest: %d/%d MOVING packets flagged anomalous (%.1f%%)",
+        n_anomalous, n_moving, 100.0 * n_anomalous / n_moving,
+    )
+    return y
 
 
 def _write_gw_status_heartbeat(last_round: int | None = None) -> None:
