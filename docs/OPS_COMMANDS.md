@@ -1,8 +1,13 @@
 # PLUDOS Operations Reference
 
 Quick-access commands for field use, monitoring, and data retrieval.
-Server Tailscale IP: **100.93.249.37** (laptop `lh25408`).
-Jetson Tailscale IP: **100.119.83.35** (Jetson `warehouse1-desktop-1`).
+Set these in your shell before running the commands below:
+
+```bash
+export JETSON_IP=<jetson-tailscale-or-local-ip>    # e.g. 100.119.83.35 or 192.168.0.100
+export SERVER_IP=<server-tailscale-or-local-ip>    # e.g. 100.93.249.37  or 192.168.0.101
+export INFLUXDB_TOKEN=<your-influxdb-token>        # from server .env file
+```
 
 ---
 
@@ -25,13 +30,10 @@ Its Tailscale IP is stable (100.x.x.x) as long as the device stays on the accoun
 
 ```bash
 # Via local network (same WiFi):
-ssh warehouse1@192.168.0.100
+ssh warehouse1@$JETSON_IP
 
-# Via Tailscale (remote, any network):
-ssh warehouse1@100.119.83.35
-
-# One-liner with password (dev/lab only — not for production):
-sshpass -p 'Warehouse1savoye!' ssh warehouse1@100.119.83.35
+# Via Tailscale (remote, any network) — same command if $JETSON_IP is the Tailscale IP.
+# Set up SSH key auth (ssh-copy-id warehouse1@$JETSON_IP) to avoid password prompts.
 
 # Check Tailscale is up on Jetson before trying:
 tailscale status | grep warehouse1-desktop-1
@@ -47,38 +49,38 @@ tailscale status | grep warehouse1-desktop-1
 
 ```bash
 # On the Jetson:
-ssh warehouse1@100.119.83.35 "podman ps -a"
+ssh warehouse1@$JETSON_IP "podman ps -a"
 
 # Live data-engine log (ctrl-C to exit):
-ssh warehouse1@100.119.83.35 "podman logs -f pludos-data-engine"
+ssh warehouse1@$JETSON_IP "podman logs -f pludos-data-engine"
 
 # Last 100 lines of alumet-relay:
-ssh warehouse1@100.119.83.35 "podman logs --tail 100 pludos-alumet-relay"
+ssh warehouse1@$JETSON_IP "podman logs --tail 100 pludos-alumet-relay"
 
 # Restart a container after .env change:
-ssh warehouse1@100.119.83.35 "podman restart pludos-data-engine"
+ssh warehouse1@$JETSON_IP "podman restart pludos-data-engine"
 
 # Restart the full stack (no --profile = data-engine only):
-ssh warehouse1@100.119.83.35 "cd ~/PLUDOS/client && podman-compose up -d data-engine"
+ssh warehouse1@$JETSON_IP "cd ~/PLUDOS/client && podman-compose up -d data-engine"
 
 # Full stack with FL + Tailscale sidecar:
-ssh warehouse1@100.119.83.35 "cd ~/PLUDOS/client && podman-compose --profile vpn up -d"
+ssh warehouse1@$JETSON_IP "cd ~/PLUDOS/client && podman-compose --profile vpn up -d"
 
 # With INA3221 alumet relay (already started separately):
-ssh warehouse1@100.119.83.35 "cd ~/PLUDOS/client && podman-compose --profile energy up -d alumet-relay"
+ssh warehouse1@$JETSON_IP "cd ~/PLUDOS/client && podman-compose --profile energy up -d alumet-relay"
 ```
 
 ---
 
 ## 3. Flux query reference
 
-All queries use org `pludos`, bucket `alumet_energy`, token `pludos-dev-token`.
+All queries use org `pludos`, bucket `alumet_energy`, token `$INFLUXDB_TOKEN`.
 
 ### Run a query from the laptop
 
 ```bash
 curl -s -X POST "http://localhost:8086/api/v2/query?org=pludos" \
-  -H "Authorization: Token pludos-dev-token" \
+  -H "Authorization: Token $INFLUXDB_TOKEN" \
   -H "Content-Type: application/vnd.flux" \
   --data-raw '<paste Flux query here>'
 ```
@@ -172,33 +174,33 @@ Parquet files live in `~/PLUDOS/client/ram_buffer/` on the Jetson.
 ### List files
 
 ```bash
-ssh warehouse1@100.119.83.35 "ls -lh ~/PLUDOS/client/ram_buffer/"
+ssh warehouse1@$JETSON_IP "ls -lh ~/PLUDOS/client/ram_buffer/"
 
 # Disk usage total:
-ssh warehouse1@100.119.83.35 "du -sh ~/PLUDOS/client/ram_buffer/"
+ssh warehouse1@$JETSON_IP "du -sh ~/PLUDOS/client/ram_buffer/"
 ```
 
 ### Download a single mission file
 
 ```bash
-scp warehouse1@100.119.83.35:~/PLUDOS/client/ram_buffer/mission_s1_*.parquet ./data/
+scp warehouse1@$JETSON_IP:~/PLUDOS/client/ram_buffer/mission_s1_*.parquet ./data/
 ```
 
 ### Download the daily consolidated file (all missions for a day)
 
 ```bash
 # Replace YYYY-MM-DD with the target date:
-scp warehouse1@100.119.83.35:~/PLUDOS/client/ram_buffer/2026-05-20.parquet ./data/
+scp warehouse1@$JETSON_IP:~/PLUDOS/client/ram_buffer/2026-05-20.parquet ./data/
 
 # Download all daily files:
-scp "warehouse1@100.119.83.35:~/PLUDOS/client/ram_buffer/*.parquet" ./data/
+scp "warehouse1@$JETSON_IP:~/PLUDOS/client/ram_buffer/*.parquet" ./data/
 ```
 
 ### Download everything (rsync — skips files already present)
 
 ```bash
 rsync -avz --progress \
-  warehouse1@100.119.83.35:~/PLUDOS/client/ram_buffer/ \
+  warehouse1@$JETSON_IP:~/PLUDOS/client/ram_buffer/ \
   ./data/jetson-1/
 ```
 
@@ -216,7 +218,7 @@ print(df.head())
 ### Inspect inside the Jetson container (no local Python needed)
 
 ```bash
-ssh warehouse1@100.119.83.35 \
+ssh warehouse1@$JETSON_IP \
   "podman exec -i pludos-data-engine python3" << 'EOF'
 import pyarrow.parquet as pq, pandas as pd, glob, os
 files = sorted(glob.glob("/app/ram_buffer/mission_s1_*.parquet"))
@@ -237,7 +239,7 @@ Measurements: `input_current` (mA) and `input_voltage` (mV), tagged by `ina_chan
 ```bash
 # Last value for all INA3221 channels:
 watch -n 5 "curl -s -X POST 'http://localhost:8086/api/v2/query?org=pludos' \
-  -H 'Authorization: Token pludos-dev-token' \
+  -H 'Authorization: Token $INFLUXDB_TOKEN' \
   -H 'Content-Type: application/vnd.flux' \
   --data-raw 'from(bucket:\"alumet_energy\") |> range(start: -30s) |> filter(fn: (r) => r._measurement == \"input_current\" and r._field == \"value\") |> last() |> keep(columns: [\"ina_channel_label\",\"_value\"])' | grep _result | awk -F, '{print \$NF, \$(NF-1)}'"
 ```
@@ -249,7 +251,7 @@ Or via the Grafana dashboard (Jetson Power row — updates every 5s).
 ```bash
 # Download input_current for all channels, last 24h:
 curl -s -X POST "http://localhost:8086/api/v2/query?org=pludos" \
-  -H "Authorization: Token pludos-dev-token" \
+  -H "Authorization: Token $INFLUXDB_TOKEN" \
   -H "Content-Type: application/vnd.flux" \
   --data-raw '
 from(bucket: "alumet_energy")
@@ -261,7 +263,7 @@ from(bucket: "alumet_energy")
 
 # Same for voltage:
 curl -s -X POST "http://localhost:8086/api/v2/query?org=pludos" \
-  -H "Authorization: Token pludos-dev-token" \
+  -H "Authorization: Token $INFLUXDB_TOKEN" \
   -H "Content-Type: application/vnd.flux" \
   --data-raw '
 from(bucket: "alumet_energy")
@@ -277,7 +279,7 @@ from(bucket: "alumet_energy")
 ```bash
 # This exports current only; multiply offline by voltage (≈5V) if needed.
 curl -s -X POST "http://localhost:8086/api/v2/query?org=pludos" \
-  -H "Authorization: Token pludos-dev-token" \
+  -H "Authorization: Token $INFLUXDB_TOKEN" \
   -H "Content-Type: application/vnd.flux" \
   --data-raw '
 from(bucket: "alumet_energy")
@@ -299,10 +301,10 @@ curl http://localhost:8086/health
 # Expected: {"status":"pass",...}
 
 # Token check from Jetson to server:
-ssh warehouse1@100.119.83.35 \
+ssh warehouse1@$JETSON_IP \
   "curl -s -o /dev/null -w '%{http_code}' \
-   -H 'Authorization: Token pludos-dev-token' \
-   http://100.93.249.37:8086/health"
+   -H 'Authorization: Token $INFLUXDB_TOKEN' \
+   http://$SERVER_IP:8086/health"
 # Expected: 200
 ```
 
@@ -327,11 +329,11 @@ curl -s http://localhost:3000/api/health | python3 -m json.tool
 
 ```bash
 # Pull latest code on Jetson and rebuild + restart data-engine:
-ssh warehouse1@100.119.83.35 \
+ssh warehouse1@$JETSON_IP \
   "cd ~/PLUDOS && git pull && cd client && podman-compose up --build -d data-engine"
 
 # Pull only (no rebuild — for config/script changes):
-ssh warehouse1@100.119.83.35 "cd ~/PLUDOS && git pull"
+ssh warehouse1@$JETSON_IP "cd ~/PLUDOS && git pull"
 ```
 
 ---
@@ -349,12 +351,13 @@ cd ~/PLUDOS && source pludos_venv/bin/activate
 flower-superlink --insecure &>/tmp/superlink.log &
 
 # 2. Start SuperNode on Jetson (inside the data-engine container):
-sshpass -p 'Warehouse1savoye!' ssh warehouse1@192.168.0.100 \
+# Replace $SERVER_IP with the server's local or Tailscale IP.
+ssh warehouse1@$JETSON_IP \
   "podman exec pludos-data-engine sh -c \
-   'nohup flower-supernode --insecure --superlink 192.168.0.101:9092 >/tmp/sn.log 2>&1 &'"
+   'nohup flower-supernode --insecure --superlink $SERVER_IP:9092 >/tmp/sn.log 2>&1 &'"
 
 # 3. Submit the FL run:
-INFLUXDB_URL=http://localhost:8086 INFLUXDB_TOKEN=pludos-dev-token \
+INFLUXDB_URL=http://localhost:8086 INFLUXDB_TOKEN=$INFLUXDB_TOKEN \
 INFLUXDB_ORG=pludos INFLUXDB_BUCKET=alumet_energy \
 flwr run . pludos-network
 
@@ -365,8 +368,7 @@ flwr log <run-id> pludos-network
 ls -lh server/models/
 
 # 6. Check saved model on Jetson (saved by client.py evaluate):
-sshpass -p 'Warehouse1savoye!' ssh warehouse1@192.168.0.100 \
-  "ls -lh ~/PLUDOS/client/ram_buffer/model/"
+ssh warehouse1@$JETSON_IP "ls -lh ~/PLUDOS/client/ram_buffer/model/"
 
 # Stop SuperLink when done:
 pkill -f flower-superlink
