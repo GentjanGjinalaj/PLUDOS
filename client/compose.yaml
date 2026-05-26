@@ -30,9 +30,6 @@ services:
       - ./ram_buffer:/app/ram_buffer
       - /etc/localtime:/etc/localtime:ro
       - /etc/timezone:/etc/timezone:ro
-      # tegrastats bind-mount: lets client.py AlumetProfiler read Jetson power rails.
-      # The binary is host-only; container image (python:3.10-slim) does not include it.
-      - /usr/bin/tegrastats:/usr/bin/tegrastats:ro
     restart: unless-stopped
 
   # 2. The AI Worker (Jetson <-> Server relay path via Tailscale)
@@ -53,35 +50,38 @@ services:
       - ./ram_buffer:/app/ram_buffer
       - /etc/localtime:/etc/localtime:ro
       - /etc/timezone:/etc/timezone:ro
-      - /usr/bin/tegrastats:/usr/bin/tegrastats:ro
     depends_on:
       - data-engine
       - tailscale
     restart: unless-stopped
 
   # 3. Alumet relay sidecar — ADR-011 Phase 2
-  # Gated behind the 'energy' profile so plain `podman-compose up data-engine`
-  # skips this service. First build compiles Rust from source (20–30 min on Jetson).
-  # Start with: podman-compose --profile energy up alumet-relay
+  # Reads Jetson INA3221 power rails via the nvidia-jetson plugin.
+  # Exposes a local Prometheus endpoint on ALUMET_PROMETHEUS_PORT (default 9095)
+  # that client.py AlumetProfiler scrapes for real-time per-phase energy data.
+  # Also writes to server InfluxDB (alumet_energy bucket) when INFLUXDB_TOKEN is set.
   #
-  # alumet-agent reads INA3221 natively via the nvidia-jetson plugin.
-  # Local mode  (ALUMET_SERVER_ADDR unset): writes directly to server InfluxDB.
-  # Relay mode  (ALUMET_SERVER_ADDR set):   forwards stream to server Alumet over gRPC.
-  # See ADR-011 in docs/decisions.md and docs/DEPLOYMENT_CHECKLIST.md for activation steps.
+  # First build compiles Rust from source (~20–30 min on Jetson). Subsequent starts
+  # use the cached image. Image must be built before this service can start:
+  #   podman-compose build alumet-relay
+  #
+  # data-engine uses network_mode: host, so localhost:9095 inside that container
+  # reaches the published port here — no extra networking needed.
   alumet-relay:
     build:
       context: ./alumet-relay
       dockerfile: Containerfile
     container_name: pludos-alumet-relay
-    profiles:
-      - energy
     env_file:
       - .env
     environment:
       - ALUMET_SERVER_ADDR=${ALUMET_SERVER_ADDR:-}
+      - ALUMET_PROMETHEUS_PORT=${ALUMET_PROMETHEUS_PORT:-9095}
+    ports:
+      - "${ALUMET_PROMETHEUS_PORT:-9095}:${ALUMET_PROMETHEUS_PORT:-9095}"
     privileged: true
     volumes:
-      # INA3221 hardware power monitor: read-only sysfs access from host.
+      # Full sysfs access required for INA3221 and RAPL reads.
       - /sys:/sys:ro
       - /etc/localtime:/etc/localtime:ro
       - /etc/timezone:/etc/timezone:ro

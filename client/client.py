@@ -31,6 +31,7 @@ import socket
 import subprocess
 import threading
 import random
+import urllib.request
 from pathlib import Path
 from sklearn.ensemble import IsolationForest
 
@@ -74,9 +75,12 @@ def _detect_xgb_device() -> str:
 DEVICE = _detect_xgb_device()
 logger.info("[CONFIG] XGBoost device: %s", DEVICE)
 
-# Phase 2 relay file path — written by alumet-relay probe.py (now dormant).
-# Leave empty to fall back to tegrastats. Will be replaced by a Prometheus
-# query once alumet-relay --output prometheus metric names are confirmed on hardware.
+# Alumet-relay Prometheus endpoint — scraped by AlumetProfiler for real INA3221 power.
+# pludos-alumet-relay publishes port 9095; pludos-data-engine uses network_mode: host
+# so localhost:9095 inside the container reaches the host's published port directly.
+ALUMET_PROMETHEUS_URL = os.getenv("ALUMET_PROMETHEUS_URL", "http://localhost:9095/metrics")
+
+# Legacy file-based relay path (probe.py, now dormant — superseded by Prometheus scrape).
 ALUMET_RELAY_METRICS_FILE = os.getenv("ALUMET_RELAY_METRICS_FILE", "")
 
 # Maximum Parquet files to concatenate per FL round. Ensures mid-mission buffer-
@@ -164,9 +168,7 @@ def _read_tegrastats() -> dict[str, float]:
 
 
 def _read_relay_metrics() -> dict[str, float] | None:
-    # Reads INA3221 data from the shared file written by alumet-relay probe.py.
-    # probe.py is currently dormant; returns None until revived or replaced by
-    # a Prometheus endpoint query (alumet --output prometheus).
+    # Legacy: reads from the shared file written by alumet-relay probe.py (dormant).
     if not ALUMET_RELAY_METRICS_FILE or not os.path.exists(ALUMET_RELAY_METRICS_FILE):
         return None
     try:
@@ -180,6 +182,67 @@ def _read_relay_metrics() -> dict[str, float] | None:
         }
     except Exception:
         return None
+
+
+def _read_alumet_prometheus() -> dict[str, float] | None:
+    """
+    Scrape the local alumet-relay Prometheus endpoint for Jetson INA3221 power.
+
+    Parses input_current_alumet (mA) and input_voltage_alumet (mV) per channel.
+    Power = current_mA * voltage_mV / 1_000_000 W.
+    Channel mapping: VDD_IN → total, *CPU* → cpu, *SOC* or *GPU* → gpu.
+    Returns None if the endpoint is unreachable (alumet-relay not running).
+    """
+    try:
+        with urllib.request.urlopen(ALUMET_PROMETHEUS_URL, timeout=1) as r:
+            text = r.read().decode()
+    except Exception:
+        return None
+
+    currents: dict[str, float] = {}
+    voltages: dict[str, float] = {}
+    for line in text.splitlines():
+        if line.startswith("#") or not line.strip():
+            continue
+        # Extract channel label from Prometheus label set, then the value.
+        m = re.search(r'input_current_alumet\{[^}]*ina_channel_label="([^"]+)"', line)
+        if m:
+            try:
+                currents[m.group(1)] = float(line.rsplit(None, 1)[-1])
+            except ValueError:
+                pass
+        m = re.search(r'input_voltage_alumet\{[^}]*ina_channel_label="([^"]+)"', line)
+        if m:
+            try:
+                voltages[m.group(1)] = float(line.rsplit(None, 1)[-1])
+            except ValueError:
+                pass
+
+    if not currents:
+        return None
+
+    def _power_w(hint: str) -> float:
+        # Find the first channel whose name contains hint (case-insensitive).
+        for ch, ma in currents.items():
+            if hint.lower() in ch.lower():
+                mv = voltages.get(ch, 5000.0)
+                return ma * mv / 1_000_000.0
+        return 0.0
+
+    total = _power_w("VDD_IN") or _power_w("IN")
+    cpu   = _power_w("CPU")
+    gpu   = _power_w("SOC") or _power_w("GPU")
+
+    # If VDD_IN not found, sum all channels as best-effort total.
+    if total == 0.0 and currents:
+        total = sum(
+            ma * voltages.get(ch, 5000.0) / 1_000_000.0
+            for ch, ma in currents.items()
+        )
+
+    logger.debug("[ALUMET] Prometheus: cpu=%.2fW gpu=%.2fW total=%.2fW channels=%s",
+                 cpu, gpu, total, list(currents.keys()))
+    return {"gpu": gpu, "cpu": cpu, "total": total}
 
 
 class AlumetProfiler:
@@ -285,8 +348,8 @@ class AlumetProfiler:
                     "total": random.uniform(25.0, 50.0),
                 }
             else:
-                # Phase 2: INA3221 via relay file; Phase 1 fallback is tegrastats.
-                pw = _read_relay_metrics() or _read_tegrastats()
+                # Priority: legacy relay file → alumet Prometheus → tegrastats zeros.
+                pw = _read_relay_metrics() or _read_alumet_prometheus() or _read_tegrastats()
 
             # Atomic float update — safe under CPython GIL for this access pattern.
             self._energy_j += pw["total"] * elapsed
