@@ -259,26 +259,23 @@ See the `pludos-alumet` skill for Grafana query examples and phase breakdown gui
 - Energy-aware adaptation confirmed: server reads InfluxDB `alumet_energy` bucket after each
   round and adjusts `n_estimators` — tested, values flow correctly.
 
-**Open decision — relay-client architecture (not yet decided):**
+**Relay-client architecture — CLOSED (2026-05-26):**
 
-Two options for forwarding Jetson power telemetry to the server, currently unresolved:
+Modes are mutually exclusive to avoid duplicate InfluxDB writes. Controlled via `client/.env`,
+no image rebuild required:
 
-| Option | How | Pro | Con |
-|--------|-----|-----|-----|
-| A — Direct InfluxDB push (current) | `influxdb` plugin writes directly from Jetson | Simple, no gRPC hop, works without Tailscale | No server-side aggregation across Jetsons |
-| B — alumet relay-client | `relay-client` → server `relay-server` → InfluxDB | Server can aggregate/process streams from all 3 Jetsons in one place, enables carbon attribution | Requires Tailscale active, server alumet needs `relay-server` plugin configured, more moving parts |
+| Mode | `.env` setting | Active plugins |
+|------|----------------|----------------|
+| Local only | neither | `jetson + prometheus-exporter + csv` |
+| Standalone | `INFLUXDB_TOKEN=...` | + `influxdb` (Jetson → InfluxDB direct) |
+| With server | `ALUMET_SERVER_ADDR=<ip>:50051` | + `relay-client` (→ server alumet → InfluxDB) |
 
-**Constraint:** must work standalone (Jetson without server reachable) AND with server when available.
-Option A satisfies standalone trivially. Option B requires a fallback to direct InfluxDB push when
-`ALUMET_SERVER_ADDR` is unset — which `entrypoint.sh` already supports conditionally.
+`entrypoint.sh` if/else: when `ALUMET_SERVER_ADDR` is set, `relay-client` activates and
+`influxdb` is skipped (server alumet handles the write). When only `INFLUXDB_TOKEN` is set,
+`influxdb` activates directly. Server `alumet` container already runs `relay-server` on port 50051.
 
-**To activate relay-client (when decided):**
-1. Set `ALUMET_SERVER_ADDR=<server-tailscale-ip>:50051` in `client/.env`.
-2. Add `relay-server` plugin to `server/alumet/` entrypoint (not yet written).
-3. `entrypoint.sh` already adds `relay-client` to PLUGINS when `ALUMET_SERVER_ADDR` is set — no rebuild needed.
-
-**Recommendation (deferred):** start with Option A (current state). Revisit when scaling to 3 Jetsons
-or when server-side energy aggregation is needed for thesis experiments.
+To switch to relay mode: set `ALUMET_SERVER_ADDR=<server-tailscale-ip>:50051` in `client/.env`,
+then `podman-compose restart alumet-relay`.
 
 ---
 
