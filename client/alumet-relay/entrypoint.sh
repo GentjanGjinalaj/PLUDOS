@@ -15,9 +15,15 @@
 #   influxdb            — InfluxDB v2 push output
 #   relay-client        — gRPC forward to server Alumet relay-server
 
-set -e
+set -eo pipefail
 
 CONFIG=/tmp/alumet-config.toml
+
+# Log dir bind-mounted from host (compose.yaml: ./logs/alumet:/app/logs).
+# Tee lets podman logs still capture output while also writing a persistent file.
+LOG_DIR="${ALUMET_LOG_DIR:-/app/logs}"
+mkdir -p "${LOG_DIR}"
+LOG_FILE="${LOG_DIR}/alumet-$(date '+%Y%m%d_%H%M%S').log"
 
 # Build config from confirmed canonical schema (alumet-agent config regen).
 # prometheus-exporter and jetson are always included.
@@ -51,4 +57,5 @@ echo "[ALUMET-RELAY] plugins=${PLUGINS} prometheus=:${ALUMET_PROMETHEUS_PORT:-90
 [ -n "${INFLUXDB_TOKEN:-}" ]     && echo "[ALUMET-RELAY] InfluxDB → ${INFLUXDB_URL:-http://localhost:8086}"
 [ -n "${ALUMET_SERVER_ADDR:-}" ] && echo "[ALUMET-RELAY] relay → ${ALUMET_SERVER_ADDR}"
 
-exec alumet-agent --config "${CONFIG}" --plugins "${PLUGINS}"
+# Tee to log file; pipefail propagates alumet-agent's exit code through the pipe.
+alumet-agent --config "${CONFIG}" --plugins "${PLUGINS}" 2>&1 | tee "${LOG_FILE}"

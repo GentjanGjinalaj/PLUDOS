@@ -85,6 +85,8 @@ services:
       - /sys:/sys:ro
       - /etc/localtime:/etc/localtime:ro
       - /etc/timezone:/etc/timezone:ro
+      # Persistent alumet log files — visible on host at client/logs/alumet/.
+      - ./logs/alumet:/app/logs
     restart: unless-stopped
 
 # ram_buffer is a bind-mount on ./ram_buffer so it works in rootless Podman

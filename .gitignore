@@ -54,8 +54,10 @@ docs/current_problems.md
 docs/next_steps.md
 docs/future_options.md
 # FL round logs — written by server.py to logs/ at round start.
-# Keep the directory (logs/.gitkeep) but ignore the log files.
+# Alumet logs — written by entrypoint.sh inside the alumet-relay container.
+# Keep the directories (.gitkeep) but ignore the log files themselves.
 logs/*.log
+client/logs/alumet/*.log
 
 # Claude Code worktrees (isolation branches, not for repo)
 .claude/worktrees/
