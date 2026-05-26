@@ -108,13 +108,33 @@ designed for ≥100 shuttles per gateway.
 - Spins a background thread at 10 Hz during `model.fit()` and writes two InfluxDB measurements:
   `fl_energy` (continuous power samples tagged `fl_round`) and `fl_phases` (one summary point per
   named phase: load / train / round_total with duration_ms, energy_j, avg_power_w).
-- **Phase 1 done:** reads `tegrastats --interval 100 --count 1` and parses `VDD_GPU`, `VDD_CPU`,
-  `VDD_SOC` rails on the Jetson. `nvpmodel -q` read once at init and attached as an InfluxDB tag.
-  `energy_j` integrated as `power_w × elapsed_s`. TEST_MODE uses random mock (laptop-safe).
-- **Phase 2 scaffolded (hardware pending):** `client/alumet-relay/` sidecar reads INA3221 sysfs
-  via Alumet and writes a shared metrics file; `_read_relay_metrics()` in `client.py` reads it
-  with `tegrastats` as fallback. Relay gRPC forwarding to the server is wired; alumet-cli flags
-  must be verified on hardware before activating. See ADR-011 in `decisions.md`.
+- Power source priority: `_read_alumet_prometheus()` → `_read_tegrastats()` (fallback).
+  Alumet is preferred; tegrastats only activates if the Prometheus endpoint is unreachable.
+- INA3221 channels confirmed on Jetson Orin Nano: `VDD_IN` (total), `VDD_CPU_GPU_CV`, `VDD_SOC`.
+
+**`alumet-relay` sidecar (`client/alumet-relay/`) — operational:**
+
+Runs `alumet-agent` (Rust, v0.9.4) on the Jetson. Always-active plugins:
+`jetson` (INA3221 source) + `prometheus-exporter` (localhost:9095) + `csv` (local file).
+Output mode is controlled by `client/.env` — no image rebuild required to switch:
+
+| Mode | Set in `client/.env` | InfluxDB writer |
+|------|----------------------|-----------------|
+| Local only | *(neither)* | none |
+| Standalone | `INFLUXDB_TOKEN=...` | Jetson writes directly |
+| With server | `ALUMET_SERVER_ADDR=<server-ip>:50051` | server alumet relay-server writes |
+
+Relay and direct modes are mutually exclusive — if `ALUMET_SERVER_ADDR` is set, the
+`influxdb` plugin is skipped on the Jetson to avoid duplicate data in InfluxDB.
+Switch: edit `.env`, then `podman-compose restart alumet-relay`. No rebuild.
+
+Log files on the Jetson (gitignored, bind-mounted):
+- `client/logs/alumet/alumet-<ts>.log` — startup/plugin status
+- `client/logs/alumet/alumet_readings.csv` — raw INA3221 readings (semicolon-delimited)
+
+Server-side: `pludos-alumet` container runs `rapl + relay-server + influxdb + prometheus-exporter`.
+`relay-server` listens on port 50051; silent when no Jetson connects.
+See ADR-011 in `decisions.md` for full decision history.
 
 ---
 
