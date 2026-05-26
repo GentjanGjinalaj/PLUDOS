@@ -45,7 +45,6 @@ QUICKSTART.md
 
 # Docs: only block the sensitive or internal-only files.
 # Technical reference docs (architecture, wire protocol, etc.) are intentionally public.
-docs/OPS_COMMANDS.md
 docs/DOWNLOAD.md
 docs/DEPLOYMENT_CHECKLIST.md
 docs/THESIS_KEYPOINTS.md

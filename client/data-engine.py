@@ -83,7 +83,7 @@ _PACKET_BYTES_EST = 300  # conservative Python dict overhead per in-memory packe
 def _compute_auto_limits() -> tuple[int, int, int]:
     """Derive buffer limits from available RAM (psutil). Returns (soft, hard, gateway)."""
     try:
-        import psutil  # optional — not in requirements.txt on non-Jetson targets
+        import psutil  # pyright: ignore[reportMissingModuleSource]  # optional — not in requirements.txt on non-Jetson targets
         avail = psutil.virtual_memory().available
         soft    = max(3000, int(avail * 0.0002 / _PACKET_BYTES_EST))
         hard    = max(4500, int(soft * 1.5))

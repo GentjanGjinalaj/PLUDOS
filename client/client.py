@@ -24,6 +24,7 @@ import socket
 import subprocess
 import threading
 import random
+from pathlib import Path
 
 from influxdb_client import InfluxDBClient, Point, WritePrecision  # type: ignore
 from influxdb_client.client.write_api import SYNCHRONOUS           # type: ignore
@@ -48,9 +49,18 @@ ALUMET_RELAY_METRICS_FILE = os.getenv("ALUMET_RELAY_METRICS_FILE", "")
 MAX_PARQUET_FILES = int(os.getenv("MAX_PARQUET_FILES", "20"))
 
 # Anomaly classification threshold for the Z-axis accelerometer channel (g).
+# Default 2.0g: gravity alone reads ~1.0g, so 2.0g catches genuine shocks only.
+# 0.8g (old default) was below gravity — flagged every sample as anomalous.
 # IMPORTANT: uncalibrated — must be validated against labelled fault data from
 # Savoye before any thesis accuracy claim. See docs/future_options.md §3.3.
-ANOMALY_THRESHOLD_G = float(os.getenv("ANOMALY_THRESHOLD_G", "0.8"))
+ANOMALY_THRESHOLD_G = float(os.getenv("ANOMALY_THRESHOLD_G", "2.0"))
+
+# Where to persist the received global model for standalone (no-server) inference.
+# Lives inside BUFFER_DIR so it survives on the host bind-mount across container
+# restarts. Relative to the container working dir, resolved at runtime.
+LOCAL_MODEL_PATH = Path(os.getenv("LOCAL_MODEL_PATH",
+                                   os.path.join(os.getenv("BUFFER_DIR", "/app/ram_buffer"),
+                                                "model", "latest.ubj")))
 
 # Default n_estimators when no server override is present. The server adapts this
 # each round via fit_config() based on the previous round's energy (ADR-014).
@@ -539,6 +549,16 @@ class PLUDOSClient(fl.client.NumPyClient):
             # Deserialise the server's merged booster from the NumPy parameter array.
             booster = xgb.Booster()
             booster.load_model(bytearray(parameters[0].tobytes()))
+
+            # Persist global model locally for standalone inference (no server needed).
+            # Saved to BUFFER_DIR/model/latest.ubj which is a host bind-mount — survives
+            # container restarts. Best-effort: never fail the round on a save error.
+            try:
+                LOCAL_MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+                booster.save_model(str(LOCAL_MODEL_PATH))
+                logger.info("[MODEL] global model saved to %s", LOCAL_MODEL_PATH)
+            except Exception as save_exc:
+                logger.warning("[MODEL] failed to save global model locally: %s", save_exc)
 
             preds    = (booster.predict(xgb.DMatrix(X_test)) > 0.5).astype(int)
             accuracy = float((preds == y_test).mean())
