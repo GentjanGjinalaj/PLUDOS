@@ -115,6 +115,9 @@ if SHUTTLE_HARD_LIMIT <= SHUTTLE_SOFT_LIMIT:
 
 # Re-anchor NTP offset every N packets per shuttle to correct STM32 crystal drift.
 NTP_REFRESH_INTERVAL = int(os.getenv("NTP_REFRESH_INTERVAL", "100"))
+# Also re-anchor if more than this many seconds have elapsed since the last anchor,
+# regardless of packet count. Prevents 16-minute drift gaps during IDLE at 0.1 Hz.
+NTP_REFRESH_MAX_S = float(os.getenv("NTP_REFRESH_MAX_S", "60"))
 
 # Mission-end detection — after this many seconds of state==IDLE following
 # any state==MOVING run, flush the shuttle's buffer as one Parquet file.
@@ -278,6 +281,10 @@ _ntp_offsets: dict[str, int] = {}
 
 # Per-shuttle packet counter driving the periodic NTP offset refresh.
 _packet_counts: dict[str, int] = {}
+
+# Wall-clock time (monotonic) of the most recent NTP re-anchor per shuttle.
+# Used with NTP_REFRESH_MAX_S to cap drift during low-rate IDLE periods.
+_ntp_anchor_wall: dict[str, float] = {}
 
 # Per-shuttle wall-clock time of the last received packet.
 _last_packet_wall: dict[str, float] = {}
@@ -640,6 +647,7 @@ class TelemetryProtocol(asyncio.DatagramProtocol):
         # establish the NTP offset and mark the mission start.
         if shuttle_name not in _ntp_offsets:
             _ntp_offsets[shuttle_name]        = receipt_ms - tick_ms
+            _ntp_anchor_wall[shuttle_name]    = now
             _mission_start_wall[shuttle_name] = now
             logger.info(
                 "[%s] NTP offset established: %d ms (state=%s)",
@@ -647,12 +655,16 @@ class TelemetryProtocol(asyncio.DatagramProtocol):
                 "MOVING" if state == STATE_MOVING else "IDLE",
             )
 
-        # Drift correction: refresh the offset every NTP_REFRESH_INTERVAL packets.
+        # Drift correction: refresh when packet count hits a multiple of NTP_REFRESH_INTERVAL
+        # OR when NTP_REFRESH_MAX_S seconds have elapsed (guards against IDLE at 0.1 Hz
+        # where 100 packets = ~1000 s without the time-based trigger).
         _packet_counts[shuttle_name] = _packet_counts.get(shuttle_name, 0) + 1
         count = _packet_counts[shuttle_name]
-        if count % NTP_REFRESH_INTERVAL == 0:
+        time_since_anchor = now - _ntp_anchor_wall.get(shuttle_name, now)
+        if count % NTP_REFRESH_INTERVAL == 0 or time_since_anchor >= NTP_REFRESH_MAX_S:
             old_offset = _ntp_offsets[shuttle_name]
-            _ntp_offsets[shuttle_name] = receipt_ms - tick_ms
+            _ntp_offsets[shuttle_name]     = receipt_ms - tick_ms
+            _ntp_anchor_wall[shuttle_name] = now
             drift_ms = _ntp_offsets[shuttle_name] - old_offset
             logger.info(
                 "[%s] NTP offset refreshed at pkt %d: %d ms (drift %+d ms)",

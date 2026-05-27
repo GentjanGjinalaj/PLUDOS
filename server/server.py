@@ -8,6 +8,7 @@ energy from InfluxDB fl_phases measurement (ADR-014).
 
 import json
 import logging
+import math
 import os
 import time
 from pathlib import Path
@@ -284,6 +285,13 @@ def fit_config(server_round: int) -> dict:
 
     if server_round > 1:
         energy_j = _query_last_round_energy(server_round - 1)
+        # NaN means the client wrote a failed-source marker (T0.3); treat like None.
+        if energy_j is not None and math.isnan(energy_j):
+            logger.warning(
+                "[ENERGY] Round %d: previous round energy is NaN (alumet failed) — holding n_estimators=%d",
+                server_round, _current_n_estimators,
+            )
+            energy_j = None
         if energy_j is not None:
             if energy_j > ENERGY_BUDGET_J:
                 _current_n_estimators = max(N_ESTIMATORS_MIN, _current_n_estimators - 2)

@@ -53,6 +53,7 @@ docs/JETSON_DEPLOYMENT.md
 docs/current_problems.md
 docs/next_steps.md
 docs/future_options.md
+docs/to-do.md
 # Log directories — auto-created at runtime, never committed.
 # server.py creates logs/ via mkdir(parents=True, exist_ok=True).
 # entrypoint.sh creates client/logs/alumet/ via mkdir -p.

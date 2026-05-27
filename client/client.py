@@ -86,6 +86,12 @@ ALUMET_PROMETHEUS_URL = os.getenv("ALUMET_PROMETHEUS_URL", "http://localhost:909
 # Legacy file-based relay path (probe.py, now dormant — superseded by Prometheus scrape).
 ALUMET_RELAY_METRICS_FILE = os.getenv("ALUMET_RELAY_METRICS_FILE", "")
 
+# Controls which energy source is accepted during FL rounds.
+#   "alumet"     — hard requirement; round aborts with ERROR if Alumet scrape fails or returns 0.
+#   "tegrastats"  — use tegrastats only (debug/no-Alumet-relay mode).
+#   "auto"        — legacy: relay → alumet → tegrastats fallback, tagged in InfluxDB.
+ENERGY_SOURCE_REQUIRED = os.getenv("ENERGY_SOURCE_REQUIRED", "alumet")
+
 # Maximum Parquet files to concatenate per FL round. Ensures mid-mission buffer-
 # pressure flushes are included rather than training on just the latest tail file.
 MAX_PARQUET_FILES = int(os.getenv("MAX_PARQUET_FILES", "20"))
@@ -98,7 +104,7 @@ MAX_PARQUET_FILES = int(os.getenv("MAX_PARQUET_FILES", "20"))
 #   "isolation_forest_xgb" — IsolationForest on per-packet vibration features.
 #       Faster (~1 s vs ~10 s per round), no torch dependency.
 #   "threshold" — legacy: accel_z > ANOMALY_THRESHOLD_G. Debug/comparison only.
-ANOMALY_MODEL = os.getenv("ANOMALY_MODEL", "lstm_autoencoder")
+ANOMALY_MODEL = os.getenv("ANOMALY_MODEL", "isolation_forest_xgb")
 
 # Isolation Forest: fraction of MOVING packets expected to be anomalous.
 # 0.05 = conservative prior (5% of warehouse shuttle samples are shock/wear events).
@@ -291,6 +297,12 @@ class AlumetProfiler:
         # for 10 Hz sampling.
         self._energy_j: float = 0.0
 
+        # Set True by _poll_metrics when ENERGY_SOURCE_REQUIRED="alumet" and scrape
+        # fails or returns zero. Checked in end_phase to abort the round cleanly.
+        self._source_failed: bool = False
+        # Last-used energy source; written by polling thread, used for InfluxDB tagging.
+        self._energy_source: str = "unknown"
+
         # Active phase snapshots: phase_name → (start_monotonic, energy_j_at_start)
         self._phase_snapshots: dict[str, tuple[float, float]] = {}
 
@@ -328,26 +340,39 @@ class AlumetProfiler:
         # Avoid divide-by-zero on very short phases.
         avg_power   = delta_e / max(now - start_t, 1e-6)
 
+        # If the required alumet source failed, write NaN so the server treats this
+        # round as "unknown energy" rather than "low energy" (T0.4 guard on server side).
+        energy_field = float("nan") if self._source_failed and ENERGY_SOURCE_REQUIRED == "alumet" else delta_e
+        source_tag   = self._energy_source
+
         point = (
             Point("fl_phases")
             .tag("device",   self.device_name)
             .tag("fl_round", str(self.round_num))
             .tag("phase",    phase)
             .tag("nvpmodel", self.nvpmodel)
+            .tag("source",   source_tag)
             .field("fl_round_int", self._round_int)
             .field("duration_ms",  duration_ms)
-            .field("energy_j",     delta_e)
+            .field("energy_j",     energy_field)
             .field("avg_power_w",  avg_power)
             .time(time.time_ns(), WritePrecision.NS)
         )
         try:
             self.write_api.write(bucket=self.bucket, record=point)
             logger.info(
-                "[ALUMET] phase=%-12s dur=%.0fms energy=%.3fJ avg=%.2fW",
-                phase, duration_ms, delta_e, avg_power,
+                "[ALUMET] phase=%-12s dur=%.0fms energy=%.3fJ avg=%.2fW source=%s",
+                phase, duration_ms, delta_e, avg_power, source_tag,
             )
         except Exception as exc:
             logger.error("[ALUMET] fl_phases write failed (phase=%s): %s", phase, exc)
+
+        if self._source_failed and ENERGY_SOURCE_REQUIRED == "alumet":
+            # Signal the polling thread to stop, then abort the round.
+            self.is_running = False
+            raise RuntimeError(
+                f"[ENERGY] alumet unavailable for round {self.round_num}; round aborted"
+            )
 
     def _poll_metrics(self) -> None:
         # 10 Hz polling loop. Reads INA3221 relay file if available, falls back
@@ -364,9 +389,33 @@ class AlumetProfiler:
                     "cpu":   random.uniform(3.0,  8.0),
                     "total": random.uniform(25.0, 50.0),
                 }
-            else:
-                # Priority: legacy relay file → alumet Prometheus → tegrastats zeros.
-                pw = _read_relay_metrics() or _read_alumet_prometheus() or _read_tegrastats()
+                self._energy_source = "test"
+            elif ENERGY_SOURCE_REQUIRED == "alumet":
+                # alumet required: fail the round if unreachable or reports zero power.
+                pw = _read_relay_metrics() or _read_alumet_prometheus()
+                if pw is None or pw.get("total", 0.0) == 0.0:
+                    if not self._source_failed:
+                        logger.error("[ENERGY] alumet unavailable, refusing to report fake energy")
+                        self._source_failed = True
+                    self._energy_source = "failed"
+                    pw = {"gpu": 0.0, "cpu": 0.0, "total": 0.0}
+                else:
+                    self._energy_source = "alumet"
+            elif ENERGY_SOURCE_REQUIRED == "tegrastats":
+                pw = _read_tegrastats()
+                self._energy_source = "tegrastats"
+            else:  # auto — legacy fallback chain, tagged for Grafana visibility
+                pw = _read_relay_metrics() or _read_alumet_prometheus()
+                if pw is not None:
+                    self._energy_source = "alumet"
+                else:
+                    pw = _read_tegrastats()
+                    self._energy_source = "tegrastats_fallback"
+                    if not self._source_failed:
+                        logger.warning(
+                            "[ENERGY][DEGRADED] alumet unavailable — falling back to tegrastats"
+                        )
+                        self._source_failed = True
 
             # Atomic float update — safe under CPython GIL for this access pattern.
             self._energy_j += pw["total"] * elapsed
@@ -376,6 +425,7 @@ class AlumetProfiler:
                 .tag("device",   self.device_name)
                 .tag("fl_round", str(self.round_num))
                 .tag("nvpmodel", self.nvpmodel)
+                .tag("source",   self._energy_source)
                 .field("fl_round_int",  self._round_int)
                 .field("power_gpu_w",   pw["gpu"])
                 .field("power_cpu_w",   pw["cpu"])
