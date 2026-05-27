@@ -115,7 +115,9 @@ static uint32_t last_movement_tick = 0U;        /* tick of the most recent above
 static uint32_t last_above_threshold_tick = 0U; /* same value, separate name for debounce clarity */
 static uint32_t continuous_movement_start_tick = 0U; /* tick when the current dwell began */
 
-#define MOVEMENT_THRESHOLD_G2   0.05f    /* deviation from 1g² — ~0.0247 g, above ISM330 noise floor */
+/* UNCALIBRATED — set threshold = mean(idle_mag²) + 5σ after recording
+   5 min IDLE + 5 min motion on the actual fixture. Current 0.05 is a guess. */
+#define MOVEMENT_THRESHOLD_G2   0.05f    /* |mag² - 1g²| threshold to detect motion */
 #define MOVEMENT_DWELL_MS       500U     /* continuous-above duration to enter STATE_MOVING */
 #define MOVEMENT_DEBOUNCE_MS    300U     /* sub-threshold tolerance inside a dwell — survives motion microbreaks */
 #define NO_MOVEMENT_TIMEOUT_MS  20000U   /* no above-threshold sample for this long → STATE_IDLE */
@@ -629,11 +631,12 @@ int main(void)
   sprintf(uart_buf, "[SENSOR] Initializing ISM330 accelerometer...\r\n");
   HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
 
-  // Enable accelerometer: CTRL1_XL = 0x50 (416 Hz, ±2g range, normal mode)
-  uint8_t accel_config = 0x50;  // 416Hz, ±2g, normal mode
+  /* ODR=0010→26 Hz; sampled at 10 Hz. 26 Hz eliminates aliasing from the 416 Hz
+     internal filter chain while staying well above the 10 Hz read rate (Nyquist). */
+  uint8_t accel_config = 0x20;  /* CTRL1_XL: ODR=26 Hz, FS=±2g, normal mode */
   if (HAL_I2C_Mem_Write(&hi2c2, ISM330_ADDR, CTRL1_XL, 1, &accel_config, 1, 100) == HAL_OK)
   {
-    sprintf(uart_buf, "[SENSOR] ISM330 accelerometer enabled (416Hz, ±2g)\r\n");
+    sprintf(uart_buf, "[SENSOR] ISM330 accelerometer enabled (26Hz, ±2g)\r\n");
     HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
   }
   else
@@ -644,8 +647,8 @@ int main(void)
 
   HAL_Delay(100);  /* allow ISM330 to stabilize */
 
-  /* Enable gyroscope: same ODR register value as accelerometer, ±250 dps FS. */
-  uint8_t gyro_config = 0x50;  /* FS_G=00 → ±250 dps; ODR matches accel */
+  /* Enable gyroscope: ODR matches accelerometer (26 Hz), ±250 dps FS. */
+  uint8_t gyro_config = 0x20;  /* CTRL2_G: ODR=26 Hz, FS_G=00 → ±250 dps */
   if (HAL_I2C_Mem_Write(&hi2c2, ISM330_ADDR, CTRL2_G, 1, &gyro_config, 1, 100) == HAL_OK)
   {
     sprintf(uart_buf, "[SENSOR] ISM330 gyroscope enabled (±250 dps)\r\n");
