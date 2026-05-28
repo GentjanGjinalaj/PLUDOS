@@ -498,6 +498,41 @@ def _write_gw_status_heartbeat(last_round: int | None = None) -> None:
         logger.warning("[GW_STATUS] write failed: %s", exc)
 
 
+def _write_train_metrics(
+    round_num, n_estimators: int, total_trees: int,
+    train_logloss: float, n_samples: int, anomaly_rate: float, labeller: str,
+) -> None:
+    # Write per-round XGBoost metrics for T8.1 convergence study. Best-effort.
+    influx_url   = os.getenv("INFLUXDB_URL",    "http://127.0.0.1:8086")
+    influx_token = os.getenv("INFLUXDB_TOKEN",  "pludos-secret-token")
+    influx_org   = os.getenv("INFLUXDB_ORG",    "pludos")
+    influx_bucket= os.getenv("INFLUXDB_BUCKET", "alumet_energy")
+    try:
+        client = InfluxDBClient(url=influx_url, token=influx_token, org=influx_org)
+        try:
+            point = (
+                Point("fl_train_metrics")
+                .tag("gateway_id", GATEWAY_ID)
+                .tag("fl_round",   str(round_num))
+                .tag("labeller",   labeller)
+                .field("n_estimators",  n_estimators)
+                .field("total_trees",   total_trees)
+                .field("train_logloss", train_logloss)
+                .field("n_samples",     n_samples)
+                .field("anomaly_rate",  anomaly_rate)
+                .time(time.time_ns(), WritePrecision.NS)
+            )
+            client.write_api(write_options=SYNCHRONOUS).write(bucket=influx_bucket, record=point)
+            logger.info(
+                "[TRAIN_METRICS] round=%s n_est=%d total_trees=%d logloss=%.4f samples=%d anomaly_rate=%.3f",
+                round_num, n_estimators, total_trees, train_logloss, n_samples, anomaly_rate,
+            )
+        finally:
+            client.close()
+    except Exception as exc:
+        logger.warning("[TRAIN_METRICS] write failed: %s", exc)
+
+
 class PLUDOSClient(fl.client.NumPyClient):
     """Flower framework wrapper for PLUDOS edge node participation in FL rounds."""
 
@@ -540,10 +575,15 @@ class PLUDOSClient(fl.client.NumPyClient):
             # Artificial sleep in TEST_MODE ensures enough InfluxDB points for Grafana.
             if TEST_MODE:
                 time.sleep(1.5)
-            model = xgb.XGBClassifier(n_estimators=n_estimators, tree_method="hist", device=DEVICE)
-            model.fit(X_train, y_train, xgb_model=xgb_model_arg)
-            logger.info("[WARMSTART] local booster: %d boosted rounds",
-                        model.get_booster().num_boosted_rounds())
+            model = xgb.XGBClassifier(n_estimators=n_estimators, tree_method="hist", device=DEVICE,
+                                      eval_metric="logloss")
+            model.fit(X_train, y_train, xgb_model=xgb_model_arg,
+                      eval_set=[(X_train, y_train)], verbose=False)
+            total_trees  = model.get_booster().num_boosted_rounds()
+            evals        = model.evals_result()
+            train_logloss = evals.get("validation_0", {}).get("logloss", [float("nan")])[-1]
+            logger.info("[WARMSTART] local booster: %d boosted rounds, logloss=%.4f",
+                        total_trees, train_logloss)
             profiler.end_phase("train")
         finally:
             # Always record round_total — even if load or train raised.
@@ -553,6 +593,10 @@ class PLUDOSClient(fl.client.NumPyClient):
 
         if model is None:
             raise RuntimeError(f"Round {round_num}: training did not complete; check buffer.")
+
+        # Write XGBoost training metrics to InfluxDB for T8.1 convergence study.
+        _write_train_metrics(round_num, n_estimators, total_trees, train_logloss,
+                             len(X_train), float(y_train.mean()) if len(y_train) else 0.0, labeller)
 
         # Serialise booster trees to raw JSON bytes for Flower transport.
         booster     = model.get_booster()
