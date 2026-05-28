@@ -319,13 +319,8 @@ _tx_rate_window: dict[str, int] = {}
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _flush(buf: list[dict], prefix: str) -> float:
-    """Cast to ML-ready dtypes, compute derived columns, write clean Parquet atomically.
-    Returns total_distance_m for the mission-end InfluxDB summary. Returns 0.0 on empty buffer."""
-    if not buf:
-        return 0.0
-    df = pd.DataFrame(buf)
-    df.sort_values(by=["shuttle_id", "seq"], inplace=True)
+def _compute_derived(df: pd.DataFrame) -> pd.DataFrame:
+    """Add all derived columns and cast to Parquet dtypes. df must be sorted by (shuttle_id, seq)."""
 
     # Anchor STM32 relative tick to gateway NTP wall clock → proper UTC Timestamp.
     df["timestamp"] = pd.to_datetime(df["timestamp_ms"], unit="ms", utc=True)
@@ -485,8 +480,17 @@ def _flush(buf: list[dict], prefix: str) -> float:
     for col in ("pause_duration_s", "moving_run_dur_s"):
         df[col] = df[col].astype("float32")
 
-    # Drop all intermediate fields; enforce canonical column order.
-    df = df[_PARQUET_COLS]
+    return df[_PARQUET_COLS]
+
+
+def _flush(buf: list[dict], prefix: str) -> float:
+    """Compute derived columns, write clean Parquet atomically, clear buf.
+    Returns total_distance_m for the mission-end InfluxDB summary. Returns 0.0 on empty buffer."""
+    if not buf:
+        return 0.0
+    df = pd.DataFrame(buf)
+    df.sort_values(by=["shuttle_id", "seq"], inplace=True)
+    df = _compute_derived(df)
 
     shuttle_id_val = int(df["shuttle_id"].iloc[0])
     shuttle_label  = f"shuttle-{shuttle_id_val}"

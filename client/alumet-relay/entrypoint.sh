@@ -86,5 +86,42 @@ else
 fi
 echo "[ALUMET-RELAY] prometheus=:${ALUMET_PROMETHEUS_PORT:-9095} csv=${LOG_DIR}/alumet_readings.csv"
 
-# Tee to log file; pipefail propagates alumet-agent's exit code through the pipe.
-alumet-agent --config "${CONFIG}" --plugins "${PLUGINS}" 2>&1 | tee "${LOG_FILE}"
+# Run agent + tee in background so we can also run a watchdog alongside.
+alumet-agent --config "${CONFIG}" --plugins "${PLUGINS}" 2>&1 | tee "${LOG_FILE}" &
+TEED_PID=$!
+
+# T7.2 watchdog: exit the container (→ Podman restarts it) if alumet writes
+# ALUMET_ZERO_THRESHOLD consecutive zero power readings to the CSV.
+# Killing tee (TEED_PID) sends SIGPIPE to alumet-agent; both die; wait returns
+# non-zero; Podman's restart: unless-stopped brings the container back up.
+ZERO_THRESHOLD="${ALUMET_ZERO_THRESHOLD:-5}"
+(
+    zeros=0
+    # Wait for CSV to appear — first reading may take a few seconds.
+    until [ -f "${LOG_DIR}/alumet_readings.csv" ]; do sleep 2; done
+    while kill -0 "${TEED_PID}" 2>/dev/null; do
+        sleep 10
+        # Filter last 20 CSV rows for a power metric; print "zero", "ok", or "skip".
+        val=$(tail -20 "${LOG_DIR}/alumet_readings.csv" 2>/dev/null \
+              | awk -F';' '
+                  tolower($2) ~ /power/ {
+                      v = $NF; gsub(/ /, "", v); found = 1; last = v + 0
+                  }
+                  END {
+                      if (!found) print "skip"
+                      else if (last == 0) print "zero"
+                      else print "ok"
+                  }')
+        case "${val}" in
+            zero) zeros=$((zeros + 1)) ;;
+            ok)   zeros=0 ;;
+            skip) ;;
+        esac
+        if [ "${zeros}" -ge "${ZERO_THRESHOLD}" ]; then
+            echo "[ALUMET-RELAY][WATCHDOG] ${zeros} consecutive zero power readings — restarting container" >&2
+            kill "${TEED_PID}" 2>/dev/null
+        fi
+    done
+) &
+
+wait "${TEED_PID}"

@@ -276,6 +276,15 @@ no image rebuild required:
 To switch to relay mode: set `ALUMET_SERVER_ADDR=<server-tailscale-ip>:50051` in `client/.env`,
 then `podman-compose restart alumet-relay`.
 
+**T7.2 — Zero-reading watchdog (2026-05-28):**
+
+`entrypoint.sh` now runs a background watchdog alongside `alumet-agent`. Every 10 s the
+watchdog reads the last 20 rows of `alumet_readings.csv`, filters for power metric rows,
+and increments a counter if the last power value is 0. When `ALUMET_ZERO_THRESHOLD`
+(default 5) consecutive zero readings are seen the watchdog kills the `tee` process;
+alumet-agent dies via SIGPIPE; `wait` returns non-zero; Podman's `restart: unless-stopped`
+brings the container back up. Set `ALUMET_ZERO_THRESHOLD=0` to disable the watchdog.
+
 ---
 
 ## ADR-012 — Manual application-layer CoAP retry
