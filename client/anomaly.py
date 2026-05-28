@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 TEST_MODE = os.getenv("TEST_MODE") == "1"
-BUFFER_DIR = "./ram_buffer" if TEST_MODE else "/app/ram_buffer"
+BUFFER_DIR = os.getenv("BUFFER_DIR", "./ram_buffer" if TEST_MODE else "/app/ram_buffer")
 
 MAX_PARQUET_FILES = int(os.getenv("MAX_PARQUET_FILES", "20"))
 
