@@ -43,7 +43,8 @@ services:
       - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
       - GF_AUTH_DISABLE_LOGIN_FORM=false
     depends_on:
-      - influxdb
+      influxdb:
+        condition: service_healthy
     restart: unless-stopped
 
   # Alumet — server-side energy profiler (ADR-011)
@@ -82,7 +83,8 @@ services:
       # Prometheus scrape endpoint — Grafana pulls live energy metrics from here.
       - "9094:9094"
     depends_on:
-      - influxdb
+      influxdb:
+        condition: service_healthy
     restart: unless-stopped
 
   # FL Trigger — watches InfluxDB for ready gateways and launches `flwr run .`
