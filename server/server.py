@@ -44,7 +44,7 @@ logger.info("[LOG] round log → %s", _log_path)
 # ---------------------------------------------------------------------------
 # FL topology config — tunable via shell env before `flwr run .`
 # ---------------------------------------------------------------------------
-NUM_ROUNDS      = int(os.getenv("FL_NUM_ROUNDS",      "3"))
+NUM_ROUNDS      = int(os.getenv("FL_NUM_ROUNDS",      "10"))
 MIN_FIT_CLIENTS = int(os.getenv("FL_MIN_FIT_CLIENTS", "1"))
 
 # ---------------------------------------------------------------------------

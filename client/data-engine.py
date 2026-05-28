@@ -127,6 +127,11 @@ MISSION_END_IDLE_S = float(os.getenv("MISSION_END_IDLE_S", "30"))
 # shuttle waited unusually long without moving, suggesting a failed pick/place).
 RETRY_PAUSE_THRESHOLD_S = float(os.getenv("RETRY_PAUSE_THRESHOLD_S", "8.0"))
 
+# 1D-ZUPT distance for Savoye XTPS: one shuttle per rail, forward/backward only.
+# The HPF running mean removes mounting-tilt DC offset before integration.
+# At 10 Hz MOVING: 20 packets ≈ 2 s window → ~0.22 Hz high-pass.
+DISTANCE_HPF_WINDOW = int(os.getenv("DISTANCE_HPF_WINDOW", "20"))
+
 # Per-second status log: roll up "tx rate" and last-seen sensor values rather
 # than logging every packet (50 Hz × 100 shuttles would drown the terminal).
 STATUS_LOG_PERIOD_S = float(os.getenv("STATUS_LOG_PERIOD_S", "1.0"))
@@ -209,10 +214,9 @@ _PARQUET_COLS = [
     # Environment (HTS221)
     "temp_c",       # float16 °C — NaN when unavailable
     "humidity_pct", # float16 %  — HTS221 RH; NaN when unavailable
-    # Kinematic estimates (ZUPT integration + mission context)
+    # Kinematic estimates
     "mission_elapsed_s", # float32 s — time since first packet in this flush buffer
-    "speed_ms",          # float32 m/s — ZUPT horizontal speed; resets at each IDLE→MOVING
-    "displacement_m",    # float32 m — ZUPT cumulative horizontal displacement per mission
+    "distance_m_cum",    # float32 m — impulse-counter cumulative distance; reset per mission
     # Mission segmentation (derived from state transitions within the flush buffer)
     "moving_run_id",     # int8    — 1-based travel leg; 0 = pre-mission IDLE (no MOVING yet)
     "pause_duration_s",  # float32 s — duration of this in-mission stop; 0 if MOVING or pre/post-mission IDLE
@@ -309,12 +313,11 @@ _tx_rate_window: dict[str, int] = {}
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _flush(buf: list[dict], prefix: str) -> tuple[float, float]:
+def _flush(buf: list[dict], prefix: str) -> float:
     """Cast to ML-ready dtypes, compute derived columns, write clean Parquet atomically.
-    Returns (final_displacement_m, max_speed_ms) for the mission-end InfluxDB summary.
-    Returns (0.0, 0.0) on empty buffer."""
+    Returns total_distance_m for the mission-end InfluxDB summary. Returns 0.0 on empty buffer."""
     if not buf:
-        return 0.0, 0.0
+        return 0.0
     df = pd.DataFrame(buf)
     df.sort_values(by=["shuttle_id", "seq"], inplace=True)
 
@@ -361,36 +364,42 @@ def _flush(buf: list[dict], prefix: str) -> tuple[float, float]:
         df["timestamp"] - df["timestamp"].iloc[0]
     ).dt.total_seconds()
 
-    # ZUPT speed and displacement using actual measured packet dt (not a fixed constant).
-    # Velocity resets to 0.0 at each IDLE→MOVING boundary, bounding integration drift
-    # to a single pick cycle. IDLE samples: speed=0 (shuttle stationary).
-    dt_arr  = dt_s.fillna(0.1).values   # first-packet fallback: assume 10 Hz interval
-    states  = df["state"].values.astype(int)
-    ax_vals = df["accel_x"].values.astype(float)
-    ay_vals = df["accel_y"].values.astype(float)
-    speeds, disps = [], []
-    vel, disp, prev = 0.0, 0.0, states[0]
+    # 1D-ZUPT distance for Savoye XTPS (one shuttle per rail, forward/backward only).
+    #
+    # Step 1: auto-detect track axis. The rail-aligned axis has far higher variance
+    #         during MOVING than the perpendicular axis (arm extend/retract).
+    # Step 2: HPF (running mean subtraction) removes mounting-tilt DC offset.
+    # Step 3: integrate signed HPF accel. At every IDLE packet reset vel=0 — the
+    #         shuttle is physically stopped on the rail, so ZUPT is exact here.
+    states    = df["state"].values.astype(int)
+    ax_moving = df.loc[df["state"] == STATE_MOVING, "accel_x"].dropna()
+    ay_moving = df.loc[df["state"] == STATE_MOVING, "accel_y"].dropna()
+    var_x     = float(ax_moving.var()) if len(ax_moving) > 1 else 0.0
+    var_y     = float(ay_moving.var()) if len(ay_moving) > 1 else 0.0
+    track_a   = (
+        df["accel_x"].values.astype(float) if var_x >= var_y
+        else df["accel_y"].values.astype(float)
+    )
+    rm        = pd.Series(track_a).rolling(DISTANCE_HPF_WINDOW, min_periods=1).mean().values
+    hpf       = track_a - rm              # signed HPF acceleration (g), DC offset removed
+    dt_arr    = dt_s.fillna(0.1).values  # fallback 0.1 s at 10 Hz MOVING rate
+    dist_arr  = []
+    d, vel    = 0.0, 0.0
     for i in range(len(states)):
-        s  = int(states[i])
-        dt = float(dt_arr[i])
-        if s == 1 and prev == 0:
-            vel = 0.0  # ZUPT: zero velocity at IDLE→MOVING transition
-        if s == 1 and not (math.isnan(ax_vals[i]) or math.isnan(ay_vals[i])):
-            a_h  = math.sqrt(ax_vals[i]**2 + ay_vals[i]**2)
-            vel  = max(0.0, vel + a_h * 9.81 * dt)
-            disp += vel * dt
+        if int(states[i]) == STATE_MOVING:
+            h = float(hpf[i])
+            if not math.isnan(h):
+                vel += h * 9.81 * float(dt_arr[i])   # g → m/s²; signed integration
+                d   += abs(vel) * float(dt_arr[i])   # unsigned path length
         else:
-            vel = 0.0
-        speeds.append(round(vel, 3))
-        disps.append(round(disp, 3))
-        prev = s
-    df["speed_ms"]       = speeds
-    df["displacement_m"] = disps
+            vel = 0.0   # ZUPT: exact reset — shuttle is stopped at IDLE on the rail
+        dist_arr.append(round(d, 3))
+    df["distance_m_cum"] = dist_arr
 
     # Mission segmentation: label each packet with its travel leg and pause context.
     # Two-pass scan over contiguous state runs; pure Python/lists — no numpy.
     times_arr = df["mission_elapsed_s"].values.tolist()
-    n = len(states)  # `states` already computed above for the ZUPT loop
+    n = len(states)  # `states` already computed above for the distance loop
 
     # Pass 1: collect contiguous state runs → [(state_val, start_idx, end_idx, duration_s), ...]
     segments = []
@@ -462,7 +471,7 @@ def _flush(buf: list[dict], prefix: str) -> tuple[float, float]:
     for col in sensor_cols:
         df[col] = df[col].astype("float16")
     df["humidity_pct"] = df["humidity_pct"].astype("float16")
-    for col in ("mission_elapsed_s", "speed_ms", "displacement_m"):
+    for col in ("mission_elapsed_s", "distance_m_cum"):
         df[col] = df[col].astype("float32")
     df["moving_run_id"] = df["moving_run_id"].astype("int8")
     df["pause_count"]   = df["pause_count"].astype("int8")
@@ -487,11 +496,10 @@ def _flush(buf: list[dict], prefix: str) -> tuple[float, float]:
                   compression="zstd", compression_level=3)
     os.replace(tmp_path, file_path)  # atomic rename: crash-safe on Linux
     logger.info("[%s] Flushed %d records → %s (zstd)", shuttle_label, len(df), file_path)
-    # Extract summary stats before clearing — returned to mission-end caller for InfluxDB.
-    final_disp = round(float(df["displacement_m"].iloc[-1]), 2)
-    max_spd    = round(float(df["speed_ms"].max()), 2)
+    # Total mission distance — returned to mission-end caller for InfluxDB.
+    total_dist = round(float(df["distance_m_cum"].iloc[-1]), 2)
     buf.clear()
-    return final_disp, max_spd
+    return total_dist
 
 
 def _write_mission_summary(
@@ -499,8 +507,7 @@ def _write_mission_summary(
     energy_j: float,
     packets: int,
     duration_ms: float,
-    displacement_m: float = 0.0,
-    max_speed_ms: float = 0.0,
+    distance_m: float = 0.0,
 ) -> None:
     # Fire-and-forget background thread so the asyncio loop is never blocked by InfluxDB I/O.
     def _write() -> None:
@@ -510,19 +517,18 @@ def _write_mission_summary(
                 Point("stm_mission")
                 .tag("shuttle_id", shuttle_id)
                 .tag("gateway",    _GATEWAY_TAG)
-                .field("energy_j",       energy_j)
-                .field("packets",        packets)
-                .field("duration_ms",    duration_ms)
-                .field("displacement_m", displacement_m)
-                .field("max_speed_ms",   max_speed_ms)
+                .field("energy_j",    energy_j)
+                .field("packets",     packets)
+                .field("duration_ms", duration_ms)
+                .field("distance_m",  distance_m)
                 .time(time.time_ns(), WritePrecision.NS)
             )
             client.write_api(write_options=SYNCHRONOUS).write(
                 bucket=_INFLUXDB_BUCKET, record=point
             )
             logger.info(
-                "[INFLUXDB] stm_mission shuttle=%s energy=%.4fJ pkts=%d dur=%.0fms disp=%.1fm spd=%.2fm/s",
-                shuttle_id, energy_j, packets, duration_ms, displacement_m, max_speed_ms,
+                "[INFLUXDB] stm_mission shuttle=%s energy=%.4fJ pkts=%d dur=%.0fms dist=%.1fm",
+                shuttle_id, energy_j, packets, duration_ms, distance_m,
             )
         except Exception as exc:
             logger.warning("[INFLUXDB] stm_mission write failed (%s): %s", shuttle_id, exc)
@@ -595,8 +601,8 @@ def _maybe_flush_mission(shuttle_id: str, now: float) -> None:
     )
 
     # Pop the buffer before reset so _reset_shuttle_state's pop is a no-op.
-    final_disp, max_spd = _flush(_telemetry_buf.pop(shuttle_id, []), "mission")
-    _write_mission_summary(shuttle_id, energy, pkts, duration_ms, final_disp, max_spd)
+    total_dist = _flush(_telemetry_buf.pop(shuttle_id, []), "mission")
+    _write_mission_summary(shuttle_id, energy, pkts, duration_ms, total_dist)
     _reset_shuttle_state(shuttle_id)
 
 

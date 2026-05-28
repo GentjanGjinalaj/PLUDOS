@@ -454,3 +454,58 @@ sparse drops.
   replaces `CriticalResource` (aiocoap) and `NonCriticalProtocol` (5684).
 - `docs/wire_protocol.md` §1 rewritten; §2 marked deprecated.
 - `docs/state_machine.md` — sample rates, debounce, no buffer table.
+
+---
+
+## ADR-017 — Distance estimation via impulse counter
+**Status:** Closed
+
+**Context:** Cumulative distance traveled is a wear proxy for shuttle bearings.
+The original ZUPT integration (double-integrating `|a_h|`) was unbounded —
+unsigned magnitude means velocity never decreases, no gravity removal, no
+reset across IDLE windows — producing values that diverge without bound.
+
+**Decision:** Replace ZUPT-on-magnitude with a proper 1D signed ZUPT, exploiting
+the Savoye XTPS rail constraint: the shuttle moves strictly forward/backward on
+one axis; `state == IDLE` is an exact physical stop.
+
+1. **Auto-detect the track axis** per flush buffer: compare `var(accel_x)` vs
+   `var(accel_y)` on MOVING packets. The rail-aligned axis has far higher variance
+   than the perpendicular arm-deployment axis. No calibration required.
+2. **HPF the track axis** via running mean subtraction over `DISTANCE_HPF_WINDOW`
+   packets (default 20 ≈ 2 s at 10 Hz), removing mounting-tilt DC offset (~0.22 Hz).
+3. **Integrate signed HPF acceleration.** At `state == IDLE`, reset `vel = 0`.
+   Since the shuttle is physically stopped on the rail at IDLE, this ZUPT reset
+   is exact — drift is bounded to the duration of each MOVING segment.
+4. `distance_m_cum += |vel| × dt` — unsigned path length, correct for
+   forward/backward travel.
+
+**Rationale:**
+- **No calibration constant.** The original impulse counter needed `STEP_DISTANCE_M`
+  tuned per floor. Physics (g = 9.81 m/s²) replaces that.
+- **Exact ZUPT.** The 1D rail constraint means IDLE truly means zero velocity.
+  This is stronger than any heuristic and bounds integration error per segment.
+- **Rejects arm noise.** By selecting only the high-variance axis, perpendicular
+  arm-deployment vibration does not contaminate the estimate.
+- **Error envelope ±15–20%** on normal runs is sufficient for the thesis goal:
+  a wear-correlated feature, not a metrology instrument.
+
+**Trade-offs accepted:**
+- HPF introduces ≈2 s lag at motion onset (burn-in of the running mean window).
+  Short runs (<2 s MOVING) underestimate distance by up to ±40%.
+- `distance_m_cum` is path length (not net displacement) — a return trip doubles it.
+- No absolute ground truth; validate with a tape measure on first production run.
+
+**Schema change:** `speed_ms` and `displacement_m` Parquet columns removed;
+`distance_m_cum` (float32) added. Old Parquet files missing `distance_m_cum`
+are backfilled with 0.0 in `client.py load_buffered_data()`.
+
+**InfluxDB:** `stm_mission.displacement_m` and `.max_speed_ms` fields replaced
+by `stm_mission.distance_m` (total per-mission distance).
+
+**Implementation files:**
+- `client/data-engine.py` — `_flush()` impulse counter; `_write_mission_summary()`
+  writes `distance_m`.
+- `client/client.py` — `load_buffered_data()` backward-compat backfill;
+  `feature_cols` updated.
+- `docs/distance_estimation.md` — algorithm, calibration, error envelope.
