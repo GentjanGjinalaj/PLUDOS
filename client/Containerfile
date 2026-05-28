@@ -13,6 +13,8 @@ RUN pip3 install --no-cache-dir -r requirements.txt
 # Copy your Python scripts into the container
 COPY data-engine.py .
 COPY client.py .
+COPY anomaly.py .
+COPY anomaly_cnn.py .
 
 # Create the internal buffer directory
 RUN mkdir -p /app/ram_buffer
