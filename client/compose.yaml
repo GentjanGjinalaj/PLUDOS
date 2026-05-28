@@ -19,6 +19,7 @@ services:
   # 1. The CoAP Data Engine (STM32 <-> Jetson local WiFi path)
   # network_mode: host — required for UDP broadcast beacon to reach the local subnet,
   # and avoids CNI firewall plugin version mismatch on rootless Podman (JetPack 6).
+  # No profiles: runs in all modes (vpn, standalone, headless, plain up).
   data-engine:
     build: .
     container_name: pludos-data-engine
@@ -32,7 +33,8 @@ services:
       - /etc/timezone:/etc/timezone:ro
     restart: unless-stopped
 
-  # 2. The AI Worker (Jetson <-> Server relay path via Tailscale)
+  # 2. The AI Worker (Jetson <-> Server relay path via Tailscale in federated mode;
+  #    local retrain loop in standalone mode — controlled by PLUDOS_MODE env var).
   ai-worker:
     build: .
     container_name: pludos-ai-worker
@@ -42,6 +44,7 @@ services:
       - .env
     profiles:
       - vpn
+      - standalone
     # GPU note: CDI device passthrough (nvidia.com/gpu=all) requires Podman ≥ 4.1.
     # Jetson currently runs Podman 3.4.4 (JetPack 5.x). XGBoost auto-detects
     # GPU availability at startup and falls back to CPU if CUDA is inaccessible.
@@ -53,9 +56,6 @@ services:
     depends_on:
       data-engine:
         condition: service_started
-      tailscale:
-        condition: service_started
-      # T4.1: block until alumet Prometheus endpoint is healthy before Flower connects.
       alumet-relay:
         condition: service_healthy
     restart: unless-stopped
@@ -73,6 +73,7 @@ services:
   # network_mode: host — avoids CNI firewall plugin version mismatch on rootless
   # Podman (JetPack 5.x). Port 9095 is bound directly on the host; data-engine
   # and client.py reach it at localhost:9095 with no CNI involved.
+  # No profiles: runs in all modes (the healthcheck guards ai-worker regardless).
   alumet-relay:
     build:
       context: ./alumet-relay
@@ -101,9 +102,56 @@ services:
       start_period: 30s
     restart: unless-stopped
 
+  # 4. Local InfluxDB — standalone profile only (T5.2)
+  # Provides a local time-series store when no central server is reachable.
+  # 7-day retention keeps eMMC usage bounded on the Jetson.
+  # Set INFLUXDB_URL=http://localhost:8086 in .env when using standalone mode.
+  influxdb-local:
+    image: docker.io/library/influxdb:2.7
+    container_name: pludos-influxdb-local
+    profiles:
+      - standalone
+    ports:
+      - "8086:8086"
+    environment:
+      - DOCKER_INFLUXDB_INIT_MODE=setup
+      - DOCKER_INFLUXDB_INIT_USERNAME=admin
+      - DOCKER_INFLUXDB_INIT_PASSWORD=pludos-local
+      - DOCKER_INFLUXDB_INIT_ORG=${INFLUXDB_ORG:-pludos}
+      - DOCKER_INFLUXDB_INIT_BUCKET=${INFLUXDB_BUCKET:-alumet_energy}
+      - DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=${INFLUXDB_TOKEN:-pludos-secret-token}
+      - DOCKER_INFLUXDB_INIT_RETENTION=168h   # 7 days
+    volumes:
+      - influxdb_local_data:/var/lib/influxdb2
+      - /etc/localtime:/etc/localtime:ro
+    restart: unless-stopped
+
+  # 5. Local Grafana — standalone profile only (T5.2)
+  # Read-only local dashboard connected to influxdb-local.
+  # Access at http://localhost:3000 (default admin/admin — rotate before production).
+  grafana-local:
+    image: docker.io/grafana/grafana:10.4.3
+    container_name: pludos-grafana-local
+    profiles:
+      - standalone
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana_local_data:/var/lib/grafana
+      - /etc/localtime:/etc/localtime:ro
+    depends_on:
+      - influxdb-local
+    restart: unless-stopped
+
 # ram_buffer is a bind-mount on ./ram_buffer so it works in rootless Podman
 # without tmpfs privileges and is directly inspectable on the host.
 # power_metrics volume removed — probe.py is gone, alumet-cli writes directly.
 volumes:
   # tailscale_data must persist across container restarts to keep Tailscale auth.
   tailscale_data:
+  # standalone-mode local storage — Jetson eMMC, 7-day retention enforced by InfluxDB.
+  influxdb_local_data:
+  grafana_local_data:

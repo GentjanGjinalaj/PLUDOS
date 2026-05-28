@@ -508,3 +508,61 @@ by `stm_mission.distance_m` (total per-mission distance).
 - `client/client.py` — `load_buffered_data()` backward-compat backfill;
   `feature_cols` updated.
 - `docs/distance_estimation.md` — algorithm, calibration, error envelope.
+
+---
+
+## ADR-018 — Three-mode deployment: federated / standalone / headless
+**Status:** Closed
+
+**Context:** The original design assumed a permanent server connection (Tailscale
+always up, central InfluxDB + Grafana always reachable). In practice the Jetson
+may need to operate without any server: during initial deployment before a Tailscale
+auth key is issued, during network partitions, or in a warehouse that never gets
+server infrastructure. The thesis also requires demonstrating the system with and
+without the federation layer to isolate energy costs.
+
+**Decision:** Introduce a `PLUDOS_MODE` environment variable controlling a three-
+way deployment profile switch with no image rebuild required:
+
+| Mode | `PLUDOS_MODE` | Compose profile | Federation | InfluxDB target |
+|------|--------------|-----------------|------------|-----------------|
+| Federated | `federated` (default) | `vpn` | Flower SuperLink | central server |
+| Standalone | `standalone` | `standalone` | none (local loop) | localhost:8086 |
+| Headless | `headless` | *(none)* | none | none |
+
+**Federated** — unchanged current design. Requires Tailscale.
+
+**Standalone** — `client.py __main__` detects `PLUDOS_MODE=standalone` and calls
+`_run_standalone_loop()` instead of registering with Flower. Retrains XGBoost
+every `STANDALONE_RETRAIN_INTERVAL_S` seconds (default 30 min) on buffered Parquet.
+Model persisted to `ram_buffer/model/latest.ubj` (same path Flower `evaluate()`
+writes in federated mode — seamless switchover). Local InfluxDB and Grafana
+launched as compose services `influxdb-local` / `grafana-local` (7-day retention,
+named volumes on Jetson eMMC). `data-engine.py` uses the same `INFLUXDB_URL`; ops
+just points it at `localhost:8086`.
+
+**Headless** — data-engine continues writing Parquet; `_write_mission_summary()`
+is gated on `PLUDOS_MODE != "headless"` to skip InfluxDB writes. ai-worker is not
+started. Parquet files accumulate on the bind-mount for later batch ingestion.
+
+**Inference layer refactored (T5.3):** anomaly labelling and data loading extracted
+to `client/anomaly.py` (no `flwr` import). `client.py` is a thin Flower wrapper
+around it. Standalone mode imports `anomaly.py` directly. Verify with:
+`python -c "import sys; sys.path.insert(0, 'client'); from anomaly import label_packets"`.
+
+**Trade-offs accepted:**
+- Standalone loses cross-shuttle federation — each Jetson learns only from its own
+  shuttles. Model divergence accumulates until the tailnet reconnects and federated
+  mode resumes (at which point the global model overwrites the local one).
+- Local InfluxDB uses named volumes on Jetson eMMC; 7-day retention caps growth
+  but eMMC writes accumulate. Monitor with `du -sh ~/.local/share/containers/...`.
+- Headless has no anomaly detection: if ops needs anomaly alerts during the
+  logging phase, standalone is the right choice even without a server.
+
+**Implementation files:**
+- `client/anomaly.py` — new; pure inference module (no Flower)
+- `client/client.py` — PLUDOS_MODE constant; `_run_standalone_loop()`; `__main__` branch
+- `client/data-engine.py` — PLUDOS_MODE read; `_write_mission_summary()` gated
+- `client/compose.yaml` — `standalone` profile; `influxdb-local`; `grafana-local`
+- `client/.env.example` — PLUDOS_MODE documentation
+- `docs/architecture.md` — Deployment Modes section

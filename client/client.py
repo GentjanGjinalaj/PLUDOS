@@ -1,25 +1,24 @@
 """
-PLUDOS AI Worker: Federated Learning Client
--------------------------------------------
+PLUDOS AI Worker: Federated Learning Client (T5.3 — Flower optional layer)
+---------------------------------------------------------------------------
 Runs on the Jetson Orin Nano. Responsibilities:
 1. Load all recent mission Parquet files from the RAM buffer (concatenated).
-2. Generate anomaly labels via the selected backend (ANOMALY_MODEL env var):
-     isolation_forest_xgb (default) — IsolationForest on MOVING packets → pseudo-labels
-     cnn_autoencoder                — 1D-CNN autoencoder on sliding windows of MOVING
-                                      packets; reconstruction MSE = anomaly score (T3.3)
-     threshold                       — legacy accel_z > ANOMALY_THRESHOLD_G rule
-3. Train an XGBoost classifier on those labels (federated via Flower).
+2. Generate anomaly labels via the selected backend (ANOMALY_MODEL env var) —
+   delegated to anomaly.py (no Flower dependency there).
+3. Train an XGBoost classifier on those labels (federated via Flower in
+   federated mode; local retrain loop in standalone mode).
 4. Profile energy consumption per FL phase via AlumetProfiler.
 5. Stream energy telemetry to InfluxDB (fl_energy, fl_phases measurements).
 6. Evaluate the server's global model on a local held-out test set.
 
+Deployment mode (PLUDOS_MODE env var):
+  federated  — default; Flower ClientApp registered with the SuperLink.
+  standalone — local retrain loop every STANDALONE_RETRAIN_INTERVAL_S seconds;
+               no Flower, writes model to LOCAL_MODEL_PATH.
+  headless   — data-engine only (data-engine.py handles this; ai-worker not started).
+
 n_estimators is set by the server each round via fit_config() based on the
 previous round's measured energy — this closes the energy-aware FL loop (ADR-014).
-
-Anomaly model switching:
-  ANOMALY_MODEL=isolation_forest_xgb — per-sample IsolationForest (default)
-  ANOMALY_MODEL=cnn_autoencoder — 1D-CNN reconstruction error (T3.3, client/anomaly_cnn.py)
-  ANOMALY_MODEL=threshold — legacy accel_z threshold rule
 """
 
 import flwr as fl
@@ -27,7 +26,6 @@ import xgboost as xgb
 import numpy as np
 import time
 import logging
-import json
 import os
 import pandas as pd
 import re
@@ -37,10 +35,12 @@ import threading
 import random
 import urllib.request
 from pathlib import Path
-from sklearn.ensemble import IsolationForest
 
 from influxdb_client import InfluxDBClient, Point, WritePrecision  # type: ignore
 from influxdb_client.client.write_api import SYNCHRONOUS           # type: ignore
+
+# Pure inference module — no Flower dependency (T5.3).
+from anomaly import load_buffered_data, _make_anomaly_labels
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -79,6 +79,15 @@ def _detect_xgb_device() -> str:
 DEVICE = _detect_xgb_device()
 logger.info("[CONFIG] XGBoost device: %s", DEVICE)
 
+# Deployment mode — controls whether Flower or the local retrain loop runs.
+#   federated  — default: register with SuperLink, Flower manages rounds.
+#   standalone — local retrain loop every STANDALONE_RETRAIN_INTERVAL_S; no Flower.
+#   headless   — data-engine only; ai-worker should not be started in this mode.
+PLUDOS_MODE = os.getenv("PLUDOS_MODE", "federated")
+
+# Retraining cadence in standalone mode (default 30 min).
+STANDALONE_RETRAIN_INTERVAL_S = int(os.getenv("STANDALONE_RETRAIN_INTERVAL_S", "1800"))
+
 # Alumet-relay Prometheus endpoint — scraped by AlumetProfiler for real INA3221 power.
 # pludos-alumet-relay publishes port 9095; pludos-data-engine uses network_mode: host
 # so localhost:9095 inside the container reaches the host's published port directly.
@@ -90,35 +99,9 @@ ALUMET_PROMETHEUS_URL = os.getenv("ALUMET_PROMETHEUS_URL", "http://localhost:909
 #   "auto"        — legacy: relay → alumet → tegrastats fallback, tagged in InfluxDB.
 ENERGY_SOURCE_REQUIRED = os.getenv("ENERGY_SOURCE_REQUIRED", "alumet")
 
-# Maximum Parquet files to concatenate per FL round. Ensures mid-mission buffer-
-# pressure flushes are included rather than training on just the latest tail file.
+# Maximum Parquet files per FL round — also used by the standalone retrain loop.
+# Defined here for use in _write_gw_status_heartbeat(); anomaly.py reads the same env var.
 MAX_PARQUET_FILES = int(os.getenv("MAX_PARQUET_FILES", "20"))
-
-# Anomaly model selector — controls pseudo-label generation for XGBoost training.
-#   "isolation_forest_xgb" (default) — IsolationForest on per-packet vibration features.
-#       Faster (~1 s per round), no torch dependency.
-#   "cnn_autoencoder" — 1D-CNN autoencoder on sliding windows of MOVING data (T3.3).
-#       Catches local frequency patterns (vibration/bearing signatures). Requires torch.
-#       Falls back to IsolationForest when MOVING data < CNN_MIN_MOVING_SAMPLES.
-#   "threshold" — legacy: accel_z > ANOMALY_THRESHOLD_G. Debug/comparison only.
-ANOMALY_MODEL = os.getenv("ANOMALY_MODEL", "isolation_forest_xgb")
-
-# Isolation Forest: fraction of MOVING packets expected to be anomalous.
-# 0.05 = conservative prior (5% of warehouse shuttle samples are shock/wear events).
-# Tune upward if the shuttle is known to be in poor condition.
-IF_CONTAMINATION = float(os.getenv("IF_CONTAMINATION", "0.05"))
-
-# Minimum MOVING packets required to trust the Isolation Forest fit.
-# Below this, fall back to the threshold label to avoid fitting noise.
-IF_MIN_MOVING_SAMPLES = int(os.getenv("IF_MIN_MOVING_SAMPLES", "50"))
-
-# Legacy threshold label fallback (used when ANOMALY_MODEL=threshold or IF data too sparse).
-# Default 2.0g: gravity alone reads ~1.0g, so 2.0g catches genuine shocks only.
-ANOMALY_THRESHOLD_G = float(os.getenv("ANOMALY_THRESHOLD_G", "2.0"))
-
-# Persisted state for CNN T3.1 (cnn_feature_stats.npz) and T3.2 (cnn_anomaly_thresholds.json).
-# Must survive container restarts — use a bind-mount or named volume in compose.yaml.
-STATE_DIR = Path(os.getenv("STATE_DIR", "./state" if TEST_MODE else "/app/state"))
 
 # Where to persist the received global model for standalone (no-server) inference.
 # Lives inside BUFFER_DIR so it survives on the host bind-mount across container
@@ -435,161 +418,7 @@ class AlumetProfiler:
 # ==========================================
 # 3. FEDERATED LEARNING LOGIC
 # ==========================================
-
-def load_buffered_data() -> tuple[np.ndarray, np.ndarray]:
-    """
-    Load and concatenate recent mission Parquet files from the RAM buffer.
-
-    Loads up to MAX_PARQUET_FILES most recent files to ensure data from
-    mid-mission buffer-pressure flushes is included — not just the latest
-    tail file, which may be a partial mission.
-    """
-    logger.info("Scanning RAM buffer for telemetry Parquet files...")
-
-    if not os.path.exists(BUFFER_DIR):
-        raise FileNotFoundError(f"CRITICAL: Buffer directory {BUFFER_DIR} not found.")
-
-    # Sort by modification time so daily (YYYY-MM-DD.parquet) and intra-day mission
-    # files are ordered chronologically regardless of their different name formats.
-    files = sorted(
-        [f for f in os.listdir(BUFFER_DIR) if f.endswith(".parquet")],
-        key=lambda f: os.path.getmtime(os.path.join(BUFFER_DIR, f)),
-    )
-    if not files:
-        raise FileNotFoundError(
-            "CRITICAL: No Parquet files found in buffer. "
-            "Ensure at least one shuttle mission has completed before triggering an FL round."
-        )
-
-    # Take only the most recent N files to bound memory usage.
-    recent = files[-MAX_PARQUET_FILES:]
-    frames = [pd.read_parquet(os.path.join(BUFFER_DIR, f)) for f in recent]
-    df = pd.concat(frames, ignore_index=True)
-    logger.info(
-        "Loaded %d samples from %d Parquet file(s): %s … %s",
-        len(df), len(recent), recent[0], recent[-1],
-    )
-
-    # Backward-compatible backfill for columns added in schema upgrades.
-    # Old Parquet files missing a column get a neutral value so training doesn't crash.
-    _backfill_f16 = {
-        "gyro_x": 0, "gyro_y": 0, "gyro_z": 0, "gyro_mag": 0,
-        "accel_jerk": 0,
-        "horizontal_accel": 0,   # √(ax²+ay²); 0 = no horizontal motion assumed
-        "tilt_angle_deg":   0,   # 0° = flat; safe neutral for old files
-        "gyro_jerk":        0,
-        "rolling_accel_mean_10": 0,
-        "rolling_accel_std_10":  0,
-    }
-    for col, val in _backfill_f16.items():
-        if col not in df.columns:
-            df[col] = np.float16(val)
-    if "accel_mag" not in df.columns:
-        df["accel_mag"] = (df["accel_x"]**2 + df["accel_y"]**2 + df["accel_z"]**2).pow(0.5)
-    if "seq_gap" not in df.columns:
-        df["seq_gap"] = np.int16(0)
-    if "energy_j" not in df.columns:
-        df["energy_j"] = np.float32(0)
-    if "mission_elapsed_s" not in df.columns:
-        df["mission_elapsed_s"] = np.float32(0)
-    for col in ("moving_run_id", "pause_count", "is_long_pause"):
-        if col not in df.columns:
-            df[col] = np.int8(0)
-    for col in ("pause_duration_s", "moving_run_dur_s"):
-        if col not in df.columns:
-            df[col] = np.float32(0)
-
-    # Backward-compat: distance_m_cum added in data-engine v3.2 (replaces ZUPT columns).
-    if "distance_m_cum" not in df.columns:
-        df["distance_m_cum"] = np.float32(0)
-
-    # Column names match data-engine.py _PARQUET_COLS — must stay in sync.
-    feature_cols = [
-        "accel_x", "accel_y", "accel_z", "accel_mag",
-        "accel_jerk", "horizontal_accel", "tilt_angle_deg",
-        "gyro_x", "gyro_y", "gyro_z", "gyro_mag", "gyro_jerk",
-        "rolling_accel_mean_10", "rolling_accel_std_10",
-        "seq_gap",
-        "energy_j",
-        "mission_elapsed_s",
-        "distance_m_cum",
-        "moving_run_id", "pause_duration_s", "moving_run_dur_s",
-        "pause_count", "is_long_pause",
-        "state",
-    ]
-    # Drop rows where any feature is NaN (sensor failure packets).
-    df_clean = df[feature_cols].dropna()
-    X_train  = df_clean.values
-
-    # T3.4: decide labeller once for this round; log it explicitly.
-    y_train, labeller = _make_anomaly_labels(df_clean)
-    logger.info("[ANOMALY] labeller=%s for this round (T3.4)", labeller)
-    return X_train, y_train, labeller
-
-
-# Features used by Isolation Forest — vibration and shock channels only.
-# IDLE packets are excluded from the IF fit (no bearing load at rest).
-_IF_FEATURES = [
-    "accel_mag",            # total shock magnitude
-    "rolling_accel_std_10", # sustained vibration (bearing wear signature)
-    "gyro_x",               # torsional vibration (motor/bearing)
-    "gyro_mag",             # overall rotation magnitude
-    "accel_z",              # vertical channel — floor surface + bearing noise
-]
-
-
-def _make_anomaly_labels(df_clean: pd.DataFrame) -> tuple[np.ndarray, str]:
-    """
-    Dispatch to the active anomaly labelling backend (ANOMALY_MODEL env var).
-
-    cnn_autoencoder      — 1D-CNN reconstruction error (T3.3); falls back to IF
-    isolation_forest_xgb — per-sample IsolationForest (default)
-    threshold            — legacy accel_z > ANOMALY_THRESHOLD_G rule
-
-    Returns (labels, labeller_name) — T3.4: labeller is decided once per round.
-    """
-    if ANOMALY_MODEL == "cnn_autoencoder":
-        from anomaly_cnn import make_anomaly_labels_cnn
-        return make_anomaly_labels_cnn(
-            df_clean, STATE_DIR, _make_anomaly_labels_if, IF_CONTAMINATION
-        )
-    if ANOMALY_MODEL == "threshold":
-        return (df_clean["accel_z"] > ANOMALY_THRESHOLD_G).astype(int).values, "threshold"
-    # Default: isolation_forest_xgb
-    return _make_anomaly_labels_if(df_clean)
-
-
-def _make_anomaly_labels_if(df_clean: pd.DataFrame) -> tuple[np.ndarray, str]:
-    """IsolationForest path; also serves as fallback from CNN."""
-    y = np.zeros(len(df_clean), dtype=int)
-    moving_mask = df_clean["state"].astype(int) == 1
-    n_moving = moving_mask.sum()
-
-    if n_moving < IF_MIN_MOVING_SAMPLES:
-        logger.warning(
-            "[ANOMALY] only %d MOVING samples (need %d) — falling back to threshold label",
-            n_moving, IF_MIN_MOVING_SAMPLES,
-        )
-        return (df_clean["accel_z"] > ANOMALY_THRESHOLD_G).astype(int).values, "threshold"
-
-    available = [c for c in _IF_FEATURES if c in df_clean.columns]
-    X_moving = df_clean.loc[moving_mask, available].values
-
-    iso = IsolationForest(
-        contamination=IF_CONTAMINATION,
-        n_estimators=100,
-        random_state=42,
-        n_jobs=-1,
-    )
-    moving_labels = (iso.fit_predict(X_moving) == -1).astype(int)
-    y[moving_mask.values] = moving_labels
-
-    n_anomalous = moving_labels.sum()
-    logger.info(
-        "[ANOMALY] IsolationForest: %d/%d MOVING packets flagged anomalous (%.1f%%)",
-        n_anomalous, n_moving, 100.0 * n_anomalous / n_moving,
-    )
-    return y, "isolation_forest_xgb"
+# load_buffered_data / _make_anomaly_labels* / label_packets imported from anomaly.py
 
 
 def _write_gw_status_heartbeat(last_round: int | None = None) -> None:
@@ -829,3 +658,46 @@ def client_fn(context: fl.common.Context):
 
 
 app = fl.client.ClientApp(client_fn=client_fn)
+
+
+# ==========================================
+# 4. STANDALONE MODE (T5.4)
+# ==========================================
+
+def _run_standalone_loop() -> None:
+    # Local retrain loop for standalone mode: no Flower, no server required.
+    # Retrains XGBoost every STANDALONE_RETRAIN_INTERVAL_S seconds on the
+    # most recent buffer data and persists the model to LOCAL_MODEL_PATH.
+    logger.info(
+        "[STANDALONE] mode=standalone interval=%ds model=%s",
+        STANDALONE_RETRAIN_INTERVAL_S, LOCAL_MODEL_PATH,
+    )
+    while True:
+        try:
+            X, y, labeller = load_buffered_data()
+            model = xgb.XGBClassifier(
+                n_estimators=N_ESTIMATORS_DEFAULT,
+                tree_method="hist",
+                device=DEVICE,
+            )
+            model.fit(X, y)
+            LOCAL_MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+            model.get_booster().save_model(str(LOCAL_MODEL_PATH))
+            logger.info(
+                "[STANDALONE] retrained labeller=%s samples=%d saved=%s",
+                labeller, len(X), LOCAL_MODEL_PATH,
+            )
+        except FileNotFoundError as exc:
+            logger.warning("[STANDALONE] no data yet: %s — retrying in %ds",
+                           exc, STANDALONE_RETRAIN_INTERVAL_S)
+        except Exception as exc:
+            logger.error("[STANDALONE] retrain failed: %s", exc)
+        time.sleep(STANDALONE_RETRAIN_INTERVAL_S)
+
+
+if __name__ == "__main__":
+    if PLUDOS_MODE == "standalone":
+        _run_standalone_loop()
+    else:
+        # federated: Flower manages execution via the ClientApp registered above.
+        logger.info("[CLIENT] PLUDOS_MODE=%s — waiting for Flower SuperNode", PLUDOS_MODE)

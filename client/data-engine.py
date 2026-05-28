@@ -53,6 +53,12 @@ logger = logging.getLogger("data-engine")
 # Configuration — all values come from environment variables with safe defaults
 # ---------------------------------------------------------------------------
 
+# Deployment mode — mirrors client.py; headless skips InfluxDB mission writes.
+#   standalone — Jetson-local InfluxDB; InfluxDB writes go to localhost.
+#   headless   — collect only; Parquet is written but InfluxDB writes are skipped.
+#   federated  — default; InfluxDB on the central server via Tailscale.
+PLUDOS_MODE     = os.getenv("PLUDOS_MODE", "federated")
+
 TEST_MODE       = os.getenv("TEST_MODE") == "1"
 TELEMETRY_PORT  = int(os.getenv("TELEMETRY_PORT", os.getenv("COAP_PORT", "5683")))
 
@@ -602,7 +608,9 @@ def _maybe_flush_mission(shuttle_id: str, now: float) -> None:
 
     # Pop the buffer before reset so _reset_shuttle_state's pop is a no-op.
     total_dist = _flush(_telemetry_buf.pop(shuttle_id, []), "mission")
-    _write_mission_summary(shuttle_id, energy, pkts, duration_ms, total_dist)
+    # headless mode: skip InfluxDB write; Parquet is still written above.
+    if PLUDOS_MODE != "headless":
+        _write_mission_summary(shuttle_id, energy, pkts, duration_ms, total_dist)
     _reset_shuttle_state(shuttle_id)
 
 
@@ -1023,10 +1031,10 @@ async def main() -> None:
         ram_info = "RAM info unavailable (psutil not installed)"
 
     logger.info(
-        "PLUDOS Data Engine (ADR-016 v3 + gyro) starting | TEST_MODE=%s | UDP=%d | "
+        "PLUDOS Data Engine (ADR-016 v3 + gyro) starting | mode=%s | TEST_MODE=%s | UDP=%d | "
         "pkt=%dB | limit_mode=%s | shuttle soft=%d (~%.0fMB) hard=%d | gateway hard=%d | "
         "mission_end_idle=%.0fs | group=%s | dir=%s | %s",
-        TEST_MODE, TELEMETRY_PORT, TELEMETRY_SIZE,
+        PLUDOS_MODE, TEST_MODE, TELEMETRY_PORT, TELEMETRY_SIZE,
         _LIMIT_MODE,
         SHUTTLE_SOFT_LIMIT, SHUTTLE_SOFT_LIMIT * _PACKET_BYTES_EST / 1e6,
         SHUTTLE_HARD_LIMIT, GATEWAY_HARD_LIMIT,

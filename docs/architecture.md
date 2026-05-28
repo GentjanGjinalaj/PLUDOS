@@ -203,6 +203,38 @@ See ADR-011 in `decisions.md` for full decision history.
 
 ---
 
+## Deployment Modes (T5.1 — ADR-018)
+
+Set `PLUDOS_MODE` in `client/.env` to select the active profile:
+
+| Mode | Compose profile | What runs | What's lost |
+|------|-----------------|-----------|-------------|
+| `federated` | `--profile vpn` | data-engine, ai-worker (Flower), alumet-relay, tailscale | — |
+| `standalone` | `--profile standalone` | data-engine, ai-worker (local loop), alumet-relay, influxdb-local, grafana-local | cross-shuttle federation, central dashboard |
+| `headless` | *(no profile)* | data-engine, alumet-relay | AI inference, InfluxDB, Flower |
+
+**federated** (default) — the current design: gateway registers with the central
+SuperLink, participates in XGBoost FL rounds, energy data flows to server InfluxDB.
+Requires Tailscale (`TS_AUTHKEY`).
+
+**standalone** — gateway runs without any server reachable. `client.py`
+`_run_standalone_loop()` retrains XGBoost every `STANDALONE_RETRAIN_INTERVAL_S`
+(default 30 min) on buffered Parquet files and persists the model to
+`ram_buffer/model/latest.ubj`. A local InfluxDB (7-day retention) and Grafana
+are started on the Jetson. All `INFLUXDB_URL` writes go to `localhost:8086`.
+Cross-shuttle federation and the central dashboard are unavailable until the
+Jetson rejoins the tailnet and switches back to `federated` mode.
+
+**headless** — data-engine only. Parquet files accumulate on the host bind-mount
+(`./ram_buffer`); InfluxDB writes are skipped. No AI, no Flower, no server
+dependency. Use for pure datalogging before the ML pipeline is ready, or when
+power or network budgets prohibit inference.
+
+Switching modes requires only editing `PLUDOS_MODE` in `.env` and restarting with
+the corresponding `--profile` flag. No image rebuild.
+
+---
+
 ## What is genuinely novel vs engineering
 
 For thesis-writing purposes, distinguish carefully:
