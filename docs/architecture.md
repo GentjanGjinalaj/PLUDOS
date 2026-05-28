@@ -11,7 +11,7 @@ diverge from the code, the code wins and the divergence is flagged.
 
 **Hardware:** STMicroelectronics B-U585I-IOT02A (STM32U585AII6Q, Cortex-M33 @
 160 MHz, 786 KB SRAM (768 KB main + 16 KB SRAM4 backup domain), 2 MB Flash).
-Sensors in use: ISM330DLC accelerometer (I2C2), HTS221 temperature/humidity
+Sensors in use: ISM330DHCX accelerometer (I2C2), HTS221 temperature/humidity
 (I2C2), LPS22HH pressure (I2C2, read for local UART debug only — not on
 the wire), MXCHIP EMW3080 WiFi (SPI2). The STM32 no longer computes or
 transmits `power_mw` — the gateway derives it from the `state` field using
@@ -150,7 +150,7 @@ See ADR-011 in `decisions.md` for full decision history.
 
 **Federated learning round (server.py):**
 
-- 3 rounds, `min_fit_clients = 1`, `min_available_clients = 1`.
+- 10 rounds (env-overridable via `FL_NUM_ROUNDS`), `min_fit_clients = 1`, `min_available_clients = 1`.
 - `on_fit_config_fn` passes `server_round` to the client so the
   AlumetProfiler can tag energy samples by round.
 - Custom `XGBoostStrategy(FedAvg)` overrides `aggregate_fit` with horizontal
@@ -200,6 +200,48 @@ See ADR-011 in `decisions.md` for full decision history.
 | Clock drift between STM32 and gateway | NTP offset refreshed every 100 pkts | Drift delta logged; sort key is sequence_monotonic not timestamp | implemented (ADR-009) |
 | WiFi credentials in repo | gitignored header | `wifi_credentials.h` not committed | resolved |
 | STM bonds to wrong Jetson on multi-Jetson WiFi | Beacon shuttle-list mismatch | STM ignores beacons whose csv-id list omits its `SHUTTLE_ID`; gateway also drops out-of-group ingress | implemented |
+
+---
+
+## Shuttle physical model (Savoye XTPS)
+
+Understanding the physical operation is required to interpret telemetry and
+design correct ML features.
+
+**Rail geometry:** Each shuttle runs on a single 1D horizontal rail on one
+minifloor. The shuttle body translates strictly forward/backward along this
+axis — no lateral or vertical translation. Rail length is typically 10–20 m
+(exact from Savoye; set `RAIL_LENGTH_M_MAX` in the distance estimator env).
+
+**Elevator hand-off:** When a box moves between floors, the shuttle delivers
+it to a fixed elevator position at one end of the rail. The elevator (conveyor
+belt mechanism, not a cab) carries the box vertically; the shuttle itself stays
+on its floor. Each floor has its own shuttle.
+
+**Shelf slots and arm extension:** Shelf positions run perpendicular to the
+rail. Each storage position is 2-deep: a front slot (directly accessible) and
+a back slot (behind the front slot). The shuttle's telescopic arms
+extend/retract perpendicular to the rail to pick and place boxes. A
+repositioning mission (accessing a back slot) involves 3–4 MOVING legs with
+intermediate IDLE pauses: reach front → push box aside → reach back → retract.
+Each arm cycle is one pick/place event, counted via `pick_events` in the
+mission summary.
+
+**Key implications for telemetry and ML:**
+
+- **IDLE = physically stopped.** The ZUPT reset (`vel = 0` at every IDLE
+  packet) is an exact physical constraint. Integration error is bounded to
+  the duration of each MOVING segment.
+- **Arm motion is perpendicular to the rail axis.** The track-axis variance
+  detector (`var(accel_x)` vs `var(accel_y)` on MOVING packets) automatically
+  discards arm vibration — it appears on the low-variance axis and is rejected.
+- **Short MOVING segments (≤2 s)** occur during repositioning. With
+  `DISTANCE_HPF_WINDOW=10` (≈1 s burn-in), these see 25–35% distance
+  underestimation. Acceptable for wear correlation at mission scale.
+- **Mission boundary risk.** The 30 s IDLE timeout (`MISSION_END_IDLE_S`)
+  may split a repositioning cycle if an intermediate shelf pause exceeds 30 s.
+  Elevator-cycle granularity is future work (T-C1,
+  `docs/distance_estimation.md §Future Work`).
 
 ---
 

@@ -195,56 +195,12 @@ at profiler init. Writes to InfluxDB measurement `fl_energy` with tags
 `fl_energy` measurement with `device=server`. Grafana queries need no changes —
 all devices share one measurement.
 
-**Phase 2 — Jetson Alumet relay sidecar (scaffolding done, relay flags pending):**
-`client/alumet-relay/` directory added with three files:
-- `Containerfile` — two-stage Rust+Python build for Jetson (ARM64 auto-selected)
-- `probe.py` — reads INA3221 sysfs at 10 Hz, writes `/app/power_metrics/latest.json`
-  to a shared tmpfs volume so `AlumetProfiler` gets hardware sensor data without
-  subprocess calls. Works immediately without confirmed Alumet relay flags.
-- `entrypoint.sh` — starts probe.py (always) + alumet-cli relay (when
-  `ALUMET_SERVER_ADDR` is set; flags unconfirmed — see TODO in file).
-
-`client/compose.yaml` updated:
-- `alumet-relay` service added (no vpn profile — probe mode works without Tailscale).
-- `power_metrics` tmpfs volume shared between alumet-relay and ai-worker.
-- `ai-worker` now has configurable hostname (`JETSON_HOSTNAME`) so the InfluxDB
-  `device` tag is human-readable rather than a container ID hash.
-
-`client/client.py` updated:
-- `_read_relay_metrics()` reads `latest.json` from the shared volume; returns `None`
-  if file unavailable so caller falls back gracefully.
-- `_poll_metrics()` uses `_read_relay_metrics() or _read_tegrastats()` — INA3221
-  when relay is running, tegrastats otherwise. InfluxDB writes with `fl_round` tag
-  remain in client.py (relay probe only writes the raw file, not InfluxDB).
-- `ALUMET_RELAY_METRICS_FILE` env var controls the relay file path.
-
-`server/compose.yaml` updated: relay port 50051 now exposed (was commented).
-
-**Relay flags confirmed from Alumet docs (no longer guessed):**
-- Client: `alumet-cli --plugin jetson --relay-out <server:port>`
-- Server: `alumet-cli --plugin rapl --relay-in 0.0.0.0:<port>`
-
-**probe.py:** removed (T4.4). Alumet's native Jetson plugin reads INA3221 directly;
-the file-based sidecar (`probe.py`) and its shared volume are no longer needed.
-`_read_relay_metrics()` and `ALUMET_RELAY_METRICS_FILE` removed from `client.py`.
-
 **New InfluxDB measurements added this session:**
 - `fl_phases` — per-phase energy summary from `client/client.py` AlumetProfiler.
   Tags: `device`, `fl_round`, `phase` (load/train/round_total), `nvpmodel`.
   Fields: `duration_ms`, `energy_j`, `avg_power_w`.
 - `stm_mission` — per-shuttle mission summary from `client/data-engine.py`.
   Tags: `shuttle_id`, `gateway`. Fields: `energy_j`, `packets`, `duration_ms`.
-
-**Remaining for full Phase 2 activation (requires physical Jetson):**
-1. Build relay image: `cd client && podman build -f alumet-relay/Containerfile alumet-relay/`
-2. Verify Jetson plugin flag name: `podman exec pludos-alumet-relay alumet-cli --help`
-   (may be `--plugin nvidia-jetson` instead of `--plugin jetson`).
-3. Verify InfluxDB output flags: `--output influxdb --influxdb-url ...` (used in both
-   entrypoint.sh local mode and server/alumet/Containerfile — needs hardware confirmation).
-4. Verify INA3221 sysfs path: `ls /sys/bus/i2c/drivers/ina3221/*/iio:device*/in_power*_label`
-5. Set `ALUMET_SERVER_ADDR=<server-tailscale-ip>:50051` in `client/.env` to activate relay.
-6. Confirm Prometheus exporter port 9091 with `alumet-cli --help` (server Containerfile adds
-   `--output prometheus`; verify this flag name on the installed version).
 
 See the `pludos-alumet` skill for Grafana query examples and phase breakdown guidance.
 
@@ -355,9 +311,8 @@ from the `config` dict in `fit()` instead of using a hardcoded value.
 thrashing around the budget boundary. Querying the **max** across gateways means
 the most energy-constrained device drives the adaptation — conservative but fair.
 
-**Calibration required:** `FL_ENERGY_BUDGET_J` defaults to `50.0 J`, which is a
-placeholder. Measure actual `energy_j` values from `fl_phases` after the first
-few hardware runs, then set the budget at 80–90% of the comfortable baseline.
+**Calibration required:** `FL_ENERGY_BUDGET_J` defaults to `200.0 J`, calibrated from initial hardware
+runs. Adjust at 80–90% of the measured comfortable baseline for your hardware.
 See `server/.env.example` for the step-by-step calibration query.
 
 **Pipeline verified (TEST_MODE, 2026-05-06):** End-to-end simulation confirmed
@@ -399,12 +354,12 @@ production-blocking bugs:
    the device would drip-flush for tens of seconds and could not detect a
    new movement during the drain.
 
-**Decision:** A single 28-byte `PludosTelemetry_t` packet is streamed over
+**Decision:** A single 24-byte `PludosTelemetry_t` packet is streamed over
 **raw UDP** to `udp://<JETSON_IP>:5683`. Both states transmit the same
 struct — only the rate differs:
 
-- `STATE_IDLE` — **1 Hz** transmit (10 Hz internal sampling for FSM responsiveness)
-- `STATE_MOVING` — **50 Hz** transmit (every sample is sent)
+- `STATE_IDLE` — **0.1 Hz** transmit (10 Hz internal sampling for FSM responsiveness)
+- `STATE_MOVING` — **10 Hz** transmit (every sample is sent)
 
 The packet carries: shuttle_id (uint8), sequence_id (uint16), tick_ms
 (uint32), state (uint8, 0/1), accel xyz, temp_c, humidity_pct. The v2
@@ -429,8 +384,8 @@ sparse drops.
 - **Single packet format = one code path.** Removes ~600 lines of CoAP
   build/parse/retry plus the entire ring-buffer state machine. The diff
   net-removes more than it adds.
-- **Bandwidth is fine.** 28 bytes × 50 Hz = 1.4 KB/s per shuttle. 100
-  shuttles = 140 KB/s, well under any 2.4 GHz link budget.
+- **Bandwidth is fine.** 24 bytes × 10 Hz = 240 B/s per shuttle. 100
+  shuttles = 24 KB/s, well under any 2.4 GHz link budget.
 - **Environmental data visible always.** Temp and humidity arrive at the
   gateway every 20 ms during MOVING (cached from a 2 Hz sensor read so
   the I²C bus is not saturated). Diagnostic value during incidents is
@@ -462,6 +417,43 @@ sparse drops.
   replaces `CriticalResource` (aiocoap) and `NonCriticalProtocol` (5684).
 - `docs/wire_protocol.md` §1 rewritten; §2 marked deprecated.
 - `docs/state_machine.md` — sample rates, debounce, no buffer table.
+
+---
+
+## ADR-016 — Wire protocol v3: ISM330 gyroscope + int16 encoding
+**Status:** Closed
+
+**Context:** Wire protocol v2 (ADR-015) used float32 fields — straightforward
+but 4 bytes per sensor field. Gyroscope data is needed for two reasons: (1)
+`gyro_z` yaw rate distinguishes rail translation from arm-extension events;
+(2) `gyro_x/y` torsional vibration reveals motor and bearing faults invisible
+to the accelerometer alone. Adding three float32 gyro fields would push the
+packet to 40 bytes — a 43% size increase.
+
+**Decision:** Upgrade to v3. Three changes in one struct revision:
+
+1. **int16 scaled integers** replace float32 for all sensor fields:
+   accel × 100 (g), gyro × 100 (dps), temp × 100 (°C), humidity × 10 (%RH).
+   Resolution: 0.01 g accel, 0.01 dps gyro — both exceed the ISM330DHCX
+   noise floor at 26 Hz ODR (noise density ~120 μg/√Hz).
+2. **Gyroscope fields added:** `gyro_x`, `gyro_y`, `gyro_z` (ISM330DHCX,
+   ±250 dps FS, 8.75 mdps/LSB per DS13281 Table 3). Three fields × 2 bytes = +6 B.
+3. **Packet shrinks 28 → 24 bytes:** float32 → int16 saves 2 bytes per field
+   across 6 accel/env fields (−12 B); the 3 new gyro int16s add +6 B. Net: −4 B
+   despite more data.
+
+**Sentinel:** `0x7FFF` (32767) in any `int16_t` field = sensor unavailable;
+gateway converts to NaN.
+
+**Rationale:** More information at smaller packet size. At 10 Hz MOVING:
+24 B × 10 Hz = 240 B/s per shuttle (vs 28 B × 50 Hz = 1.4 KB/s in v1).
+
+**Implementation files:**
+- `STM_Shuttles/PLUDOS_Edge_Node/Core/Src/main.c` — `PludosTelemetry_t`
+  struct updated to v3; int16 encoding and sentinel substitution added.
+- `client/data-engine.py` — unpack format updated to `'<BHIBhhhhhhhh'`;
+  sentinel → NaN conversion; gyro columns added to Parquet schema.
+- `docs/wire_protocol.md` — §1 rewritten for v3 layout.
 
 ---
 

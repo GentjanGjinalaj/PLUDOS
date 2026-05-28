@@ -43,11 +43,11 @@ No calibration required; the choice updates every flush buffer.
 HPF[i] = track_a[i] - mean(track_a[i-W+1 : i+1])
 ```
 
-Window `W = DISTANCE_HPF_WINDOW` (default 20 packets ≈ 2 s at 10 Hz MOVING).
+Window `W = DISTANCE_HPF_WINDOW` (default 10 packets ≈ 1 s at 10 Hz MOVING).
 Removes the DC offset caused by imperfect sensor mounting angle. Without this,
 a 1° tilt at ±2 g full-scale ≈ 0.034 g DC → 0.33 m/s² → unbounded velocity growth.
 
-Approximate cutoff: `f_c ≈ 0.44 / (W × dt) = 0.44 / (20 × 0.1 s) ≈ 0.22 Hz`.
+Approximate cutoff: `f_c ≈ 0.44 / (W × dt) = 0.44 / (10 × 0.1 s) ≈ 0.44 Hz`.
 This is well below typical shuttle acceleration events (0.5–2 Hz).
 
 ### Step 3 — Signed ZUPT integration
@@ -76,7 +76,9 @@ at the next IDLE packet.
 
 | Variable              | Default | Meaning |
 |-----------------------|---------|---------|
-| `DISTANCE_HPF_WINDOW` | `20`    | Running mean window (packets) for the high-pass filter. |
+| `DISTANCE_HPF_WINDOW` | `10`    | Running mean window (packets) for the high-pass filter. |
+| `DISTANCE_MOVING_EPS` | `0.01`  | Minimum HPF accel (g) to integrate during FSM debounce window. |
+| `RAIL_LENGTH_M_MAX`   | `20.0`  | Per-segment distance upper bound (m); clamps HPF burn-in and sensor drift. Update with exact rail length from Savoye. |
 
 No calibration constants needed for distance: only `g = 9.81 m/s²` which is fixed.
 Track axis is selected automatically per flush.
@@ -87,13 +89,14 @@ Track axis is selected automatically per flush.
 |--------|------|-------|
 | `distance_m_cum` | float32 Parquet | Cumulative path length since mission start, per packet |
 | `distance_m` | float InfluxDB `stm_mission` | Total per-mission path length (last value of `distance_m_cum`) |
+| `pick_events` | int InfluxDB `stm_mission` | Count of in-mission IDLE pauses = pick/place events; derived from `pause_count` in the flush buffer |
 
 ## Expected accuracy
 
 | Scenario | Expected error |
 |----------|---------------|
-| Clean rail, consistent speed | ±20% (HPF window lag at acceleration start) |
-| Short burst (<2 s MOVING) | ±40% (HPF burn-in period covers half the run) |
+| Clean rail, consistent speed | ±15–20% (HPF window lag at acceleration start) |
+| Short burst (<2 s MOVING) | ±25–35% (HPF burn-in ≈1 s covers ~½ short runs; improved from W=20) |
 | Long run (>10 s MOVING) | ±10–15% (HPF stable, integration dominated by noise floor) |
 | Arm deployment only, no translation | < 0.05 m artifact (arm axis is discarded) |
 
@@ -104,7 +107,7 @@ with correct order-of-magnitude values over a full shift. It is not metrological
 
 - **HPF introduces lag at motion onset.** The first `DISTANCE_HPF_WINDOW` packets
   of each MOVING segment use only past IDLE data for the mean, so the DC removal
-  converges over ≈2 s. Short runs (<2 s) underestimate distance.
+  converges over ≈1 s (W=10 at 10 Hz). Short runs (<1 s) underestimate distance.
 - **Velocity noise floor during cruise.** With zero mean (shuttle at cruise speed,
   constant acceleration ≈ 0), HPF output is near-zero noise. `|vel| × dt` still
   integrates the noise floor. Reduce `DISTANCE_HPF_WINDOW` if this dominates.
@@ -112,3 +115,25 @@ with correct order-of-magnitude values over a full shift. It is not metrological
   axes have equal variance and the algorithm picks `accel_x` as fallback. Verify
   axis selection from logs: `[DISTANCE] track_axis=accel_x` (logged at INFO).
 - **No absolute reference.** Validate the first production run with a tape measure.
+
+## Future Work
+
+### Sub-mission / elevator-cycle boundary (T-C1)
+
+Current mission definition: one mission = one 30-second IDLE-timeout boundary
+(`MISSION_END_IDLE_S`). On the Savoye XTPS, a full elevator cycle includes
+3–4 MOVING legs with intermediate shelf pauses. If any pause exceeds 30 s
+(rare, but possible on congested floors), the mission splits mid-cycle.
+
+**Proposed refinement:** add a "cycle" boundary on each return-to-elevator,
+detected by one of:
+- `distance_m_cum` returning near zero (shuttle back at the elevator bay), or
+- the longest MOVING run reversing direction (forward → long reverse).
+
+Cycle-level wear features would be: cycles per shift, distance per cycle,
+dwell time at picks — stronger wear proxies than per-mission totals because
+they normalise for the number of shelves served per trip.
+
+**Deferred:** requires physical validation on the test rig to tune the
+detection threshold. When implemented, expose the elevator-bay distance as a
+`ELEVATOR_DIST_M` env var.

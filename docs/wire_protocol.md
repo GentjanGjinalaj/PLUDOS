@@ -76,7 +76,7 @@ val / 10.0   # humidity (%RH)
 - `state` — `0` (IDLE) or `1` (MOVING). Triggers mission-end Parquet flush
   after 30 s of IDLE following any MOVING run.
 - `accel_x/y/z` — ISM330DHCX accelerometer, ±2 g FS. AC content captures
-  vibration (bearing wear, motor noise) up to 25 Hz Nyquist at 50 Hz ODR.
+  vibration (bearing wear, motor noise) up to 13 Hz Nyquist at 26 Hz ODR.
   FSM uses magnitude deviation > 0.05 g² for movement detection.
 - `gyro_x/y/z` — ISM330DHCX gyroscope, ±250 dps FS, 8.75 mdps/LSB
   (DS13281 Table 3). `gyro_z` = yaw rate (turns/curves); `gyro_x/y` =

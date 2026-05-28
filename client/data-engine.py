@@ -136,10 +136,13 @@ RETRY_PAUSE_THRESHOLD_S = float(os.getenv("RETRY_PAUSE_THRESHOLD_S", "8.0"))
 # 1D-ZUPT distance for Savoye XTPS: one shuttle per rail, forward/backward only.
 # The HPF running mean removes mounting-tilt DC offset before integration.
 # At 10 Hz MOVING: 20 packets ≈ 2 s window → ~0.22 Hz high-pass.
-DISTANCE_HPF_WINDOW = int(os.getenv("DISTANCE_HPF_WINDOW", "20"))
+DISTANCE_HPF_WINDOW = int(os.getenv("DISTANCE_HPF_WINDOW", "10"))
 # Minimum HPF accel magnitude (g) to count as motion regardless of state flag.
 # Lets integration continue during the ~800 ms FSM debounce window at motion onset (T-B2).
 DISTANCE_MOVING_EPS = float(os.getenv("DISTANCE_MOVING_EPS", "0.01"))
+# Physical upper bound on distance per MOVING segment — catches HPF burn-in errors and sensor drift.
+# Update once Savoye confirms the exact minifloor rail length; 20 m is a conservative maximum.
+RAIL_LENGTH_M_MAX = float(os.getenv("RAIL_LENGTH_M_MAX", "20.0"))
 
 # Per-second status log: roll up "tx rate" and last-seen sensor values rather
 # than logging every packet (50 Hz × 100 shuttles would drown the terminal).
@@ -322,6 +325,9 @@ _tx_rate_window: dict[str, int] = {}
 # Cleared on mission-end by _reset_shuttle_state; never cleared on pressure flush.
 _dist_carry: dict[str, float] = {}
 
+# Pick-event carry-over across mid-mission pressure flushes — same pattern as _dist_carry.
+_pick_carry: dict[str, int] = {}
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
@@ -391,8 +397,10 @@ def _compute_derived(df: pd.DataFrame, carry_dist: float = 0.0) -> pd.DataFrame:
     rm        = pd.Series(track_a).rolling(DISTANCE_HPF_WINDOW, min_periods=1).mean().values
     hpf       = track_a - rm              # signed HPF acceleration (g), DC offset removed
     dt_arr    = dt_s.fillna(0.1).values  # fallback 0.1 s at 10 Hz MOVING rate
-    dist_arr  = []
-    d, vel    = carry_dist, 0.0
+    dist_arr    = []
+    d, vel      = carry_dist, 0.0
+    d_seg_start = carry_dist  # distance at start of current MOVING segment for rail-length clamp
+    clamped_seg = False       # True once RAIL_LENGTH_M_MAX is hit in the current MOVING segment
     for i in range(len(states)):
         h = float(hpf[i])
         if not math.isnan(h):
@@ -401,11 +409,25 @@ def _compute_derived(df: pd.DataFrame, carry_dist: float = 0.0) -> pd.DataFrame:
             # ZUPT only when state==IDLE and accel is below the noise floor.
             if int(states[i]) == STATE_MOVING or abs(h) > DISTANCE_MOVING_EPS:
                 vel += h * 9.81 * float(dt_arr[i])   # g → m/s²; signed integration
-                d   += abs(vel) * float(dt_arr[i])   # unsigned path length
+                if not clamped_seg:
+                    d += abs(vel) * float(dt_arr[i])  # unsigned path length
+                    # T-C3: clamp per-segment distance to physical rail length.
+                    if (d - d_seg_start) > RAIL_LENGTH_M_MAX:
+                        logger.warning(
+                            "[DISTANCE] segment %.2f m > RAIL_LENGTH_M_MAX=%.1f m"
+                            " — clamping (HPF burn-in or sensor drift)",
+                            d - d_seg_start, RAIL_LENGTH_M_MAX,
+                        )
+                        d = d_seg_start + RAIL_LENGTH_M_MAX
+                        clamped_seg = True
             else:
-                vel = 0.0   # ZUPT: state==IDLE and |hpf| below noise floor → physically stopped
+                vel = 0.0        # ZUPT: state==IDLE and |hpf| below noise floor → physically stopped
+                d_seg_start = d  # mark start of next MOVING segment
+                clamped_seg = False
         elif int(states[i]) == STATE_IDLE:
-            vel = 0.0   # ZUPT on unavailable sensor during IDLE — safe to reset
+            vel = 0.0            # ZUPT on unavailable sensor during IDLE — safe to reset
+            d_seg_start = d
+            clamped_seg = False
         dist_arr.append(round(d, 3))
     df["distance_m_cum"] = dist_arr
 
@@ -495,12 +517,13 @@ def _compute_derived(df: pd.DataFrame, carry_dist: float = 0.0) -> pd.DataFrame:
     return df[_PARQUET_COLS]
 
 
-def _flush(buf: list[dict], prefix: str, carry_dist: float = 0.0) -> float:
+def _flush(buf: list[dict], prefix: str, carry_dist: float = 0.0, carry_picks: int = 0) -> tuple[float, int]:
     """Compute derived columns, write clean Parquet atomically, clear buf.
-    carry_dist continues distance_m_cum across mid-mission pressure flushes (T-B1).
-    Returns total_distance_m for the mission-end InfluxDB summary. Returns 0.0 on empty buffer."""
+    carry_dist continues distance_m_cum across pressure flushes (T-B1).
+    carry_picks continues pick_events count across pressure flushes (T-C2).
+    Returns (total_distance_m, pick_events) for the mission-end InfluxDB summary."""
     if not buf:
-        return 0.0
+        return 0.0, carry_picks
     df = pd.DataFrame(buf)
     df.sort_values(by=["shuttle_id", "seq"], inplace=True)
     df = _compute_derived(df, carry_dist)
@@ -520,9 +543,10 @@ def _flush(buf: list[dict], prefix: str, carry_dist: float = 0.0) -> float:
     os.replace(tmp_path, file_path)  # atomic rename: crash-safe on Linux
     logger.info("[%s] Flushed %d records → %s (zstd)", shuttle_label, len(df), file_path)
     # Total mission distance — returned to mission-end caller for InfluxDB.
-    total_dist = round(float(df["distance_m_cum"].iloc[-1]), 2)
+    total_dist  = round(float(df["distance_m_cum"].iloc[-1]), 2)
+    pick_events = carry_picks + int(df["pause_count"].max())
     buf.clear()
-    return total_dist
+    return total_dist, pick_events
 
 
 def _write_mission_summary(
@@ -531,6 +555,7 @@ def _write_mission_summary(
     packets: int,
     duration_ms: float,
     distance_m: float = 0.0,
+    pick_events: int = 0,
 ) -> None:
     # Fire-and-forget background thread so the asyncio loop is never blocked by InfluxDB I/O.
     def _write() -> None:
@@ -544,14 +569,15 @@ def _write_mission_summary(
                 .field("packets",     packets)
                 .field("duration_ms", duration_ms)
                 .field("distance_m",  distance_m)
+                .field("pick_events", pick_events)
                 .time(time.time_ns(), WritePrecision.NS)
             )
             client.write_api(write_options=SYNCHRONOUS).write(
                 bucket=_INFLUXDB_BUCKET, record=point
             )
             logger.info(
-                "[INFLUXDB] stm_mission shuttle=%s energy=%.4fJ pkts=%d dur=%.0fms dist=%.1fm",
-                shuttle_id, energy_j, packets, duration_ms, distance_m,
+                "[INFLUXDB] stm_mission shuttle=%s energy=%.4fJ pkts=%d dur=%.0fms dist=%.1fm picks=%d",
+                shuttle_id, energy_j, packets, duration_ms, distance_m, pick_events,
             )
         except Exception as exc:
             logger.warning("[INFLUXDB] stm_mission write failed (%s): %s", shuttle_id, exc)
@@ -597,7 +623,7 @@ def _reset_shuttle_state(shuttle_id: str) -> None:
     for store in (
         _mission_energy_j, _mission_start_wall, _ntp_offsets,
         _last_packet_wall, _packet_counts, _last_seq_ids, _seq_wrap_counts,
-        _last_moving_wall, _last_sample, _tx_rate_window, _dist_carry,
+        _last_moving_wall, _last_sample, _tx_rate_window, _dist_carry, _pick_carry,
     ):
         store.pop(shuttle_id, None)
 
@@ -624,10 +650,13 @@ def _maybe_flush_mission(shuttle_id: str, now: float) -> None:
     )
 
     # Pop the buffer before reset so _reset_shuttle_state's pop is a no-op.
-    total_dist = _flush(_telemetry_buf.pop(shuttle_id, []), "mission", _dist_carry.get(shuttle_id, 0.0))
+    total_dist, pick_events = _flush(
+        _telemetry_buf.pop(shuttle_id, []), "mission",
+        _dist_carry.get(shuttle_id, 0.0), _pick_carry.get(shuttle_id, 0),
+    )
     # headless mode: skip InfluxDB write; Parquet is still written above.
     if PLUDOS_MODE != "headless":
-        _write_mission_summary(shuttle_id, energy, pkts, duration_ms, total_dist)
+        _write_mission_summary(shuttle_id, energy, pkts, duration_ms, total_dist, pick_events)
     _reset_shuttle_state(shuttle_id)
 
 
@@ -754,14 +783,18 @@ class TelemetryProtocol(asyncio.DatagramProtocol):
                 "[%s] per-shuttle HARD LIMIT (%d pkts) — mid-mission flush",
                 shuttle_name, shuttle_pkts,
             )
-            _dist_carry[shuttle_name] = _flush(_telemetry_buf[shuttle_name], "mission", _dist_carry.get(shuttle_name, 0.0))
+            dist, picks = _flush(_telemetry_buf[shuttle_name], "mission", _dist_carry.get(shuttle_name, 0.0), _pick_carry.get(shuttle_name, 0))
+            _dist_carry[shuttle_name] = dist
+            _pick_carry[shuttle_name] = picks
 
         elif shuttle_pkts >= SHUTTLE_SOFT_LIMIT:
             logger.info(
                 "[%s] per-shuttle soft limit (%d pkts) — proactive flush",
                 shuttle_name, shuttle_pkts,
             )
-            _dist_carry[shuttle_name] = _flush(_telemetry_buf[shuttle_name], "mission", _dist_carry.get(shuttle_name, 0.0))
+            dist, picks = _flush(_telemetry_buf[shuttle_name], "mission", _dist_carry.get(shuttle_name, 0.0), _pick_carry.get(shuttle_name, 0))
+            _dist_carry[shuttle_name] = dist
+            _pick_carry[shuttle_name] = picks
 
         elif total_pkts >= GATEWAY_HARD_LIMIT:
             logger.error(
@@ -769,7 +802,9 @@ class TelemetryProtocol(asyncio.DatagramProtocol):
                 total_pkts, len(_telemetry_buf),
             )
             for s_name, s_buf in list(_telemetry_buf.items()):
-                _dist_carry[s_name] = _flush(s_buf, "mission", _dist_carry.get(s_name, 0.0))
+                dist, picks = _flush(s_buf, "mission", _dist_carry.get(s_name, 0.0), _pick_carry.get(s_name, 0))
+                _dist_carry[s_name] = dist
+                _pick_carry[s_name] = picks
             _telemetry_buf.clear()
 
     def error_received(self, exc: Exception) -> None:
