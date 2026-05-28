@@ -137,6 +137,9 @@ RETRY_PAUSE_THRESHOLD_S = float(os.getenv("RETRY_PAUSE_THRESHOLD_S", "8.0"))
 # The HPF running mean removes mounting-tilt DC offset before integration.
 # At 10 Hz MOVING: 20 packets ≈ 2 s window → ~0.22 Hz high-pass.
 DISTANCE_HPF_WINDOW = int(os.getenv("DISTANCE_HPF_WINDOW", "20"))
+# Minimum HPF accel magnitude (g) to count as motion regardless of state flag.
+# Lets integration continue during the ~800 ms FSM debounce window at motion onset (T-B2).
+DISTANCE_MOVING_EPS = float(os.getenv("DISTANCE_MOVING_EPS", "0.01"))
 
 # Per-second status log: roll up "tx rate" and last-seen sensor values rather
 # than logging every packet (50 Hz × 100 shuttles would drown the terminal).
@@ -315,11 +318,15 @@ _last_sample: dict[str, dict] = {}
 # Per-shuttle running count of packets received in the current STATUS_LOG_PERIOD_S window.
 _tx_rate_window: dict[str, int] = {}
 
+# Distance carry-over across mid-mission buffer-pressure flushes.
+# Cleared on mission-end by _reset_shuttle_state; never cleared on pressure flush.
+_dist_carry: dict[str, float] = {}
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _compute_derived(df: pd.DataFrame) -> pd.DataFrame:
+def _compute_derived(df: pd.DataFrame, carry_dist: float = 0.0) -> pd.DataFrame:
     """Add all derived columns and cast to Parquet dtypes. df must be sorted by (shuttle_id, seq)."""
 
     # Anchor STM32 relative tick to gateway NTP wall clock → proper UTC Timestamp.
@@ -385,15 +392,20 @@ def _compute_derived(df: pd.DataFrame) -> pd.DataFrame:
     hpf       = track_a - rm              # signed HPF acceleration (g), DC offset removed
     dt_arr    = dt_s.fillna(0.1).values  # fallback 0.1 s at 10 Hz MOVING rate
     dist_arr  = []
-    d, vel    = 0.0, 0.0
+    d, vel    = carry_dist, 0.0
     for i in range(len(states)):
-        if int(states[i]) == STATE_MOVING:
-            h = float(hpf[i])
-            if not math.isnan(h):
+        h = float(hpf[i])
+        if not math.isnan(h):
+            # Integrate when MOVING or when HPF accel exceeds eps — the FSM debounce
+            # delay (~800 ms) reports IDLE while the shuttle is physically accelerating.
+            # ZUPT only when state==IDLE and accel is below the noise floor.
+            if int(states[i]) == STATE_MOVING or abs(h) > DISTANCE_MOVING_EPS:
                 vel += h * 9.81 * float(dt_arr[i])   # g → m/s²; signed integration
                 d   += abs(vel) * float(dt_arr[i])   # unsigned path length
-        else:
-            vel = 0.0   # ZUPT: exact reset — shuttle is stopped at IDLE on the rail
+            else:
+                vel = 0.0   # ZUPT: state==IDLE and |hpf| below noise floor → physically stopped
+        elif int(states[i]) == STATE_IDLE:
+            vel = 0.0   # ZUPT on unavailable sensor during IDLE — safe to reset
         dist_arr.append(round(d, 3))
     df["distance_m_cum"] = dist_arr
 
@@ -483,14 +495,15 @@ def _compute_derived(df: pd.DataFrame) -> pd.DataFrame:
     return df[_PARQUET_COLS]
 
 
-def _flush(buf: list[dict], prefix: str) -> float:
+def _flush(buf: list[dict], prefix: str, carry_dist: float = 0.0) -> float:
     """Compute derived columns, write clean Parquet atomically, clear buf.
+    carry_dist continues distance_m_cum across mid-mission pressure flushes (T-B1).
     Returns total_distance_m for the mission-end InfluxDB summary. Returns 0.0 on empty buffer."""
     if not buf:
         return 0.0
     df = pd.DataFrame(buf)
     df.sort_values(by=["shuttle_id", "seq"], inplace=True)
-    df = _compute_derived(df)
+    df = _compute_derived(df, carry_dist)
 
     shuttle_id_val = int(df["shuttle_id"].iloc[0])
     shuttle_label  = f"shuttle-{shuttle_id_val}"
@@ -584,7 +597,7 @@ def _reset_shuttle_state(shuttle_id: str) -> None:
     for store in (
         _mission_energy_j, _mission_start_wall, _ntp_offsets,
         _last_packet_wall, _packet_counts, _last_seq_ids, _seq_wrap_counts,
-        _last_moving_wall, _last_sample, _tx_rate_window,
+        _last_moving_wall, _last_sample, _tx_rate_window, _dist_carry,
     ):
         store.pop(shuttle_id, None)
 
@@ -611,7 +624,7 @@ def _maybe_flush_mission(shuttle_id: str, now: float) -> None:
     )
 
     # Pop the buffer before reset so _reset_shuttle_state's pop is a no-op.
-    total_dist = _flush(_telemetry_buf.pop(shuttle_id, []), "mission")
+    total_dist = _flush(_telemetry_buf.pop(shuttle_id, []), "mission", _dist_carry.get(shuttle_id, 0.0))
     # headless mode: skip InfluxDB write; Parquet is still written above.
     if PLUDOS_MODE != "headless":
         _write_mission_summary(shuttle_id, energy, pkts, duration_ms, total_dist)
@@ -741,22 +754,22 @@ class TelemetryProtocol(asyncio.DatagramProtocol):
                 "[%s] per-shuttle HARD LIMIT (%d pkts) — mid-mission flush",
                 shuttle_name, shuttle_pkts,
             )
-            _flush(_telemetry_buf[shuttle_name], "mission")
+            _dist_carry[shuttle_name] = _flush(_telemetry_buf[shuttle_name], "mission", _dist_carry.get(shuttle_name, 0.0))
 
         elif shuttle_pkts >= SHUTTLE_SOFT_LIMIT:
             logger.info(
                 "[%s] per-shuttle soft limit (%d pkts) — proactive flush",
                 shuttle_name, shuttle_pkts,
             )
-            _flush(_telemetry_buf[shuttle_name], "mission")
+            _dist_carry[shuttle_name] = _flush(_telemetry_buf[shuttle_name], "mission", _dist_carry.get(shuttle_name, 0.0))
 
         elif total_pkts >= GATEWAY_HARD_LIMIT:
             logger.error(
                 "GATEWAY HARD LIMIT (%d total pkts across %d shuttles) — emergency flush all",
                 total_pkts, len(_telemetry_buf),
             )
-            for s_buf in list(_telemetry_buf.values()):
-                _flush(s_buf, "mission")
+            for s_name, s_buf in list(_telemetry_buf.items()):
+                _dist_carry[s_name] = _flush(s_buf, "mission", _dist_carry.get(s_name, 0.0))
             _telemetry_buf.clear()
 
     def error_received(self, exc: Exception) -> None:

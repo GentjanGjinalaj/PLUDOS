@@ -36,6 +36,9 @@ CNN_FEATURE_STATS_FREEZE  = int(os.getenv("CNN_FEATURE_STATS_FREEZE",  "10000"))
 CNN_MIN_IDLE_WINDOWS      = int(os.getenv("CNN_MIN_IDLE_WINDOWS",      "5"))
 ANOMALY_K                 = float(os.getenv("ANOMALY_K",               "3.0"))
 
+# Per-gateway key for persisted thresholds; each Jetson produces a distinct entry.
+_HOSTNAME_KEY = os.getenv("JETSON_HOSTNAME", "gateway")
+
 
 # ---------------------------------------------------------------------------
 # T3.1: Welford running-stats helpers (persisted as cnn_feature_stats.npz)
@@ -90,7 +93,7 @@ def _load_anomaly_threshold(state_dir: Path) -> float | None:
     path = state_dir / "cnn_anomaly_thresholds.json"
     if path.exists():
         try:
-            val = json.loads(path.read_text()).get("cnn_global")
+            val = json.loads(path.read_text()).get(_HOSTNAME_KEY)
             return float(val) if val is not None else None
         except Exception:
             pass
@@ -102,7 +105,7 @@ def _save_anomaly_threshold(state_dir: Path, threshold: float) -> None:
     try:
         state_dir.mkdir(parents=True, exist_ok=True)
         (state_dir / "cnn_anomaly_thresholds.json").write_text(
-            json.dumps({"cnn_global": threshold})
+            json.dumps({_HOSTNAME_KEY: threshold})
         )
     except Exception as exc:
         logger.warning("[CNN] threshold save failed: %s", exc)

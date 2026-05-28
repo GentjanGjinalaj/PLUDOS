@@ -104,7 +104,7 @@ services:
       - INFLUXDB_BUCKET=${INFLUXDB_BUCKET}
       - FL_TRIGGER_INTERVAL_S=${FL_TRIGGER_INTERVAL_S:-30}
       - FL_MIN_FIT_CLIENTS=${FL_MIN_FIT_CLIENTS:-1}
-      - FL_NUM_ROUNDS=${FL_NUM_ROUNDS:-3}
+      - FL_NUM_ROUNDS=${FL_NUM_ROUNDS:-10}
       # Redirect server.py FL round logs to the writable state volume — the
       # project mount is :ro so logs/ inside it is not writable from here.
       - FL_LOG_DIR=/app/state/logs
