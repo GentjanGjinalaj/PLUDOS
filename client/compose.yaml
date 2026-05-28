@@ -40,6 +40,10 @@ services:
     container_name: pludos-ai-worker
     hostname: ${JETSON_HOSTNAME:-jetson}   # sets socket.gethostname() → InfluxDB device tag
     command: python3 client.py
+    # network_mode: host — required to reach alumet-relay's Prometheus endpoint on
+    # localhost:9095; without this the container is in a CNI namespace and the scrape
+    # hits a dead socket, forcing every FL round into DEGRADED mode (T-A1).
+    network_mode: host
     env_file:
       - .env
     profiles:

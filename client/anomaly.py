@@ -40,8 +40,8 @@ ANOMALY_MODEL = os.getenv("ANOMALY_MODEL", "isolation_forest_xgb")
 IF_CONTAMINATION     = float(os.getenv("IF_CONTAMINATION",    "0.05"))
 IF_MIN_MOVING_SAMPLES = int(os.getenv("IF_MIN_MOVING_SAMPLES", "50"))
 
-# accel_z threshold — legacy backend only (ANOMALY_MODEL=threshold).
-ANOMALY_THRESHOLD_G = float(os.getenv("ANOMALY_THRESHOLD_G", "2.0"))
+# accel_z threshold — legacy backend only (ANOMALY_MODEL=threshold). Must match .env.example.
+ANOMALY_THRESHOLD_G = float(os.getenv("ANOMALY_THRESHOLD_G", "0.8"))
 
 # Persisted CNN state (T3.1/T3.2); must survive container restarts.
 STATE_DIR = Path(os.getenv("STATE_DIR", "./state" if TEST_MODE else "/app/state"))
