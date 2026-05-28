@@ -224,10 +224,9 @@ all devices share one measurement.
 - Client: `alumet-cli --plugin jetson --relay-out <server:port>`
 - Server: `alumet-cli --plugin rapl --relay-in 0.0.0.0:<port>`
 
-**probe.py status:** dormant. Alumet's native Jetson plugin reads INA3221
-directly. probe.py is kept in the repo (commented out) as a reference for the
-sysfs channel classification logic and as an emergency fallback if the Jetson
-plugin is unavailable. See `client/alumet-relay/probe.py` for details.
+**probe.py:** removed (T4.4). Alumet's native Jetson plugin reads INA3221 directly;
+the file-based sidecar (`probe.py`) and its shared volume are no longer needed.
+`_read_relay_metrics()` and `ALUMET_RELAY_METRICS_FILE` removed from `client.py`.
 
 **New InfluxDB measurements added this session:**
 - `fl_phases` — per-phase energy summary from `client/client.py` AlumetProfiler.

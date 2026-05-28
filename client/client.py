@@ -84,9 +84,6 @@ logger.info("[CONFIG] XGBoost device: %s", DEVICE)
 # so localhost:9095 inside the container reaches the host's published port directly.
 ALUMET_PROMETHEUS_URL = os.getenv("ALUMET_PROMETHEUS_URL", "http://localhost:9095/metrics")
 
-# Legacy file-based relay path (probe.py, now dormant — superseded by Prometheus scrape).
-ALUMET_RELAY_METRICS_FILE = os.getenv("ALUMET_RELAY_METRICS_FILE", "")
-
 # Controls which energy source is accepted during FL rounds.
 #   "alumet"     — hard requirement; round aborts with ERROR if Alumet scrape fails or returns 0.
 #   "tegrastats"  — use tegrastats only (debug/no-Alumet-relay mode).
@@ -179,23 +176,6 @@ def _read_tegrastats() -> dict[str, float]:
         return {"gpu": gpu / 1000.0, "cpu": cpu / 1000.0, "total": (gpu + cpu + soc) / 1000.0}
     except Exception:
         return {"gpu": 0.0, "cpu": 0.0, "total": 0.0}
-
-
-def _read_relay_metrics() -> dict[str, float] | None:
-    # Legacy: reads from the shared file written by alumet-relay probe.py (dormant).
-    if not ALUMET_RELAY_METRICS_FILE or not os.path.exists(ALUMET_RELAY_METRICS_FILE):
-        return None
-    try:
-        import json
-        with open(ALUMET_RELAY_METRICS_FILE) as f:
-            data = json.load(f)
-        return {
-            "gpu":   float(data.get("power_gpu_w",   0.0)),
-            "cpu":   float(data.get("power_cpu_w",   0.0)),
-            "total": float(data.get("power_total_w", 0.0)),
-        }
-    except Exception:
-        return None
 
 
 def _read_alumet_prometheus() -> dict[str, float] | None:
@@ -293,6 +273,8 @@ class AlumetProfiler:
         self._source_failed: bool = False
         # Last-used energy source; written by polling thread, used for InfluxDB tagging.
         self._energy_source: str = "unknown"
+        # T4.2: monotonic timestamp of last [ENERGY][DEGRADED] warn — throttles to 60 s.
+        self._last_degraded_warn_t: float = 0.0
 
         # Active phase snapshots: phase_name → (start_monotonic, energy_j_at_start)
         self._phase_snapshots: dict[str, tuple[float, float]] = {}
@@ -383,7 +365,7 @@ class AlumetProfiler:
                 self._energy_source = "test"
             elif ENERGY_SOURCE_REQUIRED == "alumet":
                 # alumet required: fail the round if unreachable or reports zero power.
-                pw = _read_relay_metrics() or _read_alumet_prometheus()
+                pw = _read_alumet_prometheus()
                 if pw is None or pw.get("total", 0.0) == 0.0:
                     if not self._source_failed:
                         logger.error("[ENERGY] alumet unavailable, refusing to report fake energy")
@@ -395,18 +377,22 @@ class AlumetProfiler:
             elif ENERGY_SOURCE_REQUIRED == "tegrastats":
                 pw = _read_tegrastats()
                 self._energy_source = "tegrastats"
+                # T4.2: warn every 60 s so ops knows tegrastats is the active source.
+                if time.monotonic() - self._last_degraded_warn_t >= 60.0:
+                    logger.warning("[ENERGY][DEGRADED] source=tegrastats (ENERGY_SOURCE_REQUIRED=%s)",
+                                   ENERGY_SOURCE_REQUIRED)
+                    self._last_degraded_warn_t = time.monotonic()
             else:  # auto — legacy fallback chain, tagged for Grafana visibility
-                pw = _read_relay_metrics() or _read_alumet_prometheus()
+                pw = _read_alumet_prometheus()
                 if pw is not None:
                     self._energy_source = "alumet"
                 else:
                     pw = _read_tegrastats()
                     self._energy_source = "tegrastats_fallback"
-                    if not self._source_failed:
-                        logger.warning(
-                            "[ENERGY][DEGRADED] alumet unavailable — falling back to tegrastats"
-                        )
-                        self._source_failed = True
+                    # T4.2: throttled DEGRADED warn; not a round-abort (auto mode).
+                    if time.monotonic() - self._last_degraded_warn_t >= 60.0:
+                        logger.warning("[ENERGY][DEGRADED] alumet unavailable — falling back to tegrastats")
+                        self._last_degraded_warn_t = time.monotonic()
 
             # Atomic float update — safe under CPython GIL for this access pattern.
             self._energy_j += pw["total"] * elapsed
@@ -801,6 +787,27 @@ class PLUDOSClient(fl.client.NumPyClient):
             return 0.0, 1, {"accuracy": 0.0}
 
 
+def _wait_for_alumet(timeout_s: int = 30) -> bool:
+    # Poll ALUMET_PROMETHEUS_URL until a 200 OK is received or timeout expires.
+    # Returns True if healthy, False if the endpoint never responds in time.
+    deadline = time.monotonic() + timeout_s
+    warned   = False
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(ALUMET_PROMETHEUS_URL, timeout=1) as r:
+                if r.status == 200:
+                    logger.info("[ENERGY] alumet ready at %s", ALUMET_PROMETHEUS_URL)
+                    return True
+        except Exception:
+            pass
+        if not warned:
+            logger.warning("[ENERGY] alumet not ready; waiting up to %ds (%s)",
+                           timeout_s, ALUMET_PROMETHEUS_URL)
+            warned = True
+        time.sleep(2)
+    return False
+
+
 def client_fn(context: fl.common.Context):
     # Startup heartbeat bootstraps the FL trigger: round 1 can fire even before
     # any FL has occurred, as long as one parquet exists in the buffer.
@@ -809,6 +816,15 @@ def client_fn(context: fl.common.Context):
     except Exception as exc:
         # Never block joining a round on a heartbeat failure.
         logger.warning("[GW_STATUS] startup heartbeat skipped: %s", exc)
+
+    # T4.1: gate on alumet readiness when it is the required source. Skip in
+    # TEST_MODE (no relay running) and "auto"/"tegrastats" (fallbacks accepted).
+    if not TEST_MODE and ENERGY_SOURCE_REQUIRED not in ("auto", "tegrastats"):
+        if not _wait_for_alumet(30):
+            raise RuntimeError(
+                "[ENERGY] alumet unavailable after 30 s — refusing to register with Flower"
+            )
+
     return PLUDOSClient().to_client()
 
 

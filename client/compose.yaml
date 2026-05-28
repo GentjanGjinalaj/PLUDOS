@@ -51,8 +51,13 @@ services:
       - /etc/localtime:/etc/localtime:ro
       - /etc/timezone:/etc/timezone:ro
     depends_on:
-      - data-engine
-      - tailscale
+      data-engine:
+        condition: service_started
+      tailscale:
+        condition: service_started
+      # T4.1: block until alumet Prometheus endpoint is healthy before Flower connects.
+      alumet-relay:
+        condition: service_healthy
     restart: unless-stopped
 
   # 3. Alumet relay sidecar — ADR-011 Phase 2
@@ -87,6 +92,13 @@ services:
       - /etc/timezone:/etc/timezone:ro
       # Persistent alumet log files — visible on host at client/logs/alumet/.
       - ./logs/alumet:/app/logs
+    # T4.1: expose readiness so ai-worker doesn't try to scrape before alumet-agent is up.
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9095/metrics"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
     restart: unless-stopped
 
 # ram_buffer is a bind-mount on ./ram_buffer so it works in rootless Podman
