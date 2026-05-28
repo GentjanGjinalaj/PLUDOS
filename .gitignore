@@ -3,8 +3,6 @@ pludos_venv/
 __pycache__/
 *.py[cod]
 *.egg-info/
-build_pludos_dashboard.py
-
 # Data files (runtime output, never commit)
 *.parquet
 # ram_buffer/ directories hold .parquet files (ignored above) and a .gitkeep — don't ignore the dir
