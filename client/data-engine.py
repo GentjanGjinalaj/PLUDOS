@@ -134,9 +134,8 @@ MISSION_END_IDLE_S = float(os.getenv("MISSION_END_IDLE_S", "30"))
 RETRY_PAUSE_THRESHOLD_S = float(os.getenv("RETRY_PAUSE_THRESHOLD_S", "8.0"))
 
 # 1D-ZUPT distance for Savoye XTPS: one shuttle per rail, forward/backward only.
-# The HPF running mean removes mounting-tilt DC offset before integration.
-# At 10 Hz MOVING: 20 packets ≈ 2 s window → ~0.22 Hz high-pass.
-DISTANCE_HPF_WINDOW = int(os.getenv("DISTANCE_HPF_WINDOW", "10"))
+# DC offset (mounting tilt) is removed using the mean of IDLE samples in the flush buffer —
+# shuttle is physically stopped during IDLE so accel_rail ≈ g×sin(θ) is constant.
 # Minimum HPF accel magnitude (g) to count as motion regardless of state flag.
 # Lets integration continue during the ~800 ms FSM debounce window at motion onset (T-B2).
 DISTANCE_MOVING_EPS = float(os.getenv("DISTANCE_MOVING_EPS", "0.01"))
@@ -394,8 +393,12 @@ def _compute_derived(df: pd.DataFrame, carry_dist: float = 0.0) -> pd.DataFrame:
         df["accel_x"].values.astype(float) if var_x >= var_y
         else df["accel_y"].values.astype(float)
     )
-    rm        = pd.Series(track_a).rolling(DISTANCE_HPF_WINDOW, min_periods=1).mean().values
-    hpf       = track_a - rm              # signed HPF acceleration (g), DC offset removed
+    # Subtract the mean accel of IDLE packets as the DC (tilt) offset.
+    # Rolling-mean HPF was removed: it erodes the motion signal during short MOVING segments
+    # (shuttle moves < HPF window samples), leaving residual velocity after deceleration.
+    idle_vals = track_a[(df["state"] == STATE_IDLE).values]
+    dc_offset = float(idle_vals.mean()) if len(idle_vals) > 0 else 0.0
+    hpf       = track_a - dc_offset      # signed acceleration (g) with tilt removed
     dt_arr    = dt_s.fillna(0.1).values  # fallback 0.1 s at 10 Hz MOVING rate
     dist_arr    = []
     d, vel      = carry_dist, 0.0
