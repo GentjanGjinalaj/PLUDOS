@@ -147,8 +147,8 @@ stat_specs = [
     ("Missions — Last 24 h",
      [raw_q(f"""from(bucket:"{BUCKET}") |> range(start: -24h) |> filter(fn: (r) => r._measurement == "stm_mission" and r._field == "energy_j") |> count() |> yield(name: "A")""")],
      "short", "purple", 4, 16),
-    ("Jetson Board Power (VDD_IN ~W)",
-     [raw_q(f"""from(bucket:"{BUCKET}") |> range(start: -2m) |> filter(fn: (r) => r._measurement == "input_current" and r._field == "value" and r.ina_channel_label == "VDD_IN") |> last() |> map(fn: (r) => ({{r with _value: float(v: r._value) * 5.0 / 1000.0}})) |> yield(name: "A")""")],
+    ("Jetson Board Power (~W)",
+     [raw_q(f"""from(bucket:"{BUCKET}") |> range(start: -2m) |> filter(fn: (r) => r._measurement == "input_current" and r._field == "value") |> last() |> map(fn: (r) => ({{r with _value: float(v: r._value) * 5.0 / 1000.0}})) |> yield(name: "A")""")],
      "watt",
      [{"value": 0, "color": "green"}, {"value": 15, "color": "yellow"}, {"value": 22, "color": "red"}],
      4, 20),
@@ -356,43 +356,55 @@ y += 7
 # ═══════════════════════════════════════════════════════════════
 panels.append(row("🖥 Jetson Power — INA3221 via Alumet", y)); y += 1
 
-def ina_curr(label, ref="A"):
+# Alumet INA3221 schema (current alumet version): ina_channel_label is a field,
+# not a tag. Only one channel is reported (total board input). Filter by _field only.
+def ina_curr_q(ref="A"):
     return raw_q(f"""from(bucket:"{BUCKET}")
   |> range(start: v.timeRangeStart, stop: v.timeRangeStop)
-  |> filter(fn: (r) => r._measurement == "input_current" and r._field == "value" and r.ina_channel_label == "{label}")
+  |> filter(fn: (r) => r._measurement == "input_current" and r._field == "value")
   |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)
   |> yield(name: "{ref}")""", ref=ref)
 
-def ina_volt(label, ref="A"):
+def ina_volt_q(ref="A"):
     return raw_q(f"""from(bucket:"{BUCKET}")
   |> range(start: v.timeRangeStart, stop: v.timeRangeStop)
-  |> filter(fn: (r) => r._measurement == "input_voltage" and r._field == "value" and r.ina_channel_label == "{label}")
+  |> filter(fn: (r) => r._measurement == "input_voltage" and r._field == "value")
   |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)
   |> yield(name: "{ref}")""", ref=ref)
 
-def ina_pwr(label, ref="A"):
-    return raw_q(f"""from(bucket:"{BUCKET}")
+def ina_pwr_q(ref="A"):
+    # Power = current_mA × voltage_mV / 1e6 = W; joined on _time.
+    return raw_q(f"""c = from(bucket:"{BUCKET}")
   |> range(start: v.timeRangeStart, stop: v.timeRangeStop)
-  |> filter(fn: (r) => r._measurement == "input_current" and r._field == "value" and r.ina_channel_label == "{label}")
+  |> filter(fn: (r) => r._measurement == "input_current" and r._field == "value")
   |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)
-  |> map(fn: (r) => ({{r with _value: float(v: r._value) * 5.0 / 1000.0}}))
+  |> rename(columns: {{_value: "current_ma"}})
+
+v2 = from(bucket:"{BUCKET}")
+  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)
+  |> filter(fn: (r) => r._measurement == "input_voltage" and r._field == "value")
+  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)
+  |> rename(columns: {{_value: "voltage_mv"}})
+
+join(tables: {{c: c, v: v2}}, on: ["_time", "resource_consumer_kind", "resource_kind"])
+  |> map(fn: (r) => ({{r with _value: r.current_ma * r.voltage_mv / 1.0e6}}))
   |> yield(name: "{ref}")""", ref=ref)
 
-# Board power (W estimated)
-panels.append(new_panel("timeseries", "Board Input Power — VDD_IN (W, ~5 V est.)",
-    [ina_pwr("VDD_IN")],
+# Board power (W — current × voltage)
+panels.append(new_panel("timeseries", "Board Input Power (W)",
+    [ina_pwr_q()],
     {"h": 8, "w": 8, "x": 0, "y": y},
     fieldConfig=ts_defaults("watt", lw=2, fill=20, min_=0, max_=25)))
 
-# Component currents
-panels.append(new_panel("timeseries", "Rail Currents (mA)",
-    [ina_curr("VDD_IN", "A"), ina_curr("VDD_CPU_GPU_CV", "B"), ina_curr("VDD_SOC", "C")],
+# Board current
+panels.append(new_panel("timeseries", "Board Input Current (mA)",
+    [ina_curr_q()],
     {"h": 8, "w": 8, "x": 8, "y": y},
     fieldConfig=ts_defaults("mamp", lw=2, fill=0, min_=0)))
 
-# Rail voltages
-panels.append(new_panel("timeseries", "Rail Voltages (mV)",
-    [ina_volt("VDD_IN", "A"), ina_volt("VDD_CPU_GPU_CV", "B"), ina_volt("VDD_SOC", "C")],
+# Board voltage
+panels.append(new_panel("timeseries", "Board Input Voltage (mV)",
+    [ina_volt_q()],
     {"h": 8, "w": 8, "x": 16, "y": y},
     fieldConfig=ts_defaults("mvolt", lw=2, fill=0, min_=4500, max_=5500)))
 
@@ -421,10 +433,14 @@ panels.append(new_panel("timeseries", "Phase Duration (ms) — load / train / ro
     [raw_q(f"""from(bucket:"{BUCKET}")
   |> range(start: v.timeRangeStart, stop: v.timeRangeStop)
   |> filter(fn: (r) => r._measurement == "fl_phases" and r._field == "duration_ms")
+  |> group(columns: ["phase", "device"])
   |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)
   |> yield(name: "A")""")],
     {"h": 8, "w": 12, "x": 12, "y": y},
-    fieldConfig=ts_defaults("ms", lw=2, fill=5, min_=0)))
+    options={"tooltip": {"mode": "multi"}, "legend": {"displayMode": "list", "placement": "bottom"}},
+    fieldConfig={"defaults": {"unit": "ms", "custom": {"lineWidth": 2, "fillOpacity": 10,
+                              "showPoints": "always", "pointSize": 6},
+                              "min": 0}}))
 
 y += 8
 

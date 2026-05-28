@@ -334,7 +334,7 @@
     {
       "id": 7,
       "type": "stat",
-      "title": "Jetson Board Power (VDD_IN ~W)",
+      "title": "Jetson Board Power (~W)",
       "datasource": {
         "type": "influxdb",
         "uid": "efmtstss6rcw0d"
@@ -342,7 +342,7 @@
       "targets": [
         {
           "refId": "A",
-          "query": "from(bucket:\"alumet_energy\") |> range(start: -2m) |> filter(fn: (r) => r._measurement == \"input_current\" and r._field == \"value\" and r.ina_channel_label == \"VDD_IN\") |> last() |> map(fn: (r) => ({r with _value: float(v: r._value) * 5.0 / 1000.0})) |> yield(name: \"A\")",
+          "query": "from(bucket:\"alumet_energy\") |> range(start: -2m) |> filter(fn: (r) => r._measurement == \"input_current\" and r._field == \"value\") |> last() |> map(fn: (r) => ({r with _value: float(v: r._value) * 5.0 / 1000.0})) |> yield(name: \"A\")",
           "datasource": {
             "type": "influxdb",
             "uid": "efmtstss6rcw0d"
@@ -1069,7 +1069,7 @@
     {
       "id": 30,
       "type": "timeseries",
-      "title": "Board Input Power \u2014 VDD_IN (W, ~5 V est.)",
+      "title": "Board Input Power (W)",
       "datasource": {
         "type": "influxdb",
         "uid": "efmtstss6rcw0d"
@@ -1077,7 +1077,7 @@
       "targets": [
         {
           "refId": "A",
-          "query": "from(bucket:\"alumet_energy\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"input_current\" and r._field == \"value\" and r.ina_channel_label == \"VDD_IN\")\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> map(fn: (r) => ({r with _value: float(v: r._value) * 5.0 / 1000.0}))\n  |> yield(name: \"A\")",
+          "query": "c = from(bucket:\"alumet_energy\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"input_current\" and r._field == \"value\")\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> rename(columns: {_value: \"current_ma\"})\n\nv2 = from(bucket:\"alumet_energy\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"input_voltage\" and r._field == \"value\")\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> rename(columns: {_value: \"voltage_mv\"})\n\njoin(tables: {c: c, v: v2}, on: [\"_time\", \"resource_consumer_kind\", \"resource_kind\"])\n  |> map(fn: (r) => ({r with _value: r.current_ma * r.voltage_mv / 1.0e6}))\n  |> yield(name: \"A\")",
           "datasource": {
             "type": "influxdb",
             "uid": "efmtstss6rcw0d"
@@ -1109,7 +1109,7 @@
     {
       "id": 31,
       "type": "timeseries",
-      "title": "Rail Currents (mA)",
+      "title": "Board Input Current (mA)",
       "datasource": {
         "type": "influxdb",
         "uid": "efmtstss6rcw0d"
@@ -1117,23 +1117,7 @@
       "targets": [
         {
           "refId": "A",
-          "query": "from(bucket:\"alumet_energy\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"input_current\" and r._field == \"value\" and r.ina_channel_label == \"VDD_IN\")\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> yield(name: \"A\")",
-          "datasource": {
-            "type": "influxdb",
-            "uid": "efmtstss6rcw0d"
-          }
-        },
-        {
-          "refId": "B",
-          "query": "from(bucket:\"alumet_energy\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"input_current\" and r._field == \"value\" and r.ina_channel_label == \"VDD_CPU_GPU_CV\")\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> yield(name: \"B\")",
-          "datasource": {
-            "type": "influxdb",
-            "uid": "efmtstss6rcw0d"
-          }
-        },
-        {
-          "refId": "C",
-          "query": "from(bucket:\"alumet_energy\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"input_current\" and r._field == \"value\" and r.ina_channel_label == \"VDD_SOC\")\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> yield(name: \"C\")",
+          "query": "from(bucket:\"alumet_energy\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"input_current\" and r._field == \"value\")\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> yield(name: \"A\")",
           "datasource": {
             "type": "influxdb",
             "uid": "efmtstss6rcw0d"
@@ -1164,7 +1148,7 @@
     {
       "id": 32,
       "type": "timeseries",
-      "title": "Rail Voltages (mV)",
+      "title": "Board Input Voltage (mV)",
       "datasource": {
         "type": "influxdb",
         "uid": "efmtstss6rcw0d"
@@ -1172,23 +1156,7 @@
       "targets": [
         {
           "refId": "A",
-          "query": "from(bucket:\"alumet_energy\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"input_voltage\" and r._field == \"value\" and r.ina_channel_label == \"VDD_IN\")\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> yield(name: \"A\")",
-          "datasource": {
-            "type": "influxdb",
-            "uid": "efmtstss6rcw0d"
-          }
-        },
-        {
-          "refId": "B",
-          "query": "from(bucket:\"alumet_energy\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"input_voltage\" and r._field == \"value\" and r.ina_channel_label == \"VDD_CPU_GPU_CV\")\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> yield(name: \"B\")",
-          "datasource": {
-            "type": "influxdb",
-            "uid": "efmtstss6rcw0d"
-          }
-        },
-        {
-          "refId": "C",
-          "query": "from(bucket:\"alumet_energy\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"input_voltage\" and r._field == \"value\" and r.ina_channel_label == \"VDD_SOC\")\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> yield(name: \"C\")",
+          "query": "from(bucket:\"alumet_energy\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"input_voltage\" and r._field == \"value\")\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> yield(name: \"A\")",
           "datasource": {
             "type": "influxdb",
             "uid": "efmtstss6rcw0d"
@@ -1279,7 +1247,7 @@
       "targets": [
         {
           "refId": "A",
-          "query": "from(bucket:\"alumet_energy\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"fl_phases\" and r._field == \"duration_ms\")\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> yield(name: \"A\")",
+          "query": "from(bucket:\"alumet_energy\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"fl_phases\" and r._field == \"duration_ms\")\n  |> group(columns: [\"phase\", \"device\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> yield(name: \"A\")",
           "datasource": {
             "type": "influxdb",
             "uid": "efmtstss6rcw0d"
@@ -1292,16 +1260,23 @@
         "x": 12,
         "y": 81
       },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "ms",
           "custom": {
             "lineWidth": 2,
-            "fillOpacity": 5,
-            "drawStyle": "line",
-            "lineInterpolation": "linear",
-            "showPoints": "never",
-            "spanNulls": false
+            "fillOpacity": 10,
+            "showPoints": "always",
+            "pointSize": 6
           },
           "min": 0
         }

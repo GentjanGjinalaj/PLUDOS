@@ -58,6 +58,9 @@ docs/to-do_results.md
 # entrypoint.sh creates client/logs/alumet/ via mkdir -p.
 logs/
 client/logs/
+client/ram_buffer/
+client/ram_buffer/model/
+client/ram_buffer_archive/
 
 # Claude Code worktrees (isolation branches, not for repo)
 .claude/worktrees/
