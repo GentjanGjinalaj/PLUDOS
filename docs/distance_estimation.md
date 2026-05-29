@@ -76,8 +76,7 @@ at the next IDLE packet.
 
 | Variable              | Default | Meaning |
 |-----------------------|---------|---------|
-| `DISTANCE_HPF_WINDOW` | `10`    | Running mean window (packets) for the high-pass filter. |
-| `DISTANCE_MOVING_EPS` | `0.01`  | Minimum HPF accel (g) to integrate during FSM debounce window. |
+| `DISTANCE_HPF_WINDOW` | `10`    | Legacy rolling-mean window (packets); current implementation uses IDLE-baseline DC removal instead. |
 | `RAIL_LENGTH_M_MAX`   | `20.0`  | Per-segment distance upper bound (m); clamps HPF burn-in and sensor drift. Update with exact rail length from Savoye. |
 
 No calibration constants needed for distance: only `g = 9.81 m/s²` which is fixed.

@@ -136,9 +136,6 @@ RETRY_PAUSE_THRESHOLD_S = float(os.getenv("RETRY_PAUSE_THRESHOLD_S", "8.0"))
 # 1D-ZUPT distance for Savoye XTPS: one shuttle per rail, forward/backward only.
 # DC offset (mounting tilt) is removed using the mean of IDLE samples in the flush buffer —
 # shuttle is physically stopped during IDLE so accel_rail ≈ g×sin(θ) is constant.
-# Minimum HPF accel magnitude (g) to count as motion regardless of state flag.
-# Lets integration continue during the ~800 ms FSM debounce window at motion onset (T-B2).
-DISTANCE_MOVING_EPS = float(os.getenv("DISTANCE_MOVING_EPS", "0.01"))
 # Physical upper bound on distance per MOVING segment — catches HPF burn-in errors and sensor drift.
 # Update once Savoye confirms the exact minifloor rail length; 20 m is a conservative maximum.
 RAIL_LENGTH_M_MAX = float(os.getenv("RAIL_LENGTH_M_MAX", "20.0"))
@@ -404,13 +401,15 @@ def _compute_derived(df: pd.DataFrame, carry_dist: float = 0.0) -> pd.DataFrame:
     d, vel      = carry_dist, 0.0
     d_seg_start = carry_dist  # distance at start of current MOVING segment for rail-length clamp
     clamped_seg = False       # True once RAIL_LENGTH_M_MAX is hit in the current MOVING segment
+    # Strict ZUPT: integrate iff state==MOVING; reset velocity on every IDLE packet.
+    # The 0.05 g² FSM threshold puts state=IDLE only when shuttle is physically stopped,
+    # so vel=0 is an exact constraint. Trades ~5-10 cm onset underestimation (from the
+    # 500 ms dwell + 300 ms debounce) for bounded drift — without this the integrator
+    # accumulates HPF noise during IDLE and saturates at RAIL_LENGTH_M_MAX.
     for i in range(len(states)):
-        h = float(hpf[i])
-        if not math.isnan(h):
-            # Integrate when MOVING or when HPF accel exceeds eps — the FSM debounce
-            # delay (~800 ms) reports IDLE while the shuttle is physically accelerating.
-            # ZUPT only when state==IDLE and accel is below the noise floor.
-            if int(states[i]) == STATE_MOVING or abs(h) > DISTANCE_MOVING_EPS:
+        if int(states[i]) == STATE_MOVING:
+            h = float(hpf[i])
+            if not math.isnan(h):
                 vel += h * 9.81 * float(dt_arr[i])   # g → m/s²; signed integration
                 if not clamped_seg:
                     d += abs(vel) * float(dt_arr[i])  # unsigned path length
@@ -423,12 +422,8 @@ def _compute_derived(df: pd.DataFrame, carry_dist: float = 0.0) -> pd.DataFrame:
                         )
                         d = d_seg_start + RAIL_LENGTH_M_MAX
                         clamped_seg = True
-            else:
-                vel = 0.0        # ZUPT: state==IDLE and |hpf| below noise floor → physically stopped
-                d_seg_start = d  # mark start of next MOVING segment
-                clamped_seg = False
-        elif int(states[i]) == STATE_IDLE:
-            vel = 0.0            # ZUPT on unavailable sensor during IDLE — safe to reset
+        else:  # STATE_IDLE — shuttle physically stopped on rail
+            vel = 0.0
             d_seg_start = d
             clamped_seg = False
         dist_arr.append(round(d, 3))
