@@ -67,7 +67,7 @@ ssh warehouse1@$JETSON_IP "cd ~/PLUDOS/client && podman-compose up -d data-engin
 ssh warehouse1@$JETSON_IP "cd ~/PLUDOS/client && podman-compose --profile vpn up -d"
 
 # With INA3221 alumet relay (already started separately):
-ssh warehouse1@$JETSON_IP "cd ~/PLUDOS/client && podman-compose --profile energy up -d alumet-relay"
+ssh warehouse1@$JETSON_IP "cd ~/PLUDOS/client && podman-compose up -d alumet-relay"
 ```
 
 ---
