@@ -143,7 +143,7 @@ See ADR-011 in `decisions.md` for full decision history.
 **Software (containerised under Podman, see `server/compose.yaml`):**
 
 - `influxdb`: InfluxDB 2.7, bucket `alumet_energy`, org `pludos`, default
-  admin token `pludos-secret-token` (rotate before any non-local deployment).
+  admin token `pludos-dev-token` (rotate before any non-local deployment).
 - `grafana`: visualisation, default admin/admin.
 - The Flower `ServerApp` (`server.py`) is a separate process started via
   `flwr run .` from the project root.

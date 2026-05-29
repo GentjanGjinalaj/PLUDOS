@@ -200,7 +200,7 @@ TS_AUTHKEY=tskey-auth-xxxxxxxxxxxx
 
 # InfluxDB — must match the server's InfluxDB instance (Phase 3)
 INFLUXDB_URL=http://<server-tailscale-ip>:8086
-INFLUXDB_TOKEN=pludos-secret-token
+INFLUXDB_TOKEN=pludos-dev-token
 INFLUXDB_ORG=pludos
 INFLUXDB_BUCKET=alumet_energy
 ```

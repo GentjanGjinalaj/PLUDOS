@@ -266,7 +266,7 @@ class AlumetProfiler:
         self._round_int: int = int(round_num) if str(round_num).isdigit() else 0
 
         influx_url    = os.getenv("INFLUXDB_URL",    "http://127.0.0.1:8086")
-        influx_token  = os.getenv("INFLUXDB_TOKEN",  "pludos-secret-token")
+        influx_token  = os.getenv("INFLUXDB_TOKEN",  "pludos-dev-token")
         influx_org    = os.getenv("INFLUXDB_ORG",    "pludos")
         influx_bucket = os.getenv("INFLUXDB_BUCKET", "alumet_energy")
 
@@ -465,7 +465,7 @@ def _write_gw_status_heartbeat(last_round: int | None = None) -> None:
         logger.warning("[GW_STATUS] buffer scan failed: %s", exc)
 
     influx_url    = os.getenv("INFLUXDB_URL",    "http://127.0.0.1:8086")
-    influx_token  = os.getenv("INFLUXDB_TOKEN",  "pludos-secret-token")
+    influx_token  = os.getenv("INFLUXDB_TOKEN",  "pludos-dev-token")
     influx_org    = os.getenv("INFLUXDB_ORG",    "pludos")
     influx_bucket = os.getenv("INFLUXDB_BUCKET", "alumet_energy")
 
@@ -504,7 +504,7 @@ def _write_train_metrics(
 ) -> None:
     # Write per-round XGBoost metrics for T8.1 convergence study. Best-effort.
     influx_url   = os.getenv("INFLUXDB_URL",    "http://127.0.0.1:8086")
-    influx_token = os.getenv("INFLUXDB_TOKEN",  "pludos-secret-token")
+    influx_token = os.getenv("INFLUXDB_TOKEN",  "pludos-dev-token")
     influx_org   = os.getenv("INFLUXDB_ORG",    "pludos")
     influx_bucket= os.getenv("INFLUXDB_BUCKET", "alumet_energy")
     try:

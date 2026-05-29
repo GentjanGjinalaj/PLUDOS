@@ -19,7 +19,7 @@ import sys
 from influxdb_client import InfluxDBClient  # type: ignore
 
 INFLUXDB_URL    = os.getenv("INFLUXDB_URL",    "http://127.0.0.1:8086")
-INFLUXDB_TOKEN  = os.getenv("INFLUXDB_TOKEN",  "pludos-secret-token")
+INFLUXDB_TOKEN  = os.getenv("INFLUXDB_TOKEN",  "pludos-dev-token")
 INFLUXDB_ORG    = os.getenv("INFLUXDB_ORG",    "pludos")
 INFLUXDB_BUCKET = os.getenv("INFLUXDB_BUCKET", "alumet_energy")
 

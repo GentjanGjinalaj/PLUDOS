@@ -126,7 +126,7 @@ services:
       - DOCKER_INFLUXDB_INIT_PASSWORD=pludos-local
       - DOCKER_INFLUXDB_INIT_ORG=${INFLUXDB_ORG:-pludos}
       - DOCKER_INFLUXDB_INIT_BUCKET=${INFLUXDB_BUCKET:-alumet_energy}
-      - DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=${INFLUXDB_TOKEN:-pludos-secret-token}
+      - DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=${INFLUXDB_TOKEN:-pludos-dev-token}
       - DOCKER_INFLUXDB_INIT_RETENTION=168h   # 7 days
     volumes:
       - influxdb_local_data:/var/lib/influxdb2

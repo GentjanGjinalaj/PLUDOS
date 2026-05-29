@@ -56,7 +56,7 @@ def gf_get(path):
 # ── Ensure datasource token is set ──────────────────────────────────────────
 print("Patching datasource token...")
 ds_full = gf_get(f"/api/datasources/uid/{DS_UID}")
-ds_full["secureJsonData"] = {"token": "pludos-secret-token"}
+ds_full["secureJsonData"] = {"token": "pludos-dev-token"}
 ds_full.pop("secureJsonFields", None)
 resp, code = gf_put(f"/api/datasources/{ds_full['id']}", ds_full)
 print(f"  datasource patch: HTTP {code}")
