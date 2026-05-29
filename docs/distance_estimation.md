@@ -53,7 +53,7 @@ No calibration required; the choice updates every flush buffer.
 HPF[i] = track_a[i] - mean(track_a[i-W+1 : i+1])
 ```
 
-Window `W = DISTANCE_HPF_WINDOW` (default 10 packets ≈ 1 s at 10 Hz MOVING).
+Window `W = DISTANCE_HPF_WINDOW` (default 10 packets ≈ 0.2 s at 50 Hz MOVING).
 Removes the DC offset caused by imperfect sensor mounting angle. Without this,
 a 1° tilt at ±2 g full-scale ≈ 0.034 g DC → 0.33 m/s² → unbounded velocity growth.
 

@@ -361,7 +361,7 @@ production-blocking bugs:
 struct — only the rate differs:
 
 - `STATE_IDLE` — **0.1 Hz** transmit (10 Hz internal sampling for FSM responsiveness)
-- `STATE_MOVING` — **10 Hz** transmit (every sample is sent)
+- `STATE_MOVING` — **50 Hz** transmit (every sample is sent; WiFi-capped)
 
 The packet carries: shuttle_id (uint8), sequence_id (uint16), tick_ms
 (uint32), state (uint8, 0/1), accel xyz, temp_c, humidity_pct. The v2
@@ -437,7 +437,8 @@ packet to 40 bytes — a 43% size increase.
 1. **int16 scaled integers** replace float32 for all sensor fields:
    accel × 100 (g), gyro × 100 (dps), temp × 100 (°C), humidity × 10 (%RH).
    Resolution: 0.01 g accel, 0.01 dps gyro — both exceed the ISM330DHCX
-   noise floor at 26 Hz ODR (noise density ~120 μg/√Hz).
+   noise floor (noise density ~120 μg/√Hz; ~0.0004 g RMS over the LPF2's
+   ~10 Hz bandwidth at 104 Hz ODR).
 2. **Gyroscope fields added:** `gyro_x`, `gyro_y`, `gyro_z` (ISM330DHCX,
    ±250 dps FS, 8.75 mdps/LSB per DS13281 Table 3). Three fields × 2 bytes = +6 B.
 3. **Packet shrinks 28 → 24 bytes:** float32 → int16 saves 2 bytes per field
@@ -447,8 +448,8 @@ packet to 40 bytes — a 43% size increase.
 **Sentinel:** `0x7FFF` (32767) in any `int16_t` field = sensor unavailable;
 gateway converts to NaN.
 
-**Rationale:** More information at smaller packet size. At 10 Hz MOVING:
-24 B × 10 Hz = 240 B/s per shuttle (vs 28 B × 50 Hz = 1.4 KB/s in v1).
+**Rationale:** More information at smaller packet size. At 50 Hz MOVING:
+24 B × 50 Hz = 1.2 KB/s per shuttle (vs 28 B × 50 Hz = 1.4 KB/s in v1).
 
 **Implementation files:**
 - `STM_Shuttles/PLUDOS_Edge_Node/Core/Src/main.c` — `PludosTelemetry_t`
@@ -484,7 +485,7 @@ one axis; `state == IDLE` is an exact physical stop.
    `var(accel_y)` on MOVING packets. The rail-aligned axis has far higher variance
    than the perpendicular arm-deployment axis. No calibration required.
 2. **HPF the track axis** via running mean subtraction over `DISTANCE_HPF_WINDOW`
-   packets (default 20 ≈ 2 s at 10 Hz), removing mounting-tilt DC offset (~0.22 Hz).
+   packets (default 20 ≈ 0.4 s at 50 Hz), removing mounting-tilt DC offset.
 3. **Integrate signed HPF acceleration.** At `state == IDLE`, reset `vel = 0`.
    Since the shuttle is physically stopped on the rail at IDLE, this ZUPT reset
    is exact — drift is bounded to the duration of each MOVING segment.

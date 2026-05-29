@@ -123,7 +123,7 @@ static uint32_t continuous_movement_start_tick = 0U; /* tick when the current dw
 #define NO_MOVEMENT_TIMEOUT_MS  20000U   /* no above-threshold sample for this long → STATE_IDLE */
 
 #define SAMPLE_PERIOD_IDLE_MS   100U     /* 10 Hz internal sampling in IDLE (FSM responsiveness) */
-#define SAMPLE_PERIOD_MOVING_MS 100U     /* 10 Hz sampling + transmit in MOVING */
+#define SAMPLE_PERIOD_MOVING_MS 20U      /* 50 Hz sampling + transmit in MOVING (UDP send self-throttles if WiFi can't keep up) */
 #define TX_PERIOD_IDLE_MS       10000U   /* 0.1 Hz UDP transmit in IDLE — every 100th sample */
 #define ENV_READ_PERIOD_MS      500U     /* 2 Hz HTS221 refresh; cached for every TX */
 
@@ -132,6 +132,7 @@ static uint32_t continuous_movement_start_tick = 0U; /* tick when the current dw
 #define ISM330_ADDR        0xD6
 #define CTRL1_XL           0x10  /* accel control: ODR + FS */
 #define CTRL2_G            0x11  /* gyro control:  ODR + FS */
+#define CTRL8_XL           0x17  /* accel filter: LPF2 bandwidth (HPCF_XL) + HP-path enable */
 #define OUTX_L_A           0x28  /* accel output X low byte (6-byte burst: X, Y, Z) */
 #define OUTX_L_G           0x22  /* gyro output X low byte  (6-byte burst: X, Y, Z) */
 /* ISM330DHCX gyro sensitivity at ±250 dps FS: 8.75 mdps/LSB (DS13281 Table 3). */
@@ -631,14 +632,18 @@ int main(void)
   sprintf(uart_buf, "[SENSOR] Initializing ISM330 accelerometer...\r\n");
   HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
 
-  /* ODR=0010→26 Hz; output register polled at 10 Hz. NOTE: reading a 26 Hz stream
-     at 10 Hz with no decimation/LPF aliases 5-13 Hz content into the 0-5 Hz band —
-     setting ODR above the read rate does NOT prevent this. Proper fix (ISM330 LPF2
-     cutoff <=5 Hz, or FIFO average-decimate 26->10) is pending review item P1-A. */
-  uint8_t accel_config = 0x20;  /* CTRL1_XL: ODR=26 Hz, FS=±2g, normal mode */
+  /* Anti-alias chain for the 50 Hz MOVING read (Nyquist 25 Hz):
+     ODR=104 Hz (code 0100) with the on-chip LPF2 enabled and its cutoff set to
+     ODR/10 ≈ 10.4 Hz (CTRL8_XL HPCF_XL=001, LP path). Cutoff < Nyquist, so the
+     50 Hz stream is alias-free over the shuttle's low-frequency motion band
+     (0–10 Hz). This resolves review item P1-A for the accelerometer. Capturing
+     content above ~10 Hz would require raising ODR, the read rate, and the cutoff
+     together (and re-measuring WiFi throughput). Register values per the ST
+     ism330dhcx driver enums (ODR_XL=0100, FS_XL=00, LPF2_XL_EN bit1). */
+  uint8_t accel_config = 0x42;  /* CTRL1_XL: ODR=104 Hz, FS=±2g, LPF2_XL_EN=1 */
   if (HAL_I2C_Mem_Write(&hi2c2, ISM330_ADDR, CTRL1_XL, 1, &accel_config, 1, 100) == HAL_OK)
   {
-    sprintf(uart_buf, "[SENSOR] ISM330 accelerometer enabled (26Hz, ±2g)\r\n");
+    sprintf(uart_buf, "[SENSOR] ISM330 accelerometer enabled (104Hz, ±2g, LPF2 on)\r\n");
     HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
   }
   else
@@ -647,13 +652,20 @@ int main(void)
     HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
   }
 
+  /* CTRL8_XL: HPCF_XL=001 (LPF2 cutoff ODR/10), hp_slope_xl_en=0 → low-pass (not HP) path. */
+  uint8_t accel_filter = 0x20;
+  (void)HAL_I2C_Mem_Write(&hi2c2, ISM330_ADDR, CTRL8_XL, 1, &accel_filter, 1, 100);
+
   HAL_Delay(100);  /* allow ISM330 to stabilize */
 
-  /* Enable gyroscope: ODR matches accelerometer (26 Hz), ±250 dps FS. */
-  uint8_t gyro_config = 0x20;  /* CTRL2_G: ODR=26 Hz, FS_G=00 → ±250 dps */
+  /* Enable gyroscope: ODR matches accelerometer (104 Hz), ±250 dps FS.
+     Gyro digital LPF1 left at its CTRL6_C default; tightening it for full
+     anti-aliasing (FTYPE bandwidth table) is a follow-up — the accelerometer
+     drives the FSM, so its LPF2 is the priority here. */
+  uint8_t gyro_config = 0x40;  /* CTRL2_G: ODR=104 Hz, FS_G=00 → ±250 dps */
   if (HAL_I2C_Mem_Write(&hi2c2, ISM330_ADDR, CTRL2_G, 1, &gyro_config, 1, 100) == HAL_OK)
   {
-    sprintf(uart_buf, "[SENSOR] ISM330 gyroscope enabled (±250 dps)\r\n");
+    sprintf(uart_buf, "[SENSOR] ISM330 gyroscope enabled (104Hz, ±250 dps)\r\n");
     HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
   }
   else
@@ -1018,7 +1030,7 @@ int main(void)
 
     /* -----------------------------------------------------------------
      * PHASE 4: transmit telemetry at the state-appropriate rate
-     *   MOVING: every loop iteration  (10 Hz)
+     *   MOVING: every loop iteration  (50 Hz target, WiFi-capped)
      *   IDLE:   every TX_PERIOD_IDLE_MS (0.1 Hz)
      * --------------------------------------------------------------- */
     {

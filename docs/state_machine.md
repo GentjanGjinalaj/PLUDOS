@@ -25,16 +25,19 @@ replaced by a continuous unified UDP stream. There is no buffer.
 
 ### STATE_MOVING
 
-- **Internal sampling rate:** 10 Hz (every 100 ms, `SAMPLE_PERIOD_MOVING_MS=100`)
-- **Telemetry transmit rate:** 10 Hz — every sample is sent immediately
+- **Internal sampling rate:** 50 Hz target (every 20 ms, `SAMPLE_PERIOD_MOVING_MS=20`)
+- **Telemetry transmit rate:** 50 Hz target — every sample is sent immediately;
+  the synchronous UDP `sendto` self-throttles to the WiFi ceiling if the radio
+  can't sustain 50 Hz
 - **Entry condition:** accelerometer deviation `> 0.05 g²` continuously
   for **500 ms** (with a 300 ms debounce tolerance — see below)
 - **Actions on entry:** none beyond logging the transition; the next loop
-  iteration starts streaming at 10 Hz with `state = 1`
+  iteration starts streaming at 50 Hz with `state = 1`
 
-> **Rate history:** originally designed at 50 Hz MOVING / 1 Hz IDLE. Reduced to
-> 10 Hz / 0.1 Hz (commit 3e99444) to lower WiFi radio duty cycle and conserve
-> shuttle battery. FSM thresholds and gateway buffer limits were updated accordingly.
+> **Rate note:** MOVING runs at 50 Hz (`SAMPLE_PERIOD_MOVING_MS=20`). The ISM330
+> ODR was raised to 104 Hz with its on-chip LPF2 (cutoff ODR/10 ≈ 10.4 Hz) so the
+> 50 Hz stream is alias-free below the 25 Hz Nyquist. Whether 50 Hz is sustained
+> end-to-end depends on the (unmeasured) WiFi throughput ceiling.
 
 ---
 
@@ -83,7 +86,7 @@ loop iteration:
 
 1. Sensors are read (cached env every 500 ms; accel every iteration).
 2. FSM is updated.
-3. If a transmit is due (every 100 ms in MOVING, every 10 s in IDLE), the
+3. If a transmit is due (every 20 ms in MOVING, every 10 s in IDLE), the
    firmware calls `MX_WIFI_Socket_sendto` with the 24-byte packet and
    returns immediately.
 
@@ -149,7 +152,7 @@ longer on the wire (ADR-015 v2).
 | `MOVEMENT_DEBOUNCE_MS` | `300U` | `main.c` | Tolerance for sub-threshold dips during dwell |
 | `NO_MOVEMENT_TIMEOUT_MS` | `20000U` | `main.c` | No-above-threshold duration to exit MOVING |
 | `SAMPLE_PERIOD_IDLE_MS` | `100U` | `main.c` | 10 Hz internal sampling in IDLE |
-| `SAMPLE_PERIOD_MOVING_MS` | `100U` | `main.c` | 10 Hz sampling + transmit in MOVING |
+| `SAMPLE_PERIOD_MOVING_MS` | `20U` | `main.c` | 50 Hz sampling + transmit in MOVING |
 | `TX_PERIOD_IDLE_MS` | `10000U` | `main.c` | 0.1 Hz transmit rate in IDLE |
 | `ENV_READ_PERIOD_MS` | `500U` | `main.c` | 2 Hz env-sensor cache refresh |
 | `TELEMETRY_PORT` | `5683U` | `main.c` | Single unified UDP port |

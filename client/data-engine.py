@@ -71,12 +71,12 @@ TELEMETRY_PORT  = int(os.getenv("TELEMETRY_PORT", os.getenv("COAP_PORT", "5683")
 # Buffer limits — hard-coded defaults vs RAM-percentage auto mode.
 #
 # Default strategy (SHUTTLE_LIMIT_MODE unset or "fixed"):
-#   Hard packet counts sized for 10 Hz MOVING TX rate on the Jetson 8 GB.
+#   Hard packet counts sized for 50 Hz MOVING TX rate on the Jetson 8 GB.
 #   At ~300 B Python dict overhead per packet:
-#     SHUTTLE_SOFT_LIMIT=3000  → ~5 min of MOVING before proactive flush (≈0.9 MB RAM)
-#     SHUTTLE_HARD_LIMIT=4500  → ~7.5 min before emergency flush          (≈1.4 MB RAM)
+#     SHUTTLE_SOFT_LIMIT=3000  → ~1 min of MOVING before proactive flush (≈0.9 MB RAM)
+#     SHUTTLE_HARD_LIMIT=4500  → ~1.5 min before emergency flush          (≈1.4 MB RAM)
 #     GATEWAY_HARD_LIMIT=100000→ safety ceiling across all shuttles       (≈30 MB RAM)
-#   These defaults produce at most one Parquet write per 5-minute mission
+#   These defaults produce at most one Parquet write per ~1-minute mission
 #   segment — far fewer eMMC writes than the old 1000/1500 limits.
 #
 # Auto strategy (SHUTTLE_LIMIT_MODE=auto):

@@ -51,7 +51,7 @@ PLUDOS (**P**ower-aware **L**ightweight **U**DP **D**ata **O**rchestration **S**
 - **Hardware:** STM32U585AII6Q on B-U585I-IOT02A (Cortex-M33 @ 160 MHz, TrustZone non-secure)
 - **Runtime:** bare-metal C, HAL drivers, **no RTOS**
 - **Sensor pipeline:** ISM330DHCX 6-axis IMU (accel + gyro), HTS221 temperature/humidity, LPS22HH pressure
-- **State machine:** IDLE (0.1 Hz TX / 10 Hz internal sampling) / MOVING (10 Hz TX) FSM, entered on a vibration threshold
+- **State machine:** IDLE (0.1 Hz TX / 10 Hz internal sampling) / MOVING (50 Hz TX) FSM, entered on a vibration threshold
 - **Transport:** 24-byte `PludosTelemetry` raw UDP to port 5683, fire-and-forget (ADR-015 / ADR-016)
 - **Zero-touch provisioning:** auto-discovers the gateway IP via a UDP beacon on port 5000
 

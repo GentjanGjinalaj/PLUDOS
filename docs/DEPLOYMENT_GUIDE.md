@@ -885,7 +885,7 @@ Rebuild and reflash after changes:
 #define MOVEMENT_DEBOUNCE_MS    300U    // ms — tolerance for sub-threshold dips during dwell
 #define NO_MOVEMENT_TIMEOUT_MS  20000U  // ms — no-above-threshold duration to exit MOVING
 #define SAMPLE_PERIOD_IDLE_MS   100U    // 10 Hz internal sampling in IDLE
-#define SAMPLE_PERIOD_MOVING_MS 100U    // 10 Hz sampling + transmit in MOVING
+#define SAMPLE_PERIOD_MOVING_MS 20U     // 50 Hz sampling + transmit in MOVING
 #define TX_PERIOD_IDLE_MS       10000U  // 0.1 Hz UDP transmit in IDLE
 #define ENV_READ_PERIOD_MS      500U    // 2 Hz HTS221 cache refresh
 ```
@@ -895,8 +895,8 @@ Rebuild and reflash after changes:
 Gateway runtime tuning — takes effect on container restart, no image rebuild:
 
 ```bash
-# Per-shuttle buffer pressure (in packets). At 10 Hz MOVING: SOFT=3000 ≈ 5 min,
-# HARD=4500 ≈ 7.5 min. Gateway-wide ceiling is a safety valve across all shuttles.
+# Per-shuttle buffer pressure (in packets). At 50 Hz MOVING: SOFT=3000 ≈ 1 min,
+# HARD=4500 ≈ 1.5 min. Gateway-wide ceiling is a safety valve across all shuttles.
 SHUTTLE_SOFT_LIMIT=3000
 SHUTTLE_HARD_LIMIT=4500
 GATEWAY_HARD_LIMIT=100000

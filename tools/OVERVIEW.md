@@ -46,7 +46,7 @@ data-engine.py (_unpack_telemetry)
 ```
 
 The script even `assert`s the packet is 24 bytes and mirrors the firmware's TX
-cadence (10 Hz MOVING, 0.1 Hz IDLE) and int16 scaling. If you change the packet
+cadence (50 Hz MOVING, 0.1 Hz IDLE) and int16 scaling. If you change the packet
 in `main.c`, you must update this mock too, or your laptop tests will silently
 diverge from real hardware. `docs/wire_protocol.md §1` is the spec all three
 follow.

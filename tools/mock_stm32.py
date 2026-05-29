@@ -65,9 +65,9 @@ _SENTINEL  = 0x7FFF
 STATE_IDLE   = 0
 STATE_MOVING = 1
 
-# TX cadence mirrors STM32 firmware (commit 3e99444): 10 Hz MOVING, 0.1 Hz IDLE.
+# TX cadence mirrors STM32 firmware: 50 Hz MOVING, 0.1 Hz IDLE.
 TX_PERIOD_IDLE_S   = 10.0   # 0.1 Hz in IDLE   (TX_PERIOD_IDLE_MS=10000)
-TX_PERIOD_MOVING_S = 0.10   # 10 Hz in MOVING  (SAMPLE_PERIOD_MOVING_MS=100)
+TX_PERIOD_MOVING_S = 0.02   # 50 Hz in MOVING  (SAMPLE_PERIOD_MOVING_MS=20)
 
 
 # ---------------------------------------------------------------------------
@@ -151,7 +151,7 @@ async def simulate_shuttle(shuttle_id: int) -> None:
                               seq_ref, boot_ms,
                               ax_range=(-0.02, 0.02), az_dc=1.0, az_jitter=0.02)
 
-            logger.info("[shuttle-%d] cycle %d: MOVING %.0fs (10 Hz)", shuttle_id, cycle, MISSION_S)
+            logger.info("[shuttle-%d] cycle %d: MOVING %.0fs (50 Hz)", shuttle_id, cycle, MISSION_S)
             await _send_phase(sock, shuttle_id, STATE_MOVING, MISSION_S,
                               seq_ref, boot_ms,
                               ax_range=(-0.20, 0.20), az_dc=1.0, az_jitter=0.15)
@@ -172,7 +172,7 @@ async def simulate_shuttle(shuttle_id: int) -> None:
 async def main() -> None:
     logger.info(
         "Mock STM32 (ADR-016 v3) | target=%s:%d | %d shuttle(s) starting at ID %d "
-        "| mission=%.0fs idle=%.0fs post-idle=%.0fs | 10Hz MOVING 0.1Hz IDLE",
+        "| mission=%.0fs idle=%.0fs post-idle=%.0fs | 50Hz MOVING 0.1Hz IDLE",
         TELEMETRY_HOST, TELEMETRY_PORT, MOCK_SHUTTLES, FIRST_SHUTTLE_ID,
         MISSION_S, IDLE_S, POST_MISSION_IDLE_S,
     )

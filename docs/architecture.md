@@ -20,11 +20,12 @@ measurement on the Jetson is tracked in ADR-011 (P2-2).
 
 **Firmware responsibilities (ADR-015 v2):**
 
-- Sample the accelerometer at 10 Hz (both states), run the idle/moving state
-  machine, and stream telemetry directly. No SRAM buffer — every sample
-  becomes a UDP packet at the state-appropriate TX rate (10 Hz MOVING,
-  0.1 Hz IDLE — every 100th sample). Commit 3e99444 reduced rates from the
-  original 50 Hz / 1 Hz to lower radio duty cycle.
+- Sample the accelerometer (104 Hz ODR, on-chip LPF2 cutoff ≈10.4 Hz; polled at
+  50 Hz in MOVING, 10 Hz in IDLE for FSM responsiveness), run the idle/moving
+  state machine, and stream telemetry directly. No SRAM buffer — every sample
+  becomes a UDP packet at the state-appropriate TX rate (50 Hz MOVING,
+  0.1 Hz IDLE — every 100th sample). The synchronous UDP send self-throttles to
+  the WiFi ceiling if the radio can't sustain 50 Hz.
 - Unified telemetry (accel xyz, gyro xyz, temp, humidity, state) goes out as a
   single 24-byte `PludosTelemetry` v3 raw UDP datagram to
   `udp://<gateway>:5683`. No CoAP, no second port, no ACK, no retry.
@@ -75,9 +76,9 @@ designed for ≥100 shuttles per gateway.
 **Buffering and flush policy (data-engine):**
 
 - Per-shuttle soft limit: `SHUTTLE_SOFT_LIMIT` (default 3000 packets,
-  ≈5 min of 10 Hz MOVING) — proactive flush, mission keeps buffering.
+  ≈1 min of 50 Hz MOVING) — proactive flush, mission keeps buffering.
 - Per-shuttle hard limit: `SHUTTLE_HARD_LIMIT` (default 4500 packets,
-  ≈7.5 min) — emergency mid-mission flush.
+  ≈1.5 min) — emergency mid-mission flush.
 - Gateway-wide ceiling: `GATEWAY_HARD_LIMIT` (default 100 000 packets
   across all shuttles combined) — last-resort safety valve.
 - Mission-end flush: detected on the gateway. After a run of state
@@ -167,8 +168,8 @@ See ADR-011 in `decisions.md` for full decision history.
    transitions to MOVING when accelerometer deviation > 0.05 g² for
    500 ms (with 300 ms debounce).
 2. In MOVING the STM32 emits one 24-byte UDP packet per accelerometer
-   sample to `udp://<gateway>:5683` at 10 Hz, fire-and-forget. No buffer,
-   no ACK.
+   sample to `udp://<gateway>:5683` at 50 Hz (WiFi-capped), fire-and-forget.
+   No buffer, no ACK.
 3. Gateway parses each packet, derives `timestamp_ms = tick_ms + ntp_offset`,
    tracks per-shuttle uint16 sequence wraps, and appends to the per-shuttle
    in-memory list.

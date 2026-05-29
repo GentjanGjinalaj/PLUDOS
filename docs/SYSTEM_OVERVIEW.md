@@ -62,7 +62,7 @@ TIER 1 — EDGE (per shuttle)            TIER 2 — GATEWAY (per minifloor)     
 │  EMW3080 Wi-Fi (SPI2)      │ ───────▶│  beacon       :5000 broadcast     │  │  alumet (RAPL)   :50051/:9094│
 │                            │  :5683  │                                   │  │  fl-trigger → flwr run .     │
 │  FSM: IDLE 0.1 Hz TX       │         │  ai-worker  Flower XGBoost client │  │  server.py  ServerApp        │
-│       MOVING 10 Hz TX      │◀────────│   AlumetProfiler 10 Hz scrape     │  │   XGBoostStrategy tree-union │
+│       MOVING 50 Hz TX      │◀────────│   AlumetProfiler 10 Hz scrape     │  │   XGBoostStrategy tree-union │
 │  (beacon listen :5000)     │ beacon  │  alumet-relay INA3221→:9095 Prom  │  │                              │
 └───────────────────────────┘         │  tailscale (vpn profile)          │  └──────────────────────────────┘
                                        └───────────────────────────────────┘
@@ -136,18 +136,19 @@ foundation; everything else is computed from them on the gateway.
 
 | Signal | Sensor / origin | Internal rate | TX rate (over UDP) | Purpose |
 |---|---|---|---|---|
-| `accel_x/y/z` | ISM330DHCX accel, ±2 g | ODR 26 Hz (`main.c:636`, value 0x20); polled 10 Hz | 10 Hz MOVING / 0.1 Hz IDLE | Ride-roughness vibration + impacts; FSM trigger |
-| `gyro_x/y/z` | ISM330DHCX gyro, ±250 dps | ODR 26 Hz (`main.c:651`); polled 10 Hz | same | Torsional vibration (`gyro_x/y`), yaw/turns (`gyro_z`) |
+| `accel_x/y/z` | ISM330DHCX accel, ±2 g | ODR 104 Hz, LPF2 cutoff ≈10.4 Hz (`main.c` CTRL1_XL=0x42, CTRL8_XL=0x20); polled 50 Hz | 50 Hz MOVING / 0.1 Hz IDLE | Ride-roughness vibration + impacts; FSM trigger |
+| `gyro_x/y/z` | ISM330DHCX gyro, ±250 dps | ODR 104 Hz (`main.c` CTRL2_G=0x40); polled 50 Hz | same | Torsional vibration (`gyro_x/y`), yaw/turns (`gyro_z`) |
 | `temp_c` | HTS221 | cached 2 Hz (`ENV_READ_PERIOD_MS=500U`, `main.c:128`) | stamped on every packet | Ambient / motor-heat proxy |
 | `humidity_pct` | HTS221 | cached 2 Hz | every packet | Environmental envelope |
-| `state` | STM32 FSM | evaluated 10 Hz | every packet | Mission segmentation, ZUPT gating |
+| `state` | STM32 FSM | evaluated 50 Hz (MOVING) | every packet | Mission segmentation, ZUPT gating |
 | `seq`, `tick_ms` | STM32 | per packet | every packet | Sort key + NTP anchor |
 | `pressure_hpa` | LPS22HH | local read | **not transmitted** | UART debug only (ADR-015) |
 
-**Honest capture framing.** ODR is 26 Hz but the gateway only sees packets at
-10 Hz MOVING, so the **observable Nyquist is 5 Hz**. PLUDOS captures low-frequency
-ride-roughness and impact events — **not** bearing spectral signatures (50–500 Hz,
-fully aliased out). The thesis claim is "anomaly detection from ride-quality
+**Honest capture framing.** ODR is 104 Hz with an on-chip LPF2 cutoff ≈10.4 Hz,
+and the gateway sees packets at 50 Hz MOVING, so the **observable band is ~0–10 Hz**
+(25 Hz Nyquist, but LPF2 is the binding limit) and alias-free. PLUDOS captures
+low-frequency ride-roughness and impact events — **not** bearing spectral signatures
+(50–500 Hz, filtered out). The thesis claim is "anomaly detection from ride-quality
 degradation", not "bearing frequency analysis".
 
 The 24-byte wire struct (`<BHIBhhhhhhhh`, `data-engine.py:242`) uses int16 scaled
@@ -199,8 +200,8 @@ present any as measured ground truth.
    (`data-engine.py` `BEACON_PORT=5000`, `:148`).
 2. **FSM gates the TX rate.** IDLE samples 10 Hz internally, transmits 0.1 Hz;
    crossing `MOVEMENT_THRESHOLD_G2=0.05f` (`main.c:120`) continuously for 500 ms
-   (300 ms debounce) → MOVING, transmits 10 Hz. Exit MOVING after 20 s with no
-   above-threshold sample (`docs/state_machine.md`).
+   (300 ms debounce) → MOVING, transmits 50 Hz (WiFi-capped). Exit MOVING after
+   20 s with no above-threshold sample (`docs/state_machine.md`).
 3. **Telemetry send.** Each sample → one 24-byte UDP datagram to `<gateway>:5683`,
    fire-and-forget, no ACK/retry (`docs/wire_protocol.md` §No reliability layer).
 4. **Gateway ingest.** `TelemetryProtocol.datagram_received` (`data-engine.py:668`)

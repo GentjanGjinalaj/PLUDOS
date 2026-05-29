@@ -82,7 +82,7 @@ def _derive_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     df["accel_mag"] = (df["accel_x"]**2 + df["accel_y"]**2 + df["accel_z"]**2).pow(0.5)
     df["gyro_mag"]  = (df["gyro_x"]**2  + df["gyro_y"]**2  + df["gyro_z"]**2).pow(0.5)
-    # 1-second rolling std (10 packets at 10 Hz MOVING) — surface/vibration proxy.
+    # Rolling std over 10 packets (≈0.2 s at 50 Hz MOVING) — surface/vibration proxy.
     # min_periods=2 (std needs ≥2 points); fill the leading NaN with 0.
     df["rolling_accel_std_10"] = (
         df["accel_mag"].rolling(10, min_periods=2).std().fillna(0.0)

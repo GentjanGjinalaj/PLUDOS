@@ -38,8 +38,8 @@ the bug that caused one shuttle's file to overwrite the other's.
 |---|---|---|
 | Mission end | shuttle stays IDLE for ≥ 30 s after any MOVING run (`MISSION_END_IDLE_S`) | Yes |
 | Time cap | shuttle buffer open longer than `BUFFER_MAX_AGE_S` (default 300 s) wall-clock | Yes |
-| Soft limit | shuttle buffer reaches 3 000 packets (≈ 5 min at 10 Hz MOVING) | No — mission continues |
-| Hard limit | shuttle buffer reaches 4 500 packets (≈ 7.5 min at 10 Hz MOVING) | No — mission continues |
+| Soft limit | shuttle buffer reaches 3 000 packets (≈ 1 min at 50 Hz MOVING) | No — mission continues |
+| Hard limit | shuttle buffer reaches 4 500 packets (≈ 1.5 min at 50 Hz MOVING) | No — mission continues |
 | Gateway ceiling | all-shuttle total reaches 100 000 packets | No |
 | Shutdown | `podman stop` (SIGTERM) — **not** caught; in-flight buffer is lost | — |
 
@@ -64,7 +64,7 @@ mission in sequence order.
 
 | Column | Type | Unit | Description |
 |---|---|---|---|
-| `state` | int8 | — | `0` = IDLE (shuttle stationary, 0.1 Hz TX), `1` = MOVING (shuttle in transit, 10 Hz TX). Derived from the STM32 FSM — see `docs/state_machine.md`. |
+| `state` | int8 | — | `0` = IDLE (shuttle stationary, 0.1 Hz TX), `1` = MOVING (shuttle in transit, 50 Hz TX). Derived from the STM32 FSM — see `docs/state_machine.md`. |
 
 ### Accelerometer (ISM330DHCX)
 
@@ -116,7 +116,7 @@ and XGBoost use them.
 |---|---|
 | `accel_mag` | √(accel_x² + accel_y² + accel_z²). Total acceleration magnitude; ≈ 1.0 g at rest. |
 | `gyro_mag` | √(gyro_x² + gyro_y² + gyro_z²). Aggregate rotation magnitude. |
-| `rolling_accel_std_10` | 10-packet rolling std of `accel_mag` (≈ 1 s at 10 Hz MOVING), `min_periods=2`, leading NaN filled 0. Sustained-vibration / bearing-wear proxy. |
+| `rolling_accel_std_10` | 10-packet rolling std of `accel_mag` (≈ 0.2 s at 50 Hz MOVING), `min_periods=2`, leading NaN filled 0. Sustained-vibration / bearing-wear proxy. |
 
 ---
 

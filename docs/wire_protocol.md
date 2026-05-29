@@ -58,11 +58,14 @@ val / 10.0   # humidity (%RH)
 | State | Sampling rate (internal) | Transmit rate (over UDP) |
 |---|---|---|
 | `STATE_IDLE` (state=0) | 10 Hz | **0.1 Hz** (every 100th sample, `TX_PERIOD_IDLE_MS=10000`) |
-| `STATE_MOVING` (state=1) | 10 Hz | **10 Hz** (every sample, `SAMPLE_PERIOD_MOVING_MS=100`) |
+| `STATE_MOVING` (state=1) | 50 Hz target | **50 Hz target** (every sample, `SAMPLE_PERIOD_MOVING_MS=20`) |
 
-> **Note (commit 3e99444):** TX rates were reduced from the original design (50 Hz MOVING / 1 Hz IDLE)
-> to conserve WiFi bandwidth and radio duty cycle. At 10 Hz MOVING, bandwidth per shuttle is
-> 10 × 24 B = 240 B/s. The gateway buffer limits are sized accordingly.
+> **Note:** MOVING TX rate raised to 50 Hz (`SAMPLE_PERIOD_MOVING_MS=20`). Each
+> `sendto` is synchronous, so the loop self-throttles to the WiFi ceiling if the
+> radio can't sustain 50 Hz — the actual rate is whatever the link allows up to
+> 50 Hz. At 50 Hz, bandwidth per shuttle is 50 × 24 B = 1200 B/s. The on-chip
+> ISM330 LPF2 (cutoff ODR/10 ≈ 10.4 Hz) band-limits the signal below the 25 Hz
+> Nyquist of the 50 Hz stream — alias-free over the 0–10 Hz motion band.
 
 ### Field notes
 
@@ -75,8 +78,9 @@ val / 10.0   # humidity (%RH)
   packets (default 100). Converted to UTC `pd.Timestamp` at flush.
 - `state` — `0` (IDLE) or `1` (MOVING). Triggers mission-end Parquet flush
   after 30 s of IDLE following any MOVING run.
-- `accel_x/y/z` — ISM330DHCX accelerometer, ±2 g FS. AC content captures
-  vibration (bearing wear, motor noise) up to 13 Hz Nyquist at 26 Hz ODR.
+- `accel_x/y/z` — ISM330DHCX accelerometer, ±2 g FS, ODR 104 Hz with on-chip
+  LPF2 (cutoff ODR/10 ≈ 10.4 Hz). AC content captures shuttle motion in the
+  0–10 Hz band, alias-free at the 50 Hz read rate (25 Hz Nyquist).
   FSM uses magnitude deviation > 0.05 g² for movement detection.
 - `gyro_x/y/z` — ISM330DHCX gyroscope, ±250 dps FS, 8.75 mdps/LSB
   (DS13281 Table 3). `gyro_z` = yaw rate (turns/curves); `gyro_x/y` =

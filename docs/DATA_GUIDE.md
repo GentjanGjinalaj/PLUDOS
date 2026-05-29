@@ -17,7 +17,7 @@ collector and lets the modelling side decide what features it wants.
 ## 1. How data flows into Parquet
 
 ```
-STM32 firmware (10 Hz MOVING / 0.1 Hz IDLE)
+STM32 firmware (50 Hz MOVING / 0.1 Hz IDLE)
   │  24-byte UDP packet
   ▼
 data-engine.py  (Jetson)
@@ -41,11 +41,12 @@ by the timestamp in the filename and concatenate before analysis.
 | State    | STM32 sensor loop | TX rate to Jetson   |
 |----------|-------------------|---------------------|
 | IDLE     | 10 Hz             | **0.1 Hz** (1 pkt/10 s) |
-| MOVING   | 10 Hz             | **10 Hz** (every sample) |
+| MOVING   | 50 Hz             | **50 Hz** (every sample, WiFi-capped) |
 
-The firmware always samples at 10 Hz internally. Movement detection uses
-a 500 ms dwell window (5 consecutive above-threshold samples). The shuttle
-transitions to MOVING within 500 ms regardless of the 0.1 Hz IDLE TX rate.
+The firmware samples at 10 Hz internally in IDLE and 50 Hz in MOVING. Movement
+detection uses a 500 ms dwell window (5 consecutive above-threshold samples at
+the 10 Hz IDLE rate). The shuttle transitions to MOVING within 500 ms regardless
+of the 0.1 Hz IDLE TX rate.
 
 ---
 
@@ -63,7 +64,7 @@ that fits.
 | `shuttle_id` | int8 | — | 1-based integer. Set at firmware build time via `SHUTTLE_ID` in `wifi_credentials.h`. Maps to a human label via the `SHUTTLE_NAMES` env var (default: `shuttle-N`). |
 | `seq` | int32 | — | Monotonic packet counter. The wire value is uint16 (wraps at 65 535); the gateway unwraps it into a globally unique sort key. **Always use `seq` for ordering**, never `timestamp`. |
 | `seq_gap` | int16 | packets | `seq[i] − seq[i−1] − 1`. Zero means no loss. Non-zero values cluster at WiFi dead zones (metal shelving, elevator shaft entry). Position-correlated signal — useful ML feature for identifying where on the route a failure occurred. First row in each file is always 0. |
-| `state` | int8 | — | `0` = IDLE (stopped, 0.1 Hz TX). `1` = MOVING (in transit, 10 Hz TX). Derived from the STM32 FSM — see `docs/state_machine.md`. |
+| `state` | int8 | — | `0` = IDLE (stopped, 0.1 Hz TX). `1` = MOVING (in transit, 50 Hz TX). Derived from the STM32 FSM — see `docs/state_machine.md`. |
 
 ### 3.2 Accelerometer (ISM330DHCX, ±2 g full scale)
 
@@ -116,7 +117,7 @@ use them.
 |---|---|---|
 | `accel_mag` | √(accel_x² + accel_y² + accel_z²) | Total acceleration magnitude; ≈ 1.0 g at rest. Deviations > 1.05 g indicate dynamic motion. |
 | `gyro_mag` | √(gyro_x² + gyro_y² + gyro_z²) | Aggregate rotation rate magnitude. |
-| `rolling_accel_std_10` | 10-packet rolling std of `accel_mag` (`min_periods=2`, leading NaN → 0) | 1 s window at 10 Hz MOVING. Primary surface-roughness / bearing-wear proxy — high std = high vibration variance. |
+| `rolling_accel_std_10` | 10-packet rolling std of `accel_mag` (`min_periods=2`, leading NaN → 0) | 0.2 s window at 50 Hz MOVING. Primary surface-roughness / bearing-wear proxy — high std = high vibration variance. |
 
 Other features that earlier schema versions stored (`accel_jerk`,
 `horizontal_accel`, `tilt_angle_deg`, `gyro_jerk`, `rolling_accel_mean_10`)
@@ -187,7 +188,7 @@ print(moving[["seq", "accel_mag", "accel_z", "seq_gap"]].describe())
 ```
 seq_gap > 0             → packet dropped here (WiFi dead zone at this route position)
 state = 0               → shuttle stopped; expect 0.1 Hz data rate
-state = 1               → shuttle moving; expect 10 Hz data rate
+state = 1               → shuttle moving; expect 50 Hz data rate
 accel_z ≈ 1.0           → upright on flat surface (normal)
 accel_z ≠ 1.0           → tilt or vertical shock
 gyro_x/y AC noise       → bearing or motor fault vibration

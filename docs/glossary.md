@@ -7,7 +7,7 @@ Domain terms used throughout the PLUDOS codebase and documentation.
 | Term | Definition |
 |---|---|
 | **Shuttle** | A warehouse autonomous shuttle vehicle. Each shuttle carries one STM32U585 edge node. |
-| **Edge node** | The STM32U585 board (B-U585I-IOT02A) mounted on a shuttle. Samples the ISM330DHCX IMU at 10 Hz, runs the IDLE/MOVING state machine, and streams 24-byte `PludosTelemetry` UDP packets to the gateway at 10 Hz (MOVING) or 0.1 Hz (IDLE). |
+| **Edge node** | The STM32U585 board (B-U585I-IOT02A) mounted on a shuttle. Samples the ISM330DHCX IMU (104 Hz ODR, polled 50 Hz in MOVING / 10 Hz in IDLE), runs the IDLE/MOVING state machine, and streams 24-byte `PludosTelemetry` UDP packets to the gateway at 50 Hz (MOVING) or 0.1 Hz (IDLE). |
 | **Gateway** | A Jetson Orin Nano Super Developer Kit installed in a warehouse. Receives telemetry from multiple shuttles, buffers per-shuttle, flushes to Parquet on mission end, runs Flower FL client. One gateway per warehouse; designed to handle ≥ 100 shuttles. |
 | **Central server** | Laptop (development) or dedicated server (production). Runs Flower ServerApp, InfluxDB, and Grafana. Aggregates FL models from all gateways. |
 | **Mission** | One shuttle movement cycle: from the first STATE_MOVING packet until the gateway detects ≥ 30 s of STATE_IDLE after any MOVING run (`MISSION_END_IDLE_S`). A single Parquet file is written per completed mission. |

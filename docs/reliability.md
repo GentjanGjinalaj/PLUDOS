@@ -8,7 +8,7 @@ those marked **design** follow from the protocol choice.
 
 ## 1 — Loss points (by hop)
 
-### 1.1 STM32 → Jetson (UDP, 10 Hz MOVING)
+### 1.1 STM32 → Jetson (UDP, 50 Hz MOVING)
 
 | Source | Loss mode | Expected rate |
 |--------|-----------|---------------|
@@ -36,7 +36,7 @@ the energy/packet summary is missing from InfluxDB but the Parquet file is unaff
 |----------|-----------------|------------|
 | `data-engine` container restarts (Podman `restart: unless-stopped`) | In-memory buffer for the current MOVING mission | Buffer is lost; Parquet files already flushed survive (host bind-mount `./ram_buffer`) |
 | Jetson power loss | Same as container restart | Parquet survives on ext4 bind-mount (fsync via `os.replace`) |
-| Worst case | One entire MOVING run × 10 Hz × SHUTTLE_HARD_LIMIT packets | ≤ 4500 packets ≈ 7.5 min at 10 Hz |
+| Worst case | One entire MOVING run × 50 Hz × SHUTTLE_HARD_LIMIT packets | ≤ 4500 packets ≈ 1.5 min at 50 Hz |
 
 ### 1.4 Jetson → FL server (Flower booster bytes)
 
@@ -51,7 +51,7 @@ The Parquet data remains on disk.
 > **Target:** ≥ 99 % of MOVING packets emitted by the STM32 land in Parquet during
 > a single mission, assuming no Jetson crash during the mission.
 
-At 10 Hz MOVING with ≤ 1 % hop loss, a 5-minute mission (3000 packets) loses ~30
+At 50 Hz MOVING with ≤ 1 % hop loss, a 1-minute mission (3000 packets) loses ~30
 packets. Parquet rows for these are simply missing (observable via `seq_gap`). The
 XGBoost model trains on the surviving 2970+ rows — a 1 % gap has no detectable
 effect on anomaly labelling accuracy.
