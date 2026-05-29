@@ -37,7 +37,9 @@ MAX_PARQUET_FILES = int(os.getenv("MAX_PARQUET_FILES", "20"))
 # Anomaly model selector — controls pseudo-label generation for XGBoost training.
 ANOMALY_MODEL = os.getenv("ANOMALY_MODEL", "isolation_forest_xgb")
 
-IF_CONTAMINATION     = float(os.getenv("IF_CONTAMINATION",    "0.05"))
+# Faults on these shuttles are rare — keep the assumed anomaly fraction low so
+# IsolationForest does not over-flag normal MOVING vibration. Tune via env.
+IF_CONTAMINATION     = float(os.getenv("IF_CONTAMINATION",    "0.02"))
 IF_MIN_MOVING_SAMPLES = int(os.getenv("IF_MIN_MOVING_SAMPLES", "50"))
 
 # accel_z threshold — legacy backend only (ANOMALY_MODEL=threshold). Must match .env.example.
@@ -49,6 +51,8 @@ STATE_DIR = Path(os.getenv("STATE_DIR", "./state" if TEST_MODE else "/app/state"
 # ---------------------------------------------------------------------------
 # IsolationForest feature set — vibration and shock channels only.
 # IDLE packets are excluded from the IF fit (no bearing load at rest).
+# accel_mag, gyro_mag and rolling_accel_std_10 are derived at train time by
+# _derive_features (the gateway stores raw signal only — store-raw, derive-here).
 # ---------------------------------------------------------------------------
 
 _IF_FEATURES = [
@@ -58,6 +62,32 @@ _IF_FEATURES = [
     "gyro_mag",             # overall rotation magnitude
     "accel_z",              # vertical channel — floor surface + bearing noise
 ]
+
+# Raw columns persisted by the gateway (must match data-engine.py _PARQUET_COLS).
+_RAW_FEATURES = [
+    "accel_x", "accel_y", "accel_z",
+    "gyro_x", "gyro_y", "gyro_z",
+    "temp_c", "humidity_pct",
+    "seq_gap", "state",
+]
+
+
+def _derive_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute engineered features from raw signal at train time (store-raw pattern).
+
+    The gateway persists only raw samples; classic ML (IsolationForest, XGBoost)
+    needs hand-engineered features, so they are computed here once per FL round.
+    The CNN path consumes raw axes directly and ignores these columns.
+    Mutates and returns df with accel_mag, gyro_mag and rolling_accel_std_10 added.
+    """
+    df["accel_mag"] = (df["accel_x"]**2 + df["accel_y"]**2 + df["accel_z"]**2).pow(0.5)
+    df["gyro_mag"]  = (df["gyro_x"]**2  + df["gyro_y"]**2  + df["gyro_z"]**2).pow(0.5)
+    # 1-second rolling std (10 packets at 10 Hz MOVING) — surface/vibration proxy.
+    # min_periods=2 (std needs ≥2 points); fill the leading NaN with 0.
+    df["rolling_accel_std_10"] = (
+        df["accel_mag"].rolling(10, min_periods=2).std().fillna(0.0)
+    )
+    return df
 
 
 # ---------------------------------------------------------------------------
@@ -93,50 +123,21 @@ def load_buffered_data() -> tuple[np.ndarray, np.ndarray, str]:
         len(df), len(recent), recent[0], recent[-1],
     )
 
-    # Backward-compatible backfill for columns added in schema upgrades.
-    _backfill_f16 = {
-        "gyro_x": 0, "gyro_y": 0, "gyro_z": 0, "gyro_mag": 0,
-        "accel_jerk": 0,
-        "horizontal_accel": 0,
-        "tilt_angle_deg":   0,
-        "gyro_jerk":        0,
-        "rolling_accel_mean_10": 0,
-        "rolling_accel_std_10":  0,
-    }
-    for col, val in _backfill_f16.items():
+    # Backfill any missing raw column with NaN so old/partial Parquet files still load.
+    for col in _RAW_FEATURES:
         if col not in df.columns:
-            df[col] = np.float16(val)
-    if "accel_mag" not in df.columns:
-        df["accel_mag"] = (df["accel_x"]**2 + df["accel_y"]**2 + df["accel_z"]**2).pow(0.5)
-    if "seq_gap" not in df.columns:
-        df["seq_gap"] = np.int16(0)
-    if "energy_j" not in df.columns:
-        df["energy_j"] = np.float32(0)
-    if "mission_elapsed_s" not in df.columns:
-        df["mission_elapsed_s"] = np.float32(0)
-    for col in ("moving_run_id", "pause_count", "is_long_pause"):
-        if col not in df.columns:
-            df[col] = np.int8(0)
-    for col in ("pause_duration_s", "moving_run_dur_s"):
-        if col not in df.columns:
-            df[col] = np.float32(0)
-    if "distance_m_cum" not in df.columns:
-        df["distance_m_cum"] = np.float32(0)
+            df[col] = np.nan
 
-    # Column names must stay in sync with data-engine.py _PARQUET_COLS.
-    feature_cols = [
-        "accel_x", "accel_y", "accel_z", "accel_mag",
-        "accel_jerk", "horizontal_accel", "tilt_angle_deg",
-        "gyro_x", "gyro_y", "gyro_z", "gyro_mag", "gyro_jerk",
-        "rolling_accel_mean_10", "rolling_accel_std_10",
-        "seq_gap",
-        "energy_j",
-        "mission_elapsed_s",
-        "distance_m_cum",
-        "moving_run_id", "pause_duration_s", "moving_run_dur_s",
-        "pause_count", "is_long_pause",
-        "state",
-    ]
+    # Sort by (shuttle_id, seq) so the rolling-window derivation is time-ordered.
+    if "shuttle_id" in df.columns and "seq" in df.columns:
+        df = df.sort_values(["shuttle_id", "seq"]).reset_index(drop=True)
+
+    # store-raw, derive-at-train-time: build engineered features from raw signal.
+    df = _derive_features(df)
+
+    # Feature matrix = raw signal + train-time-derived features. The CNN labeller
+    # reads the raw axes directly; IsolationForest/XGBoost use the derived columns.
+    feature_cols = _RAW_FEATURES + ["accel_mag", "gyro_mag", "rolling_accel_std_10"]
     df_clean = df[feature_cols].dropna()
     X_train  = df_clean.values
 

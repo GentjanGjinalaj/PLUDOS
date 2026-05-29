@@ -130,8 +130,9 @@ Grafana queries span devices with a single `filter`.
   - `energy_j` — cumulative joules integrated as `power × Δt` since round start
 - **Precision:** nanosecond timestamps, 10 Hz sample rate during training
 
-Also written by `AlumetProfiler`: `fl_phases` (per-phase summary: load/train/round_total) and
-`stm_mission` (per-shuttle mission energy). See `docs/ANALYTICS.md §3` for full schemas.
+Also written: `fl_phases` (per-phase summary: load/train/round_total, by `AlumetProfiler`) and
+`stm_mission` (per-shuttle mission summary: `packets`/`duration_ms`, by the data-engine).
+See `docs/ANALYTICS.md §3` for full schemas.
 
 **Status (ADR-011):** Phase 1 done — `tegrastats` on Jetson, Intel RAPL on server.
 Phase 2 scaffolded — Alumet relay sidecar built, relay flags confirmed, hardware build pending.

@@ -56,7 +56,7 @@ def gf_get(path):
 # ── Ensure datasource token is set ──────────────────────────────────────────
 print("Patching datasource token...")
 ds_full = gf_get(f"/api/datasources/uid/{DS_UID}")
-ds_full["secureJsonData"] = {"token": "pludos-dev-token"}
+ds_full["secureJsonData"] = {"token": "pludos-secret-token"}
 ds_full.pop("secureJsonFields", None)
 resp, code = gf_put(f"/api/datasources/{ds_full['id']}", ds_full)
 print(f"  datasource patch: HTTP {code}")
@@ -145,7 +145,7 @@ stat_specs = [
      [{"value": 0, "color": "dark-blue"}, {"value": 0.05, "color": "green"}, {"value": 9, "color": "dark-green"}],
      4, 12),
     ("Missions — Last 24 h",
-     [raw_q(f"""from(bucket:"{BUCKET}") |> range(start: -24h) |> filter(fn: (r) => r._measurement == "stm_mission" and r._field == "energy_j") |> count() |> yield(name: "A")""")],
+     [raw_q(f"""from(bucket:"{BUCKET}") |> range(start: -24h) |> filter(fn: (r) => r._measurement == "stm_mission" and r._field == "packets") |> count() |> yield(name: "A")""")],
      "short", "purple", 4, 16),
     ("Jetson Board Power (~W)",
      [raw_q(f"""from(bucket:"{BUCKET}") |> range(start: -2m) |> filter(fn: (r) => r._measurement == "input_current" and r._field == "value") |> last() |> map(fn: (r) => ({{r with _value: float(v: r._value) * 5.0 / 1000.0}})) |> yield(name: "A")""")],
@@ -184,14 +184,16 @@ for title, targets, unit, color_or_thresh, w, x in stat_specs:
 y += 4
 
 # ═══════════════════════════════════════════════════════════════
-# ROW 1 — Motion: accel magnitude + state timeline
+# ROW 1 — Motion: raw accel XYZ + state timeline
+# (raw-only collection: magnitude / tilt / horizontal are no longer stored —
+#  derive them at analysis time from the raw axes if needed)
 # ═══════════════════════════════════════════════════════════════
 panels.append(row("📡 Shuttle Motion", y)); y += 1
 
-panels.append(new_panel("timeseries", "Acceleration Magnitude (g) — both shuttles",
-    [ts_q("accel_mag")],
+panels.append(new_panel("timeseries", "Acceleration X / Y / Z (g) — both shuttles",
+    [ts_q("accel_x", ref="A"), ts_q("accel_y", ref="B"), ts_q("accel_z", ref="C")],
     {"h": 8, "w": 16, "x": 0, "y": y},
-    fieldConfig=ts_defaults("short", lw=2, fill=5)))
+    fieldConfig=ts_defaults("short", lw=1, fill=0)))
 
 panels.append(new_panel("timeseries", "State (0 = IDLE · 1 = MOVING)",
     [ts_q("state", agg="last")],
@@ -211,24 +213,7 @@ panels.append(new_panel("timeseries", "State (0 = IDLE · 1 = MOVING)",
 y += 8
 
 # ═══════════════════════════════════════════════════════════════
-# ROW 2 — Accel XYZ + Gyro
-# ═══════════════════════════════════════════════════════════════
-panels.append(row("🔩 Detailed Kinematics", y)); y += 1
-
-panels.append(new_panel("timeseries", "Acceleration X / Y / Z (g)",
-    [ts_q("accel_x", ref="A"), ts_q("accel_y", ref="B"), ts_q("accel_z", ref="C")],
-    {"h": 8, "w": 12, "x": 0, "y": y},
-    fieldConfig=ts_defaults("short", lw=1, fill=0)))
-
-panels.append(new_panel("timeseries", "Gyroscope Magnitude (dps)",
-    [ts_q("gyro_mag")],
-    {"h": 8, "w": 12, "x": 12, "y": y},
-    fieldConfig=ts_defaults("angv", lw=2, fill=5)))
-
-y += 8
-
-# ═══════════════════════════════════════════════════════════════
-# ROW 3 — Gyro XYZ
+# ROW 3 — Gyro XYZ (raw)
 # ═══════════════════════════════════════════════════════════════
 panels.append(row("🔄 Gyroscope Components", y)); y += 1
 
@@ -236,23 +221,6 @@ panels.append(new_panel("timeseries", "Gyroscope X / Y / Z (dps)",
     [ts_q("gyro_x", ref="A"), ts_q("gyro_y", ref="B"), ts_q("gyro_z", ref="C")],
     {"h": 7, "w": 24, "x": 0, "y": y},
     fieldConfig=ts_defaults("angv", lw=1, fill=0)))
-
-y += 7
-
-# ═══════════════════════════════════════════════════════════════
-# ROW 3b — Derived motion (tilt angle + horizontal accel)
-# ═══════════════════════════════════════════════════════════════
-panels.append(row("📐 Derived Motion", y)); y += 1
-
-panels.append(new_panel("timeseries", "Tilt Angle (°)",
-    [ts_q("tilt_angle_deg")],
-    {"h": 7, "w": 12, "x": 0, "y": y},
-    fieldConfig=ts_defaults("degree", lw=2, fill=10, min_=0, max_=90)))
-
-panels.append(new_panel("timeseries", "Horizontal Acceleration (g)",
-    [ts_q("horizontal_accel")],
-    {"h": 7, "w": 12, "x": 12, "y": y},
-    fieldConfig=ts_defaults("accG", lw=2, fill=5)))
 
 y += 7
 
@@ -274,33 +242,8 @@ panels.append(new_panel("timeseries", "Relative Humidity (%RH)",
 y += 7
 
 # ═══════════════════════════════════════════════════════════════
-# ROW 5 — Energy (shuttle side)
-# ═══════════════════════════════════════════════════════════════
-panels.append(row("⚡ Shuttle Energy", y)); y += 1
-
-panels.append(new_panel("timeseries", "Accumulated Mission Energy — live (J) [derived from state]",
-    [ts_q("energy_j", agg="last")],
-    {"h": 8, "w": 12, "x": 0, "y": y},
-    fieldConfig=ts_defaults("joule", lw=2, fill=15)))
-
-panels.append(new_panel("timeseries", "Per-Mission Energy at flush (J) [derived from state]",
-    [raw_q(f"""from(bucket:"{BUCKET}")
-  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)
-  |> filter(fn: (r) => r._measurement == "stm_mission" and r._field == "energy_j")
-  |> yield(name: "A")""")],
-    {"h": 8, "w": 12, "x": 12, "y": y},
-    fieldConfig={
-        "defaults": {
-            "unit": "joule",
-            "custom": {"lineWidth": 0, "fillOpacity": 80,
-                       "drawStyle": "bars", "showPoints": "never"},
-        }
-    }))
-
-y += 8
-
-# ═══════════════════════════════════════════════════════════════
-# ROW 6 — Mission duration
+# ROW 6 — Mission duration / packets
+# (shuttle-side energy + distance removed — raw-only collection)
 # ═══════════════════════════════════════════════════════════════
 panels.append(row("📦 Mission Summaries", y)); y += 1
 
@@ -328,22 +271,6 @@ panels.append(new_panel("timeseries", "Packets per Mission",
     fieldConfig={
         "defaults": {
             "unit": "short",
-            "custom": {"lineWidth": 0, "fillOpacity": 70,
-                       "drawStyle": "bars", "showPoints": "never"},
-        }
-    }))
-
-y += 7
-
-panels.append(new_panel("timeseries", "Per-Mission Distance (m)",
-    [raw_q(f"""from(bucket:"{BUCKET}")
-  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)
-  |> filter(fn: (r) => r._measurement == "stm_mission" and r._field == "distance_m")
-  |> yield(name: "A")""")],
-    {"h": 7, "w": 24, "x": 0, "y": y},
-    fieldConfig={
-        "defaults": {
-            "unit": "lengthm",
             "custom": {"lineWidth": 0, "fillOpacity": 70,
                        "drawStyle": "bars", "showPoints": "never"},
         }
@@ -453,7 +380,7 @@ table_flux = f"""from(bucket:"{BUCKET}")
   |> range(start: -24h)
   |> filter(fn: (r) => r._measurement == "stm_mission")
   |> pivot(rowKey: ["_time","shuttle_id","gateway"], columnKey: ["_field"], valueColumn: "_value")
-  |> keep(columns: ["_time","shuttle_id","gateway","energy_j","packets","duration_ms","distance_m"])
+  |> keep(columns: ["_time","shuttle_id","gateway","packets","duration_ms"])
   |> map(fn: (r) => ({{r with duration_ms: r.duration_ms / 1000.0}}))
   |> sort(columns: ["_time"], desc: true)
   |> limit(n: 100)"""
@@ -474,11 +401,6 @@ panels.append(new_panel("table", "All Missions — last 24 h",
             {"matcher": {"id": "byName", "options": "gateway"},
              "properties": [{"id": "displayName", "value": "Gateway"},
                              {"id": "custom.width", "value": 100}]},
-            {"matcher": {"id": "byName", "options": "energy_j"},
-             "properties": [{"id": "displayName", "value": "Energy"},
-                             {"id": "unit", "value": "joule"},
-                             {"id": "decimals", "value": 3},
-                             {"id": "custom.width", "value": 100}]},
             {"matcher": {"id": "byName", "options": "duration_ms"},
              "properties": [{"id": "displayName", "value": "Duration (s)"},
                              {"id": "unit", "value": "s"},
@@ -488,11 +410,6 @@ panels.append(new_panel("table", "All Missions — last 24 h",
              "properties": [{"id": "displayName", "value": "Packets"},
                              {"id": "decimals", "value": 0},
                              {"id": "custom.width", "value": 80}]},
-            {"matcher": {"id": "byName", "options": "distance_m"},
-             "properties": [{"id": "displayName", "value": "Distance"},
-                             {"id": "unit", "value": "lengthm"},
-                             {"id": "decimals", "value": 1},
-                             {"id": "custom.width", "value": 100}]},
         ],
     }))
 

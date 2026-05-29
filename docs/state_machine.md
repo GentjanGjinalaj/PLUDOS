@@ -16,8 +16,9 @@ replaced by a continuous unified UDP stream. There is no buffer.
   needed so the FSM can detect a movement dwell at all
 - **Telemetry transmit rate:** 0.1 Hz (`TX_PERIOD_IDLE_MS=10000`) — one
   `PludosTelemetry` UDP packet every 10 s carries accel, gyro, temp, and humidity.
-  `pressure_hpa` and `power_mw` are no longer on the wire (ADR-015 v2); the gateway
-  derives power from `state` via `POWER_IDLE_MW` / `POWER_MOVING_MW` env vars.
+  `pressure_hpa` and `power_mw` are no longer on the wire (ADR-015 v2); shuttle
+  power/energy is not estimated on the gateway either (the `POWER_*_MW` placeholder
+  was removed in the schema-v4 raw-only cull).
 - **Entry condition:** no above-threshold accelerometer sample for **20 s**
 - **Actions on entry:** none beyond logging the transition; the next loop
   iteration starts streaming at 0.1 Hz with `state = 0`
@@ -165,10 +166,10 @@ longer on the wire (ADR-015 v2).
   `JETSON_IP` define in `wifi_credentials.h` is the compile-time
   fallback used only when the very first boot probe times out.
 - **P2-2 ADC power sensing:** `power_mw` was removed from the wire in
-  ADR-015 v2 — the firmware no longer estimates or transmits power.
-  The gateway derives it from `state` using the `POWER_IDLE_MW` /
-  `POWER_MOVING_MW` env vars. Real INA3221/Alumet measurement on the
-  Jetson side is tracked in ADR-011.
+  ADR-015 v2 — the firmware no longer estimates or transmits power. The
+  gateway-side `POWER_*_MW` estimate was also removed in the schema-v4
+  raw-only cull, so there is no shuttle power/energy figure at all. Real
+  INA3221/Alumet measurement on the Jetson side is tracked in ADR-011.
 - **Threshold tuning:** `MOVEMENT_THRESHOLD_G2 = 0.05f` is conservative.
   If false-trigger rate or missed-mission rate becomes an issue with real
   shuttle motion, retune against logged data — the squared-magnitude axis

@@ -708,7 +708,7 @@ same time. A stale pidfile (process no longer alive) is reclaimed automatically.
 ```bash
 FL_TRIGGER_INTERVAL_S=30   # poll period in seconds
 FL_MIN_FIT_CLIENTS=1       # gateways required before firing a round
-FL_NUM_ROUNDS=3            # forwarded to server.py
+FL_NUM_ROUNDS=10           # forwarded to server.py
 ```
 
 **Inspecting trigger state**:
@@ -855,7 +855,7 @@ python3 tools/mock_stm32.py
 | Alumet `cargo install alumet-cli` may fail if package name differs on crates.io | `pludos-alumet` container won't start | Server energy measurement missing; all other services unaffected. Verify with `podman build server/alumet` and check the error. |
 | `flwr run .` simulation mode doesn't exercise real Jetson client | FL tree-set union not tested end-to-end multi-gateway | Use Mode B (§3.6) with `flower-superlink` + `flower-supernode` |
 | `client/Containerfile` uses CPU-only `python:3.10-slim` | `ai-worker` falls back to CPU XGBoost on the Jetson | Tracked separately — needs a JetPack 6 CUDA base image |
-| `POWER_MOVING_MW` default (260 mW) is a datasheet rough estimate | Per-mission `energy_j` numbers are ±40% | Bench-ammeter calibration when hardware is on the rig |
+| No shuttle-side energy measurement | `stm_mission` carries only `packets`/`duration_ms`; per-shuttle energy is not reported (the hardcoded estimate was removed in schema v4) | Add an INA3221/shunt on the STM32 when hardware allows |
 
 ---
 
@@ -922,7 +922,7 @@ SHUTTLE_GROUP=1,2         # multi-Jetson pairing (see DEPLOYMENT_3JETSON.md)
 override without editing source. Set them before `flwr run .`:
 
 ```bash
-export FL_NUM_ROUNDS=5          # default 3
+export FL_NUM_ROUNDS=5          # default 10
 export FL_MIN_FIT_CLIENTS=2     # default 1 — raise for multi-gateway
 flwr run . pludos-network
 ```
@@ -930,7 +930,7 @@ flwr run . pludos-network
 Alternatively, edit the defaults at the top of `server/server.py`:
 
 ```python
-NUM_ROUNDS      = int(os.getenv("FL_NUM_ROUNDS",      "3"))
+NUM_ROUNDS      = int(os.getenv("FL_NUM_ROUNDS",      "10"))
 MIN_FIT_CLIENTS = int(os.getenv("FL_MIN_FIT_CLIENTS", "1"))
 ```
 

@@ -200,7 +200,9 @@ all devices share one measurement.
   Tags: `device`, `fl_round`, `phase` (load/train/round_total), `nvpmodel`.
   Fields: `duration_ms`, `energy_j`, `avg_power_w`.
 - `stm_mission` — per-shuttle mission summary from `client/data-engine.py`.
-  Tags: `shuttle_id`, `gateway`. Fields: `energy_j`, `packets`, `duration_ms`.
+  Tags: `shuttle_id`, `gateway`. Fields: `packets`, `duration_ms`.
+  (The `energy_j` field was removed in the schema-v4 raw-only cull — it was a
+  hardcoded `power_mw × elapsed` estimate, not a measurement. See ADR-017 note.)
 
 See the `pludos-alumet` skill for Grafana query examples and phase breakdown guidance.
 
@@ -458,7 +460,16 @@ gateway converts to NaN.
 ---
 
 ## ADR-017 — Distance estimation via impulse counter
-**Status:** Closed
+**Status:** Superseded (2026-05-29, schema v4 raw-only)
+
+> **Superseded.** Distance estimation was removed from the gateway entirely.
+> Even with the 1D signed-ZUPT design below, the integrator drifted badly at
+> the 10 Hz observable rate (a sub-metre move once read as 32 m). Under the
+> schema-v4 "store raw, derive at train time" decision the data-engine became
+> a pure raw collector: `distance_m_cum` / `displacement_m` / `speed_ms` are no
+> longer computed or stored, and `stm_mission.distance_m` was dropped. The
+> design record below is kept for any downstream reimplementation that consumes
+> raw `accel_x/y/z`. See `docs/distance_estimation.md` (also marked obsolete).
 
 **Context:** Cumulative distance traveled is a wear proxy for shuttle bearings.
 The original ZUPT integration (double-integrating `|a_h|`) was unbounded —

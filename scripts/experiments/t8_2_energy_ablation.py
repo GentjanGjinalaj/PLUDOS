@@ -112,7 +112,7 @@ def main():
     args = ap.parse_args()
 
     influx_url = os.getenv("INFLUXDB_URL",    "http://localhost:8086")
-    token      = os.getenv("INFLUXDB_TOKEN",  "pludos-dev-token")
+    token      = os.getenv("INFLUXDB_TOKEN",  "pludos-secret-token")
     org        = os.getenv("INFLUXDB_ORG",    "pludos")
     bucket     = os.getenv("INFLUXDB_BUCKET", "alumet_energy")
 

@@ -631,8 +631,10 @@ int main(void)
   sprintf(uart_buf, "[SENSOR] Initializing ISM330 accelerometer...\r\n");
   HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
 
-  /* ODR=0010→26 Hz; sampled at 10 Hz. 26 Hz eliminates aliasing from the 416 Hz
-     internal filter chain while staying well above the 10 Hz read rate (Nyquist). */
+  /* ODR=0010→26 Hz; output register polled at 10 Hz. NOTE: reading a 26 Hz stream
+     at 10 Hz with no decimation/LPF aliases 5-13 Hz content into the 0-5 Hz band —
+     setting ODR above the read rate does NOT prevent this. Proper fix (ISM330 LPF2
+     cutoff <=5 Hz, or FIFO average-decimate 26->10) is pending review item P1-A. */
   uint8_t accel_config = 0x20;  /* CTRL1_XL: ODR=26 Hz, FS=±2g, normal mode */
   if (HAL_I2C_Mem_Write(&hi2c2, ISM330_ADDR, CTRL1_XL, 1, &accel_config, 1, 100) == HAL_OK)
   {

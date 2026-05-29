@@ -174,9 +174,10 @@ See ADR-011 in `decisions.md` for full decision history.
    in-memory list.
 4. When the shuttle has been in state==IDLE for `MISSION_END_IDLE_S`
    (default 30 s) after any MOVING run, the gateway sorts the buffer by
-   `sequence_monotonic` and writes one Parquet file atomically. A
-   `stm_mission` summary point (energy_j, packets, duration_ms) is also
-   pushed to InfluxDB on a daemon thread.
+   `sequence_monotonic` and writes one Parquet file atomically (raw signal
+   only — feature engineering is deferred to train time in `anomaly.py`). A
+   `stm_mission` summary point (packets, duration_ms) is also pushed to
+   InfluxDB on a daemon thread.
 5. Out of band (manual or scheduled), `flwr run .` starts an FL round; the
    server signals each gateway-side `ai-worker`, which loads the most
    recent `MAX_PARQUET_FILES` files, fits XGBoost, returns booster bytes.
@@ -224,24 +225,23 @@ a back slot (behind the front slot). The shuttle's telescopic arms
 extend/retract perpendicular to the rail to pick and place boxes. A
 repositioning mission (accessing a back slot) involves 3–4 MOVING legs with
 intermediate IDLE pauses: reach front → push box aside → reach back → retract.
-Each arm cycle is one pick/place event, counted via `pick_events` in the
-mission summary.
+Each arm cycle is one pick/place event. (The gateway no longer counts these —
+`pick_events` was removed with the schema-v4 raw-only cull; derive from `state`
+transitions downstream if needed.)
 
-**Key implications for telemetry and ML:**
+**Key implications for telemetry and ML** (the gateway now stores raw signal
+only — these are physical facts that inform *train-time* feature engineering
+in `anomaly.py`, not gateway code):
 
-- **IDLE = physically stopped.** The ZUPT reset (`vel = 0` at every IDLE
-  packet) is an exact physical constraint. Integration error is bounded to
-  the duration of each MOVING segment.
-- **Arm motion is perpendicular to the rail axis.** The track-axis variance
-  detector (`var(accel_x)` vs `var(accel_y)` on MOVING packets) automatically
-  discards arm vibration — it appears on the low-variance axis and is rejected.
-- **Short MOVING segments (≤2 s)** occur during repositioning. With
-  `DISTANCE_HPF_WINDOW=10` (≈1 s burn-in), these see 25–35% distance
-  underestimation. Acceptable for wear correlation at mission scale.
-- **Mission boundary risk.** The 30 s IDLE timeout (`MISSION_END_IDLE_S`)
-  may split a repositioning cycle if an intermediate shelf pause exceeds 30 s.
-  Elevator-cycle granularity is future work (T-C1,
-  `docs/distance_estimation.md §Future Work`).
+- **IDLE = physically stopped.** Velocity is known to be exactly zero at every
+  IDLE packet — an exact physical constraint that any downstream ZUPT-style
+  integrator can exploit to bound drift to a single MOVING segment.
+- **Arm motion is perpendicular to the rail axis.** Arm vibration appears on
+  the low-variance accel axis; a track-axis variance test can separate it from
+  rail travel at analysis time.
+- **Mission boundary risk.** The 30 s IDLE timeout (`MISSION_END_IDLE_S`) may
+  split a repositioning cycle if an intermediate shelf pause exceeds 30 s.
+  Elevator-cycle granularity is future work.
 
 ---
 

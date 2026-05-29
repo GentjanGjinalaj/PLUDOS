@@ -1,5 +1,15 @@
 # Distance Estimation — 1D-ZUPT for Savoye XTPS Rail Motion (T2.2 / ADR-017)
 
+> **OBSOLETE (schema v4, 2026-05-29).** The gateway no longer computes or
+> stores distance (`distance_m_cum` / `displacement_m` / `speed_ms`). The
+> 1D-ZUPT integrator drifted badly at the 10 Hz observable rate — a sub-metre
+> physical move once read as 32 m — so the whole computation was deleted to
+> keep the data-engine a pure raw collector (Jetson CPU/SD savings). This
+> document is retained as a design record: the rail-axis reasoning and the
+> failure analysis below should inform any **downstream** reimplementation
+> that consumes raw `accel_x/y/z` from the Parquet files. It does **not**
+> describe current data-engine behaviour.
+
 ## Context
 
 The Savoye XTPS shuttle moves strictly in one dimension: forward/backward on a

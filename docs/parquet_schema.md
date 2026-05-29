@@ -5,8 +5,12 @@ complete telemetry buffer from the first MOVING packet until 30 s of
 subsequent IDLE (or a mid-mission buffer-pressure overflow). Multiple
 files may exist per shuttle per day.
 
-**Schema version:** v3 (ADR-016). Files produced by earlier versions of
-`data-engine.py` will be missing `gyro_*`, `seq_gap`, and `interval_ms`.
+**Schema version:** v4 (raw-only). The gateway now stores **only raw
+signal** — no derived columns (`accel_mag`, `gyro_mag`, distance, energy,
+segmentation). All feature engineering happens at train time in
+`anomaly.py:_derive_features()`. This keeps the data-engine a pure
+collector and minimises Jetson CPU / SD-card load. Files produced by
+earlier versions will additionally carry derived columns that v4 ignores.
 
 ---
 
@@ -33,6 +37,7 @@ the bug that caused one shuttle's file to overwrite the other's.
 | Trigger | Condition | State reset? |
 |---|---|---|
 | Mission end | shuttle stays IDLE for ≥ 30 s after any MOVING run (`MISSION_END_IDLE_S`) | Yes |
+| Time cap | shuttle buffer open longer than `BUFFER_MAX_AGE_S` (default 300 s) wall-clock | Yes |
 | Soft limit | shuttle buffer reaches 3 000 packets (≈ 5 min at 10 Hz MOVING) | No — mission continues |
 | Hard limit | shuttle buffer reaches 4 500 packets (≈ 7.5 min at 10 Hz MOVING) | No — mission continues |
 | Gateway ceiling | all-shuttle total reaches 100 000 packets | No |
@@ -54,7 +59,6 @@ mission in sequence order.
 | `shuttle_id` | int8 | — | 1-based integer. Set via `SHUTTLE_ID` in `wifi_credentials.h`. Maps to a human name via `SHUTTLE_NAMES` env var (default `shuttle-N`). |
 | `seq` | int32 | — | Monotonic packet counter. The uint16 wire value (wraps at 65 535) is unwrapped by the gateway into a globally unique sort key. Always use `seq` for ordering, not `timestamp`. |
 | `seq_gap` | int16 | packets | Packets lost **before** this row = `seq[i] − seq[i−1] − 1`. Zero means no loss; 1 means one packet was dropped. First row in each file is always 0. Non-zero values cluster at WiFi dead zones (metal shelving, elevator shaft entry) — this is a position-correlated ML feature. |
-| `interval_ms` | float32 | ms | **Deprecated (v2 schema only).** Superseded by deriving `dt` from actual NTP-anchored timestamps at flush time. Not present in v3 (ADR-016) files. |
 
 ### Motion state
 
@@ -66,53 +70,71 @@ mission in sequence order.
 
 | Column | Type | Unit | Description |
 |---|---|---|---|
-| `accel_x` | float32 | g | Lateral acceleration (left/right relative to shelf row). ±2 g full scale. NaN if ISM330 I²C read failed (sentinel 0x7FFF on wire). |
-| `accel_y` | float32 | g | Forward/backward along the direction of travel. |
-| `accel_z` | float32 | g | Vertical. At rest on flat ground ≈ 1.00 g (gravity). Bearing wear shows as AC noise on this channel. |
-| `accel_mag` | float32 | g | √(x²+y²+z²). ≈ 1.0 at rest. Deviations > 0.05 g² drive the STM32 movement-detection FSM. NaN if any accel axis is NaN. |
+| `accel_x` | float16 | g | Lateral acceleration (left/right relative to shelf row). ±2 g full scale. NaN if ISM330 I²C read failed (sentinel 0x7FFF on wire). |
+| `accel_y` | float16 | g | Forward/backward along the direction of travel. |
+| `accel_z` | float16 | g | Vertical. At rest on flat ground ≈ 1.00 g (gravity). Bearing wear shows as AC noise on this channel. |
 
-Precision: 2 decimal places (wire is int16 × 100, so 0.01 g resolution).
+Precision: rounded to 2 decimals before storage (wire is int16 × 100, so
+0.01 g resolution). Stored as float16 to halve file size — finer than the
+0.01 g wire quantum across the ±2 g range.
 
 ### Gyroscope (ISM330DHCX)
 
 | Column | Type | Unit | Description |
 |---|---|---|---|
-| `gyro_x` | float32 | dps | Roll rate. Torsional vibration from motor/bearing faults appears here. ±250 dps full scale, 8.75 mdps/LSB sensitivity. NaN if ISM330 gyro init failed. |
-| `gyro_y` | float32 | dps | Pitch rate. |
-| `gyro_z` | float32 | dps | Yaw rate (turns and curves along the shelf row). |
-| `gyro_mag` | float32 | dps | √(gx²+gy²+gz²). Aggregate rotation magnitude. NaN if any gyro axis is NaN. |
+| `gyro_x` | float16 | dps | Roll rate. Torsional vibration from motor/bearing faults appears here. ±250 dps full scale, 8.75 mdps/LSB sensitivity. NaN if ISM330 gyro init failed. |
+| `gyro_y` | float16 | dps | Pitch rate. |
+| `gyro_z` | float16 | dps | Yaw rate (turns and curves along the shelf row). |
 
 Note: a small zero-rate offset (typically ±0.5 dps) is normal for the
 ISM330 at power-on without factory calibration. The ML model will
 learn around it since it is consistent per device.
 
-Precision: 2 decimal places (wire is int16 × 100, so 0.01 dps resolution).
+Precision: rounded to 2 decimals before storage (wire is int16 × 100).
+Stored as float16; the ±250 dps range exceeds float16's exact-integer
+limit, so the LSB is coarser than 0.01 dps at large rates — irrelevant
+given 10 Hz sampling already aliases vibration.
 
 ### Environment (HTS221)
 
 | Column | Type | Unit | Description |
 |---|---|---|---|
-| `temp_c` | float32 | °C | Ambient temperature. NaN if HTS221 I²C read failed. Typical warehouse: 15–25 °C. Elevated readings may indicate motor heat near the sensor. |
-| `humidity_pct` | float32 | %RH | Relative humidity. NaN if HTS221 failed. Precision: 1 decimal place (wire is int16 × 10). |
+| `temp_c` | float16 | °C | Ambient temperature. NaN if HTS221 I²C read failed. Typical warehouse: 15–25 °C. Elevated readings may indicate motor heat near the sensor. |
+| `humidity_pct` | float16 | %RH | Relative humidity. NaN if HTS221 failed. Rounded to 1 decimal (wire is int16 × 10). |
 
 ---
 
-## Columns computed at training time (client.py only, not in Parquet)
+## Columns computed at training time (not in Parquet)
 
-These are derived in `client.py:load_buffered_data()` before XGBoost
-training. They are **not stored** in the Parquet files.
+These are derived in `anomaly.py:_derive_features()` once per FL round,
+after the recent Parquet files are loaded and sorted by `(shuttle_id,
+seq)`. They are **not stored** — store-raw, derive-at-train-time. The CNN
+labeller ignores them (it consumes raw axes directly); IsolationForest
+and XGBoost use them.
 
 | Column | Description |
 |---|---|
-| `speed_ms` | Estimated horizontal speed (m/s) via ZUPT integration: `vel += sqrt(ax²+ay²) × 9.81 × dt` on MOVING packets (where `dt` is the actual inter-packet elapsed time, not a fixed constant); resets to 0 at each IDLE→MOVING transition to bound drift. Coarse proxy — not calibrated against ground truth. |
-| `displacement_m` | Cumulative distance travelled since IDLE→MOVING, in metres. Same caveats as `speed_ms`. |
+| `accel_mag` | √(accel_x² + accel_y² + accel_z²). Total acceleration magnitude; ≈ 1.0 g at rest. |
+| `gyro_mag` | √(gyro_x² + gyro_y² + gyro_z²). Aggregate rotation magnitude. |
+| `rolling_accel_std_10` | 10-packet rolling std of `accel_mag` (≈ 1 s at 10 Hz MOVING), `min_periods=2`, leading NaN filled 0. Sustained-vibration / bearing-wear proxy. |
 
 ---
 
 ## What is missing / will never be here
 
+- **`accel_mag` / `gyro_mag` / `rolling_accel_std_10`** — derived columns;
+  no longer stored. Computed at train time (see section above).
+- **`distance_m_cum` / `displacement_m` / `speed_ms`** — ZUPT distance
+  integration removed entirely (v4). The 1-D integrator drifted badly at
+  10 Hz and the figure was not trustworthy. Recompute downstream from raw
+  accel if needed; do not treat as ground truth.
+- **`energy_j` / `power_mw`** — per-packet energy estimate removed (v4).
+  Gateway/FL-round energy is measured separately (Alumet, server-side
+  `fl_phases`), not derived per telemetry packet.
+- **Mission segmentation** (`moving_run_id`, `pause_duration_s`,
+  `moving_run_dur_s`, `pause_count`, `is_long_pause`) — removed (v4).
+  Derive at analysis time from `state` transitions if needed.
 - **`pressure_hpa`** — LPS22HH is read on the STM32 for local UART debug but not transmitted (ADR-015). Not in the wire protocol.
-- **`power_mw`** — Derived from `state` on the gateway (`POWER_IDLE_MW`/`POWER_MOVING_MW`). Not in Parquet to avoid encoding the estimate as ground truth; compute it downstream if needed.
 - **GPS / position** — No GPS on the shuttle. Position is inferred from mission sequence number and shelf layout (future work).
 
 ---
@@ -137,5 +159,10 @@ moving = df[df["state"] == 1]
 idle   = df[df["state"] == 0]
 
 print(f"MOVING packets: {len(moving)}  |  IDLE packets: {len(idle)}")
-print(moving[["seq", "accel_mag", "gyro_mag", "seq_gap"]].describe())
+
+# accel_mag is derived, not stored — compute it from the raw axes.
+moving = moving.assign(
+    accel_mag=(moving["accel_x"]**2 + moving["accel_y"]**2 + moving["accel_z"]**2)**0.5
+)
+print(moving[["seq", "accel_mag", "accel_z", "seq_gap"]].describe())
 ```

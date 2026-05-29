@@ -74,9 +74,12 @@ can query across all of them in one data source.
 | `_measurement` | measurement name | `stm_mission` |
 | `shuttle_id` | tag | STM32 shuttle identifier |
 | `gateway` | tag | Jetson hostname |
-| `energy_j` | field | STM32-estimated energy (power_mw × elapsed_s, ±40%) |
-| `packets` | field | total CoAP packets received in this mission |
+| `packets` | field | total packets received in this mission |
 | `duration_ms` | field | mission wall-clock duration on gateway |
+
+Note: shuttle-side `energy_j` was removed in schema v4 (it was a hardcoded
+`power_mw × elapsed` estimate). Real energy is Jetson/server-side only — see
+`fl_energy` / `fl_phases` above.
 
 ---
 
@@ -135,7 +138,7 @@ from(bucket: "alumet_energy")
   |> yield(name: "phase_energy")
 ```
 
-### 4.5 Per-shuttle mission energy (stm_mission)
+### 4.5 Per-shuttle mission summary (stm_mission)
 
 One point per mission end. Use a table panel or time series grouped by `shuttle_id`.
 
@@ -143,7 +146,7 @@ One point per mission end. Use a table panel or time series grouped by `shuttle_
 from(bucket: "alumet_energy")
   |> range(start: v.timeRangeStart, stop: v.timeRangeStop)
   |> filter(fn: (r) => r["_measurement"] == "stm_mission")
-  |> filter(fn: (r) => r["_field"] == "energy_j" or r["_field"] == "duration_ms")
+  |> filter(fn: (r) => r["_field"] == "packets" or r["_field"] == "duration_ms")
   |> group(columns: ["shuttle_id", "gateway"])
   |> yield(name: "mission_summary")
 ```

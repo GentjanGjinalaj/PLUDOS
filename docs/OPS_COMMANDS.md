@@ -103,12 +103,14 @@ from(bucket: "alumet_energy")
   |> last()
 ```
 
-### Acceleration magnitude — last hour
+### Vertical acceleration (accel_z) — last hour
 
 ```flux
+# accel_mag is no longer streamed (schema v4 stores raw axes only). Query a
+# raw axis directly, or compute the magnitude downstream from accel_x/y/z.
 from(bucket: "alumet_energy")
   |> range(start: -1h)
-  |> filter(fn: (r) => r._measurement == "stm_telemetry" and r._field == "accel_mag")
+  |> filter(fn: (r) => r._measurement == "stm_telemetry" and r._field == "accel_z")
   |> aggregateWindow(every: 5s, fn: mean, createEmpty: false)
 ```
 
@@ -122,25 +124,16 @@ from(bucket: "alumet_energy")
   |> aggregateWindow(every: 10s, fn: mean, createEmpty: false)
 ```
 
-### All missions today (energy + duration)
+### All missions today (packets + duration)
 
 ```flux
+# stm_mission carries only packets/duration_ms in schema v4 (shuttle energy removed).
 from(bucket: "alumet_energy")
   |> range(start: -24h)
   |> filter(fn: (r) => r._measurement == "stm_mission")
   |> pivot(rowKey: ["_time","shuttle_id","gateway"], columnKey: ["_field"], valueColumn: "_value")
-  |> keep(columns: ["_time","shuttle_id","gateway","energy_j","packets","duration_ms"])
+  |> keep(columns: ["_time","shuttle_id","gateway","packets","duration_ms"])
   |> sort(columns: ["_time"], desc: true)
-```
-
-### Total energy consumed today (per shuttle)
-
-```flux
-from(bucket: "alumet_energy")
-  |> range(start: -24h)
-  |> filter(fn: (r) => r._measurement == "stm_mission" and r._field == "energy_j")
-  |> group(columns: ["shuttle_id"])
-  |> sum()
 ```
 
 ### Jetson INA3221 power — board input (VDD_IN, last hour)

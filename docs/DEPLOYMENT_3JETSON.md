@@ -197,8 +197,9 @@ compose first, then point `INFLUXDB_URL` in `client/.env` at
   P2-14 in `current_problems.md`.
 - `client/Containerfile` still uses CPU-only `python:3.10-slim`. The
   ai-worker XGBoost fit runs on CPU until a JetPack 6 CUDA image is wired.
-- `POWER_MOVING_MW` default (260 mW) is a datasheet rough — calibrate with
-  a bench ammeter before claiming energy numbers in the thesis.
+- No shuttle-side energy figure. The `POWER_*_MW` gateway estimate was
+  removed in the schema-v4 raw-only cull; only Jetson/server energy (Alumet)
+  is instrument-grade. Add an STM32 INA219 before claiming shuttle energy.
 - `client/CLAUDE.md` and several other docs still reference the pre-ADR-015
   CoAP architecture. They are local-only (gitignored) and need a separate
   pass.

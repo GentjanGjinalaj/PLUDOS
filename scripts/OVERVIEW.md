@@ -18,7 +18,7 @@ the running system imports them.
 | File | Calibrates | How | Feeds |
 |------|-----------|-----|-------|
 | `calibrate_movement_threshold.py` | `MOVEMENT_THRESHOLD_G2` (the IDLE→MOVING trigger in firmware) | Reads an IDLE Parquet and a MOVING Parquet, computes `mean(idle_mag²) + 5σ` | The `#define MOVEMENT_THRESHOLD_G2` in `main.c` |
-| `calibrate_distance.py` | `DISTANCE_SCALE_FACTOR` (ZUPT distance correction) | Mirrors `data-engine.py`'s ZUPT integration on a **known-distance** run; scale = known / integrated | A multiplier on `data-engine.py`'s `distance_m_cum` |
+| `calibrate_distance.py` | ~~`DISTANCE_SCALE_FACTOR`~~ — **OBSOLETE** | Mirrored `data-engine.py`'s ZUPT integration. Distance was removed entirely in the schema-v4 raw-only cull, so this script no longer calibrates anything live. Kept only as a reference if distance is ever reimplemented downstream. | nothing (distance no longer computed or stored) |
 | `calibrate_energy_budget.py` | `FL_ENERGY_BUDGET_J` (energy-aware FL adaptation) | Queries the last N rounds of `fl_phases` from InfluxDB; budget = `margin × mean(round_total)` | The `FL_ENERGY_BUDGET_J` env in `server/.env` |
 
 ## Weight

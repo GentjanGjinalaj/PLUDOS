@@ -55,6 +55,9 @@ services:
     # Upgrade path: podman ≥ 4.1 + nvidia-ctk cdi generate → add devices: [nvidia.com/gpu=all]
     volumes:
       - ./ram_buffer:/app/ram_buffer
+      # CNN Welford stats + IDLE-baseline threshold (STATE_DIR=/app/state) must
+      # survive restarts — T3.1 persistence design fails without this bind-mount.
+      - ./state:/app/state
       - /etc/localtime:/etc/localtime:ro
       - /etc/timezone:/etc/timezone:ro
     depends_on:
