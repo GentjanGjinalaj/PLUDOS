@@ -18,7 +18,6 @@ the running system imports them.
 | File | Calibrates | How | Feeds |
 |------|-----------|-----|-------|
 | `calibrate_movement_threshold.py` | `MOVEMENT_THRESHOLD_G2` (the IDLE→MOVING trigger in firmware) | Reads an IDLE Parquet and a MOVING Parquet, computes `mean(idle_mag²) + 5σ` | The `#define MOVEMENT_THRESHOLD_G2` in `main.c` |
-| `calibrate_distance.py` | ~~`DISTANCE_SCALE_FACTOR`~~ — **OBSOLETE** | Mirrored `data-engine.py`'s ZUPT integration. Distance was removed entirely in the schema-v4 raw-only cull, so this script no longer calibrates anything live. Kept only as a reference if distance is ever reimplemented downstream. | nothing (distance no longer computed or stored) |
 | `calibrate_energy_budget.py` | `FL_ENERGY_BUDGET_J` (energy-aware FL adaptation) | Queries the last N rounds of `fl_phases` from InfluxDB; budget = `margin × mean(round_total)` | The `FL_ENERGY_BUDGET_J` env in `server/.env` |
 
 ## Weight
@@ -37,7 +36,8 @@ captured Parquet / InfluxDB ──► scripts/*.py ──► "RECOMMENDED <CONST
 ```
 
 Each calibration script deliberately **mirrors** a piece of live logic (e.g.
-`calibrate_distance.py` re-implements `data-engine.py`'s integration) so its
-recommendation matches what the system will actually do. If you change that
-live logic, update the mirror here too. The thesis-validation scripts live one
+`calibrate_movement_threshold.py` recomputes the same `mag²` deviation the
+firmware FSM uses) so its recommendation matches what the system will actually
+do. If you change that live logic, update the mirror here too. The
+thesis-validation scripts live one
 level down in `scripts/experiments/` (see that folder's OVERVIEW.md).
