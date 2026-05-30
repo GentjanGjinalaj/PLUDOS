@@ -132,6 +132,8 @@ static uint32_t continuous_movement_start_tick = 0U; /* tick when the current dw
 #define ISM330_ADDR        0xD6
 #define CTRL1_XL           0x10  /* accel control: ODR + FS */
 #define CTRL2_G            0x11  /* gyro control:  ODR + FS */
+#define CTRL4_C            0x13  /* gyro filter: LPF1_SEL_G enable (bit1) */
+#define CTRL6_C            0x15  /* gyro filter: LPF1 bandwidth (FTYPE) */
 #define CTRL8_XL           0x17  /* accel filter: LPF2 bandwidth (HPCF_XL) + HP-path enable */
 #define OUTX_L_A           0x28  /* accel output X low byte (6-byte burst: X, Y, Z) */
 #define OUTX_L_G           0x22  /* gyro output X low byte  (6-byte burst: X, Y, Z) */
@@ -658,16 +660,29 @@ int main(void)
 
   HAL_Delay(100);  /* allow ISM330 to stabilize */
 
-  /* Enable gyroscope: ODR matches accelerometer (104 Hz), ±250 dps FS.
-     Gyro digital LPF1 left at its CTRL6_C default; tightening it for full
-     anti-aliasing (FTYPE bandwidth table) is a follow-up — the accelerometer
-     drives the FSM, so its LPF2 is the priority here. */
+  /* Enable gyroscope: ODR matches accelerometer (104 Hz), ±250 dps FS. */
   uint8_t gyro_config = 0x40;  /* CTRL2_G: ODR=104 Hz, FS_G=00 → ±250 dps */
   if (HAL_I2C_Mem_Write(&hi2c2, ISM330_ADDR, CTRL2_G, 1, &gyro_config, 1, 100) == HAL_OK)
   {
     sprintf(uart_buf, "[SENSOR] ISM330 gyroscope enabled (104Hz, ±250 dps)\r\n");
     HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
   }
+
+  /* Gyro anti-alias for the 50 Hz read (Nyquist 25 Hz). Two writes needed:
+       CTRL4_C  LPF1_SEL_G=1  → route the gyro through digital LPF1 (else the
+                               FTYPE setting is ignored and bandwidth stays 33 Hz).
+       CTRL6_C  FTYPE=111     → narrowest LPF1; at ODR=104 Hz this gives 11.5 Hz
+                               bandwidth (phase −64° @ 20 Hz). Source: ST AN5192
+                               Table 14 (LSM6 family, identical gyro filter chain).
+     11.5 Hz < 25 Hz Nyquist, matching the accel's ~10.4 Hz LPF2 → the gyro stream
+     is now alias-free over the 0–10 Hz motion band. LPF1 is active only in the
+     gyro's default high-performance mode (CTRL7_G left at default). The −64° phase
+     lag is acceptable: gyro is the low-frequency motion-context channel, not used
+     for real-time orientation fusion. */
+  uint8_t gyro_lpf1_en = 0x02;  /* CTRL4_C: LPF1_SEL_G=1, other fields default 0 */
+  (void)HAL_I2C_Mem_Write(&hi2c2, ISM330_ADDR, CTRL4_C, 1, &gyro_lpf1_en, 1, 100);
+  uint8_t gyro_filter = 0x07;   /* CTRL6_C: FTYPE=111, other fields default 0 */
+  (void)HAL_I2C_Mem_Write(&hi2c2, ISM330_ADDR, CTRL6_C, 1, &gyro_filter, 1, 100);
   else
   {
     sprintf(uart_buf, "[SENSOR] ERROR: Failed to initialize ISM330 gyroscope\r\n");

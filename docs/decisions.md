@@ -579,3 +579,57 @@ around it. Standalone mode imports `anomaly.py` directly. Verify with:
 - `client/compose.yaml` — `standalone` profile; `influxdb-local`; `grafana-local`
 - `client/.env.example` — PLUDOS_MODE documentation
 - `docs/architecture.md` — Deployment Modes section
+
+---
+
+## ADR-019 — Remote firmware update (OTA) for the STM32 shuttle
+**Status:** Open (not implemented; physical ST-Link flash is the only path today)
+
+**Context:** Once shuttles are deployed in a warehouse, physical access for an
+ST-Link reflash becomes impractical — the whole point of the fleet is that it
+runs unattended. We need a way to push new `main.c` builds over the network.
+The beacon (UDP :5000) is *not* this: it only discovers the gateway IP at
+runtime and writes RAM, never flash. There is no remote-update path in the
+firmware yet.
+
+**Two-tier decision (deliberately split by phase):**
+
+**Test/bench phase (now) — lightweight, no security:**
+The STM32U585 has **dual-bank flash** (2 × 1 MB) with hardware bank swap via the
+`BFB2` option bit. This gives the lightest possible OTA with *no bootloader
+project, no TrustZone, no signing*:
+1. App receives a new `.bin` over the network (CoAP block-wise — already reserved
+   for control messages, ADR-001 — or TFTP; both give chunk-level reliability).
+2. App unlocks flash, erases the *inactive* bank, writes the image into it.
+3. App verifies a **CRC32 over the received image** — this gate is mandatory, not
+   optional: a single dropped chunk over a lossy link otherwise bricks the board.
+4. Only if CRC matches: toggle `BFB2`, call `HAL_FLASH_OB_Launch()` → reset boots
+   the other bank. Next update ping-pongs back.
+   Because the active bank is always remapped to `0x08000000`, the *same* `.bin`
+   flashes to either bank — no per-bank relink.
+
+This is ~a few hundred lines (flash driver + option-byte handling + a UDP/CoAP
+"firmware push" handler). It skips signing and encryption, which is acceptable on
+a trusted test LAN.
+
+**Production phase (deferred) — ST SBSFU/MCUboot:**
+Reuse ST's **SBSFU example for the B-U585I-IOT02A** (STM32CubeU5, AN5447 / UM2851):
+immutable secure boot, ECDSA signature + SHA256 integrity, AES-CTR encrypted
+images, MCUboot dual-slot swap. The example's loader is YModem-over-UART; the
+WiFi-download glue (image → inactive slot via the MXCHIP EMW3080) is the part we
+write. Trigger via a CoAP CON control message (ADR-001's reserved use).
+
+**Existing code to reuse (do not reinvent):**
+- ST SBSFU — `STM32CubeU5/Projects/B-U585I-IOT02A/Applications/SBSFU` (production engine)
+- ST OpenBootloader — same tree (UART/USB/SPI/I2C local loaders)
+- FreeRTOS `iot-reference-stm32u5` — full network OTA over MQTT on this exact board,
+  but FreeRTOS- and AWS-coupled (conflicts with our bare-metal, no-cloud stack)
+
+**Trade-offs accepted:**
+- The test-phase path has **no rollback**: a broken image that passes CRC but
+  hangs at boot requires physical ST-Link recovery. Keep an ST-Link on the bench.
+- No authenticity check on the test path — anyone on the LAN could push an image.
+  Acceptable for a trusted bench, *not* for deployment. The production path closes
+  this with ECDSA signing.
+- SBSFU integration (TrustZone flash layout, signing toolchain) is a multi-week
+  effort — hence the phase split rather than jumping straight to secure OTA.
