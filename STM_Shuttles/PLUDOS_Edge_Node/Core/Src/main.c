@@ -667,6 +667,11 @@ int main(void)
     sprintf(uart_buf, "[SENSOR] ISM330 gyroscope enabled (104Hz, ±250 dps)\r\n");
     HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
   }
+  else
+  {
+    sprintf(uart_buf, "[SENSOR] ERROR: Failed to initialize ISM330 gyroscope\r\n");
+    HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
+  }
 
   /* Gyro anti-alias for the 50 Hz read (Nyquist 25 Hz). Two writes needed:
        CTRL4_C  LPF1_SEL_G=1  → route the gyro through digital LPF1 (else the
@@ -683,11 +688,6 @@ int main(void)
   (void)HAL_I2C_Mem_Write(&hi2c2, ISM330_ADDR, CTRL4_C, 1, &gyro_lpf1_en, 1, 100);
   uint8_t gyro_filter = 0x07;   /* CTRL6_C: FTYPE=111, other fields default 0 */
   (void)HAL_I2C_Mem_Write(&hi2c2, ISM330_ADDR, CTRL6_C, 1, &gyro_filter, 1, 100);
-  else
-  {
-    sprintf(uart_buf, "[SENSOR] ERROR: Failed to initialize ISM330 gyroscope\r\n");
-    HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
-  }
 
   // -----------------------------------------------------------------
   // HUMIDITY/TEMPERATURE INITIALIZATION (HTS221)
