@@ -622,10 +622,20 @@ async def _status_log_task() -> None:
                 continue
             rate = _tx_rate_window.get(sid, 0) / STATUS_LOG_PERIOD_S
             _tx_rate_window[sid] = 0
-            # Stop logging a shuttle that has gone silent (no packets for 5 periods).
-            # The watchdog will clean up its tracking state after MISSION_END_IDLE_S.
             last_pkt = _last_packet_wall.get(sid)
-            if rate == 0 and last_pkt and (now - last_pkt) > STATUS_LOG_PERIOD_S * 5:
+            silent_s = (now - last_pkt) if last_pkt else 0.0
+            # No packets this period: don't re-print the stale sample as if it were live.
+            # Emit an explicit silence marker (last state/seq are from when it last spoke),
+            # skip the InfluxDB point, and stop entirely once past the silence cutoff —
+            # the watchdog cleans up tracking state after MISSION_END_IDLE_S.
+            if rate == 0:
+                if last_pkt and silent_s > STATUS_LOG_PERIOD_S * 5:
+                    continue
+                last_state = "MOVING" if sample["state"] == STATE_MOVING else "IDLE"
+                logger.info(
+                    "[%s] no packets (%.0fs silent) — last seen %s seq=%d",
+                    sid, silent_s, last_state, sample["seq_wire"],
+                )
                 continue
 
             state_name = "MOVING" if sample["state"] == STATE_MOVING else "IDLE"
