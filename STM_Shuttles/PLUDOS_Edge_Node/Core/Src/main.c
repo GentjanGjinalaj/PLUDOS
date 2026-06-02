@@ -23,6 +23,7 @@
 /* USER CODE BEGIN Includes */
 #include "wifi_credentials.h"
 #include "sensors.h"
+#include "psram.h"
 #include <stdio.h>
 #include <string.h>
 #include <math.h>            /* fabsf() for FSM threshold check */
@@ -158,6 +159,18 @@ static uint16_t current_packet_num = 1U;
  * wifi_credentials.h (gitignored — copy from wifi_credentials.h.example). */
 #define TELEMETRY_PORT 5683U  /* single UDP port for the unified PludosTelemetry stream */
 
+/* Set to 1 to run a one-shot UDP throughput benchmark at boot (after the socket
+ * is armed), then resume normal telemetry. Measures the EMW3080 ceiling: the
+ * sender-side pkt/s is the real radio limit because MX_WIFI_Socket_sendto
+ * backpressures at the module's actual throughput. Set back to 0 after measuring. */
+#define BENCH_THROUGHPUT 0
+
+/* Set to 1 to verify the WiFi power-cycle once at boot: after the first
+ * WIFI_PowerOn(), do WIFI_PowerOff() then WIFI_PowerOn() again and log whether
+ * the socket re-arms. Proves the held-in-reset → re-Init path is reversible
+ * (the load-bearing assumption of the ADR-020 drain). Set back to 0 after. */
+#define WIFI_POWERCYCLE_SELFTEST 0
+
 /* ARM Cortex-M33 is little-endian; mx_sockaddr_in.sin_port is network byte order.
  * No stdlib htons() on bare metal — swap bytes at compile time. */
 #define PLUDOS_HTONS(x) ((uint16_t)(((uint16_t)(x) >> 8U) | ((uint16_t)(x) << 8U)))
@@ -183,6 +196,69 @@ static float    cached_humidity_pct =    0.0f;
 static uint32_t last_tx_tick      = 0U;
 static uint32_t tx_count_window   = 0U;
 static uint32_t tx_window_start_tick = 0U;
+
+/* =========================================================================
+ * ADR-020 high-rate capture engine (sampling_strategy.md §11/§13)
+ * --------------------------------------------------------------------------
+ * MOVING: the ISM330 batches accel 3332 Hz + gyro 416 Hz into its on-chip FIFO
+ * (stream mode); the loop drains the FIFO over I²C into the 8 MB PSRAM ring,
+ * one mission per MOVING episode. The FSM/live path keeps polling the OUTX
+ * registers (still live in FIFO mode) at the decimated loop rate, so motion
+ * detection and telemetry are unaffected. IDLE: FIFO bypassed, sensors back to
+ * the low-rate anti-aliased live config. All register bytes verified against
+ * the ST ism330dhcx_reg.h bitfields/enums — none invented.
+ * ========================================================================= */
+#define ISM330_FIFO_CTRL3     0x09U   /* BDR_GY[7:4] | BDR_XL[3:0] (FIFO batch rates) */
+#define ISM330_FIFO_CTRL4     0x0AU   /* FIFO_MODE[2:0] */
+#define ISM330_FIFO_STATUS1   0x3AU   /* diff_fifo[7:0] (unread word count, low byte) */
+#define ISM330_FIFO_STATUS2   0x3BU   /* [1:0]=diff_fifo[9:8], bit6=fifo_ovr_ia */
+#define ISM330_FIFO_DATA_TAG  0x78U   /* FIFO_DATA_OUT_TAG; 0x78..0x7E auto-wrap per word */
+
+/* Capture-mode sensor config. FS kept at ±2 g / ±250 dps (same as live) so the
+ * decimated OUTX read the FSM uses keeps the 0.061 mg/LSB and 8.75 mdps/LSB scaling.
+ * (Doc §11 suggests ±4 g for shock headroom — provisional; revisit once rail-joint
+ * peak amplitudes are measured. ±2 g avoids a state-dependent scaling branch.) */
+#define CAP_CTRL1_XL_MOVING   0x92U   /* accel ODR=3332Hz (1001), FS=±2g (00), LPF2_XL_EN=1 */
+#define CAP_CTRL8_XL_MOVING   0x00U   /* HPCF_XL=000 → LPF2 cutoff = ODR/4 ≈ 833 Hz (< 1666 Nyquist) */
+#define CAP_CTRL2_G_MOVING    0x60U   /* gyro ODR=416Hz (0110), FS=±250 dps */
+#define CAP_FIFO_CTRL3_MOVING 0x69U   /* BDR_GY=417Hz (6), BDR_XL=3333Hz (9) */
+#define CAP_FIFO_MODE_STREAM  0x06U   /* FIFO_CTRL4: continuous/stream mode */
+#define CAP_FIFO_MODE_BYPASS  0x00U   /* FIFO_CTRL4: bypass (FIFO off / flush) */
+/* Gyro LPF1 (CTRL4_C=0x02, CTRL6_C=0x07 FTYPE=111) left at boot setting: FTYPE=111 is
+ * the narrowest LPF1, so its corner is the lowest of all FTYPE codes and stays below
+ * the 208 Hz Nyquist at 416 Hz ODR. Exact corner: AN5192/AN5398 Table 14. */
+
+/* Live/IDLE restore bytes — must match the boot init in USER CODE 2. */
+#define LIVE_CTRL1_XL         0x42U   /* accel 104Hz, ±2g, LPF2 on */
+#define LIVE_CTRL8_XL         0x20U   /* LPF2 cutoff ODR/10 ≈ 10.4 Hz */
+#define LIVE_CTRL2_G          0x40U   /* gyro 104Hz, ±250 dps */
+
+#define CAP_FIFO_WORD_BYTES   7U      /* 1 tag byte + 6 data bytes per FIFO word */
+#define CAP_FIFO_READ_WORDS   96U     /* max words per Service burst (~672 B ≈ 15 ms I²C @400 kHz) */
+#define CAP_MAX_BURSTS_PER_SVC 12U    /* 12×96=1152 > 1023 FIFO depth — drains full snapshot per call */
+#define CAP_MAX_MISSIONS      8U      /* mission-metadata ring (bookkeeping only; data in PSRAM) */
+#define CAP_RING_WTM_BYTES    (PSRAM_SIZE_BYTES - (PSRAM_SIZE_BYTES / 4U)) /* 75% = 6 MB drain trigger */
+
+/* Per-mission bookkeeping; the sample bytes themselves live in the PSRAM ring. */
+typedef struct
+{
+    uint16_t mission_id;
+    uint32_t start_offset;   /* byte offset into the PSRAM ring where this mission begins */
+    uint32_t byte_count;     /* raw FIFO bytes captured */
+    uint32_t word_count;     /* FIFO words captured (accel + gyro interleaved) */
+    uint32_t overrun_evts;   /* FIFO overrun events seen during this mission (data loss markers) */
+    uint8_t  sealed;         /* 1 once MOVING→IDLE finalizes the mission */
+} CaptureMission_t;
+
+static CaptureMission_t cap_missions[CAP_MAX_MISSIONS];
+static uint8_t  cap_mission_count = 0U;  /* missions opened so far */
+static int8_t   cap_active_idx    = -1;  /* index of in-progress mission, -1 = none */
+static uint32_t cap_ring_wptr     = 0U;  /* next PSRAM write offset [0, PSRAM_SIZE_BYTES) */
+static uint16_t cap_next_id       = 1U;
+static uint8_t  cap_initialized   = 0U;
+static uint8_t  cap_wtm_hit       = 0U;  /* set when the ring crosses 75% (step-4 drain trigger) */
+static uint32_t cap_words_window  = 0U;  /* words captured in the current 1 s log window */
+static uint8_t  cap_fifo_buf[CAP_FIFO_READ_WORDS * CAP_FIFO_WORD_BYTES]; /* SRAM staging for the burst read */
 
 /* USER CODE END PV */
 
@@ -210,6 +286,13 @@ static MX_WIFI_STATUS_T WIFI_WaitForStationIP(uint8_t ip_addr[4], uint32_t timeo
 static void WIFI_DelayWithYield(uint32_t delay_ms);
 static void TELEMETRY_RefreshEnvCache(void);
 static int32_t TELEMETRY_Send(void);
+static int8_t WIFI_PowerOn(void);
+static void WIFI_PowerOff(void);
+/* ADR-020 high-rate ISM330 FIFO capture engine (state-rated) */
+static int8_t   Capture_Init(void);
+static void     Capture_EnterMoving(void);
+static void     Capture_EnterIdle(void);
+static uint16_t Capture_Service(void);
 
 /* USER CODE END PFP */
 
@@ -581,6 +664,372 @@ static int32_t TELEMETRY_Send(void)
   return sent;
 }
 
+#if BENCH_THROUGHPUT
+/* One-shot UDP throughput benchmark. Blasts datagrams as fast as
+ * MX_WIFI_Socket_sendto allows, per payload size, and reports achieved pkt/s
+ * and Mbps over UART. The sender-side rate is the EMW3080 ceiling (sendto
+ * backpressures at the module's real throughput). 1472 B = 1500 MTU − 20 IP
+ * − 8 UDP, the largest payload that avoids IPv4 fragmentation. */
+static void TELEMETRY_BenchThroughput(void)
+{
+  static uint8_t bench_buf[1472];
+  const uint16_t sizes[] = {24U, 256U, 512U, 1024U, 1472U};
+  struct mx_sockaddr_in dest = {0};
+
+  if ((socket_id < 0) || (wifi_station_ready == 0U) || (jetson_ip[0] == 0))
+  {
+    sprintf(uart_buf, "[BENCH] skipped: socket/WiFi not ready\r\n");
+    HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
+    return;
+  }
+
+  dest.sin_len         = sizeof(dest);
+  dest.sin_family      = MX_AF_INET;
+  dest.sin_port        = PLUDOS_HTONS(TELEMETRY_PORT);
+  dest.sin_addr.s_addr = (uint32_t)mx_aton_r(jetson_ip);
+
+  for (uint32_t s = 0U; s < (sizeof(sizes) / sizeof(sizes[0])); s++)
+  {
+    uint16_t len = sizes[s];
+    uint32_t seq = 0U, ok = 0U, fail = 0U, bytes = 0U;
+    uint32_t t0 = HAL_GetTick();
+
+    while ((HAL_GetTick() - t0) < 3000U)   /* 3 s per payload size */
+    {
+      seq++;
+      bench_buf[0] = (uint8_t)(seq >> 24); /* big-endian seq → loss check on the receiver */
+      bench_buf[1] = (uint8_t)(seq >> 16);
+      bench_buf[2] = (uint8_t)(seq >> 8);
+      bench_buf[3] = (uint8_t)(seq);
+      int32_t r = MX_WIFI_Socket_sendto(wifi_obj, socket_id, bench_buf, len,
+                                        0, (struct mx_sockaddr *)&dest, sizeof(dest));
+      if (r == (int32_t)len) { ok++; bytes += len; } else { fail++; }
+    }
+
+    uint32_t dt   = HAL_GetTick() - t0;                                   /* ms */
+    uint32_t pps  = (dt > 0U) ? ((ok * 1000U) / dt) : 0U;
+    uint32_t kbps = (dt > 0U) ? (uint32_t)(((uint64_t)bytes * 8U) / dt) : 0U; /* bytes*8/ms = kbit/s */
+    sprintf(uart_buf, "[BENCH] size=%4u ok=%6lu fail=%6lu  %5lu pkt/s  %lu.%03lu Mbps\r\n",
+            (unsigned)len, (unsigned long)ok, (unsigned long)fail, (unsigned long)pps,
+            (unsigned long)(kbps / 1000U), (unsigned long)(kbps % 1000U));
+    HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 2000);
+    HAL_Delay(200);
+  }
+
+  sprintf(uart_buf, "[BENCH] done — resuming normal telemetry\r\n");
+  HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
+}
+#endif /* BENCH_THROUGHPUT */
+
+/* Power up the EMW3080 and bring the station fully online: probe the SPI bus
+ * (once), hard-reset the module, init the driver, register the status callback,
+ * connect to the AP, wait for a DHCP lease and arm the telemetry UDP socket.
+ * Returns 0 on success (socket armed), -1 on any failure. Re-runnable after
+ * WIFI_PowerOff(): the held-in-reset module comes back cold exactly like boot,
+ * so we always hard-reset + re-Init here. This is the on-demand power gate for
+ * the ADR-020 buffer-then-drain model — WiFi is only powered when draining. */
+static int8_t WIFI_PowerOn(void)
+{
+  WIFI_SPI_ApplySafeTiming();  /* re-apply the MXCHIP-safe SPI2 timing (idempotent) */
+
+  /* Probe registers the host-side SPI bus driver — needed once per boot only. */
+  if (wifi_obj == NULL)
+  {
+    void *ctx = NULL;
+    if ((mxwifi_probe(&ctx) != 0) || (ctx == NULL))
+    {
+      sprintf(uart_buf, "[NETWORK] ERROR: WiFi SPI bus registration failed\r\n");
+      HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+      return -1;
+    }
+    wifi_obj = (MX_WIFIObject_t *)ctx;
+  }
+
+  /* Always hard-reset: releases the RESET pin and reboots the module from the
+   * held-in-reset (off) state into a clean SPI handshake. */
+  if (MX_WIFI_HardResetModule(wifi_obj) != MX_WIFI_STATUS_OK)
+  {
+    sprintf(uart_buf, "[NETWORK] ERROR: hard reset failed\r\n");
+    HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+    wifi_driver_initialized = 0U;
+    return -1;
+  }
+
+  if (MX_WIFI_Init(wifi_obj) != MX_WIFI_STATUS_OK)
+  {
+    sprintf(uart_buf, "[NETWORK] ERROR: module init failed\r\n");
+    HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+    wifi_driver_initialized = 0U;
+    return -1;
+  }
+
+  wifi_driver_initialized          = 1U;
+  wifi_obj->NetSettings.DHCP_IsEnabled = 1U;
+  wifi_station_event               = 0xFF;
+  wifi_station_ready               = 0U;
+  (void)MX_WIFI_RegisterStatusCallback_if(wifi_obj, WIFI_StatusCallback, NULL, MC_STATION);
+
+  if (MX_WIFI_Connect(wifi_obj, WIFI_SSID, WIFI_PASSWORD, MX_WIFI_SEC_AUTO) != MX_WIFI_STATUS_OK)
+  {
+    sprintf(uart_buf, "[NETWORK] ERROR: connect failed (check SSID/password)\r\n");
+    HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+    return -1;
+  }
+
+  uint8_t ip_addr[4] = {0};
+  if (WIFI_WaitForStationIP(ip_addr, 15000U) != MX_WIFI_STATUS_OK)
+  {
+    sprintf(uart_buf, "[NETWORK] ERROR: no DHCP lease\r\n");
+    HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+    return -1;
+  }
+  sprintf(uart_buf, "[NETWORK] SUCCESS! Station IP: %d.%d.%d.%d\r\n",
+          ip_addr[0], ip_addr[1], ip_addr[2], ip_addr[3]);
+  HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+  (void)memcpy(stm32_ip, ip_addr, 4U);
+
+  /* Resolve the gateway by beacon only the first time; keep the cached IP across
+   * later power cycles so re-draining does not pay the beacon wait every time. */
+  if (jetson_ip[0] == 0)
+  {
+    if (BEACON_Run(BEACON_MAX_RETRIES, BEACON_TIMEOUT_MS) == 0U)
+    {
+      strncpy(jetson_ip, JETSON_IP, sizeof(jetson_ip) - 1U);
+      jetson_ip[sizeof(jetson_ip) - 1U] = 0;
+      sprintf(uart_buf, "[BEACON] Timed out — fallback IP: %s\r\n", JETSON_IP);
+      HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+    }
+  }
+
+  socket_id = MX_WIFI_Socket_create(wifi_obj, MX_AF_INET, MX_SOCK_DGRAM, MX_IPPROTO_UDP);
+  if (socket_id < 0)
+  {
+    sprintf(uart_buf, "[NETWORK] ERROR: failed to create UDP socket\r\n");
+    HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+    return -1;
+  }
+  sprintf(uart_buf, "[NETWORK] PludosTelemetry stream armed → udp://%s:%u\r\n",
+          jetson_ip, (unsigned)TELEMETRY_PORT);
+  HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+  return 0;
+}
+
+/* Power down the EMW3080 to the lowest-power state: close the socket, leave the
+ * AP, then hold the module in hardware reset (RESET pin = WRLS_WKUP_W low). The
+ * host-side SPI bus stays registered (wifi_obj kept) so WIFI_PowerOn() can bring
+ * it straight back without re-probing. Clears the ready flags so the main loop's
+ * WiFi paths stay quiescent until the next WIFI_PowerOn(). */
+static void WIFI_PowerOff(void)
+{
+  if (socket_id >= 0)
+  {
+    (void)MX_WIFI_Socket_close(wifi_obj, socket_id);
+    socket_id = -1;
+  }
+  if ((wifi_obj != NULL) && (wifi_driver_initialized != 0U))
+  {
+    (void)MX_WIFI_Disconnect(wifi_obj);
+  }
+  /* Assert RESET low — module fully off; drains no radio current until PowerOn. */
+  HAL_GPIO_WritePin(WRLS_WKUP_W_GPIO_Port, WRLS_WKUP_W_Pin, GPIO_PIN_RESET);
+
+  wifi_driver_initialized = 0U;
+  wifi_station_ready      = 0U;
+  wifi_station_event      = 0xFF;
+
+  sprintf(uart_buf, "[NETWORK] WiFi powered off (module held in reset)\r\n");
+  HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+}
+
+/* Put the FIFO in bypass and reset capture bookkeeping. Call once after the ISM330
+ * boot init; PSRAM must already be memory-mapped (PSRAM_Init). Returns 0 on success. */
+static int8_t Capture_Init(void)
+{
+  uint8_t bypass = CAP_FIFO_MODE_BYPASS;
+  if (HAL_I2C_Mem_Write(&hi2c2, ISM330_ADDR, ISM330_FIFO_CTRL4, 1, &bypass, 1, 100) != HAL_OK)
+  {
+    return -1;
+  }
+  cap_ring_wptr     = 0U;
+  cap_mission_count = 0U;
+  cap_active_idx    = -1;
+  cap_next_id       = 1U;
+  cap_wtm_hit       = 0U;
+  cap_initialized   = 1U;
+  return 0;
+}
+
+/* Switch the ISM330 to high-rate capture (accel 3332 Hz, gyro 416 Hz, FIFO stream)
+ * and open a new mission in the PSRAM ring. FS/scaling stay at the live ±2 g/±250 dps,
+ * so the FSM's decimated OUTX read keeps working unchanged. */
+static void Capture_EnterMoving(void)
+{
+  uint8_t v;
+  CaptureMission_t *m;
+
+  if (cap_initialized == 0U)
+  {
+    return;
+  }
+
+  /* High-rate sensor config (gyro LPF1 CTRL4_C/CTRL6_C left at boot FTYPE=111). */
+  v = CAP_CTRL1_XL_MOVING; (void)HAL_I2C_Mem_Write(&hi2c2, ISM330_ADDR, CTRL1_XL, 1, &v, 1, 100);
+  v = CAP_CTRL8_XL_MOVING; (void)HAL_I2C_Mem_Write(&hi2c2, ISM330_ADDR, CTRL8_XL, 1, &v, 1, 100);
+  v = CAP_CTRL2_G_MOVING;  (void)HAL_I2C_Mem_Write(&hi2c2, ISM330_ADDR, CTRL2_G,  1, &v, 1, 100);
+
+  /* Batch rates, then BYPASS→STREAM toggle to flush any stale words before capture. */
+  v = CAP_FIFO_CTRL3_MOVING; (void)HAL_I2C_Mem_Write(&hi2c2, ISM330_ADDR, ISM330_FIFO_CTRL3, 1, &v, 1, 100);
+  v = CAP_FIFO_MODE_BYPASS;  (void)HAL_I2C_Mem_Write(&hi2c2, ISM330_ADDR, ISM330_FIFO_CTRL4, 1, &v, 1, 100);
+  v = CAP_FIFO_MODE_STREAM;  (void)HAL_I2C_Mem_Write(&hi2c2, ISM330_ADDR, ISM330_FIFO_CTRL4, 1, &v, 1, 100);
+
+  /* Open a mission record. The PSRAM ring keeps wrapping regardless; if the metadata
+   * table is full we reuse the last slot (bookkeeping degrades, data path does not). */
+  if (cap_mission_count < CAP_MAX_MISSIONS)
+  {
+    cap_active_idx = (int8_t)cap_mission_count;
+    cap_mission_count++;
+  }
+  else
+  {
+    cap_active_idx = (int8_t)(CAP_MAX_MISSIONS - 1U);
+  }
+  m = &cap_missions[cap_active_idx];
+  m->mission_id   = cap_next_id++;
+  m->start_offset = cap_ring_wptr;
+  m->byte_count   = 0U;
+  m->word_count   = 0U;
+  m->overrun_evts = 0U;
+  m->sealed       = 0U;
+  cap_wtm_hit     = 0U;
+
+  sprintf(uart_buf, "[CAPTURE] mission %u start @0x%06lX (accel 3332Hz, gyro 416Hz)\r\n",
+          (unsigned)m->mission_id, (unsigned long)m->start_offset);
+  HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+}
+
+/* Drain pending FIFO words into the PSRAM ring. Returns the number of words copied
+ * this call. The MOVING loop runs at ~25 Hz, far slower than the 3749 word/s FIFO
+ * production rate, so a single 96-word burst per call cannot keep up (96×25 < 3749)
+ * and the FIFO overruns. We therefore loop bursts until the FIFO is empty, bounded by
+ * CAP_MAX_BURSTS_PER_SVC (12×96 > 1023 = full FIFO depth) so the call still terminates. */
+static uint16_t Capture_Service(void)
+{
+  uint8_t  s1, s2, burst;
+  uint16_t diff, n;
+  uint32_t bytes, i;
+  uint16_t total = 0U;
+  volatile uint8_t *ring;
+  CaptureMission_t *m;
+
+  if ((cap_initialized == 0U) || (cap_active_idx < 0))
+  {
+    return 0U;
+  }
+
+  m    = &cap_missions[cap_active_idx];
+  ring = (volatile uint8_t *)PSRAM_BASE_ADDR;
+
+  for (burst = 0U; burst < CAP_MAX_BURSTS_PER_SVC; burst++)
+  {
+    if (HAL_I2C_Mem_Read(&hi2c2, ISM330_ADDR, ISM330_FIFO_STATUS1, 1, &s1, 1, 100) != HAL_OK)
+    {
+      break;
+    }
+    if (HAL_I2C_Mem_Read(&hi2c2, ISM330_ADDR, ISM330_FIFO_STATUS2, 1, &s2, 1, 100) != HAL_OK)
+    {
+      break;
+    }
+
+    if ((s2 & 0x40U) != 0U)
+    {
+      m->overrun_evts++; /* fifo_ovr_ia: FIFO filled faster than drained — words were lost */
+    }
+
+    diff = (uint16_t)s1 | ((uint16_t)(s2 & 0x03U) << 8); /* 10-bit unread word count */
+    if (diff == 0U)
+    {
+      break; /* FIFO empty — snapshot fully drained */
+    }
+    n = (diff > CAP_FIFO_READ_WORDS) ? CAP_FIFO_READ_WORDS : diff;
+
+    /* One burst read of n words. FIFO_DATA_OUT (0x78..0x7E) auto-wraps 0x7E→0x78 per word
+     * on a multi-byte read (ISM330DHCX datasheet), so n*7 contiguous bytes from 0x78 are
+     * n back-to-back [tag, X_L, X_H, Y_L, Y_H, Z_L, Z_H] words. */
+    if (HAL_I2C_Mem_Read(&hi2c2, ISM330_ADDR, ISM330_FIFO_DATA_TAG, 1,
+                         cap_fifo_buf, (uint16_t)(n * CAP_FIFO_WORD_BYTES), 100) != HAL_OK)
+    {
+      break;
+    }
+
+    /* Copy raw words into the memory-mapped PSRAM ring, wrapping at the 8 MB boundary.
+     * Tags are preserved so the gateway demuxes accel (0x02) vs gyro (0x01) and rebuilds
+     * each stream's timeline as t0 + index/ODR (sampling_strategy.md §12). */
+    bytes = (uint32_t)n * CAP_FIFO_WORD_BYTES;
+    for (i = 0U; i < bytes; i++)
+    {
+      ring[cap_ring_wptr] = cap_fifo_buf[i];
+      cap_ring_wptr++;
+      if (cap_ring_wptr >= PSRAM_SIZE_BYTES)
+      {
+        cap_ring_wptr = 0U; /* ring wrap */
+      }
+    }
+    m->byte_count += bytes;
+    m->word_count += n;
+    total = (uint16_t)(total + n);
+
+    if (n < CAP_FIFO_READ_WORDS)
+    {
+      break; /* read everything that was queued — no full burst pending */
+    }
+  }
+
+  /* Watermark for the step-4 mid-mission drain (WiFi on once the ring crosses ~75%). */
+  if ((cap_wtm_hit == 0U) && (m->byte_count >= CAP_RING_WTM_BYTES))
+  {
+    cap_wtm_hit = 1U;
+  }
+
+  return total;
+}
+
+/* Finalize the active mission: empty the FIFO, stop it (bypass), restore the low-rate
+ * live config, and seal the mission record for the drain stage. */
+static void Capture_EnterIdle(void)
+{
+  uint8_t v, i;
+  CaptureMission_t *m;
+
+  if ((cap_initialized == 0U) || (cap_active_idx < 0))
+  {
+    return;
+  }
+
+  /* Pull remaining queued words; 12 × 96 > 1023 FIFO depth, so the FIFO fully empties. */
+  for (i = 0U; i < 12U; i++)
+  {
+    if (Capture_Service() == 0U)
+    {
+      break;
+    }
+  }
+
+  v = CAP_FIFO_MODE_BYPASS; (void)HAL_I2C_Mem_Write(&hi2c2, ISM330_ADDR, ISM330_FIFO_CTRL4, 1, &v, 1, 100);
+
+  /* Restore the anti-aliased live config (matches the boot init in USER CODE 2). */
+  v = LIVE_CTRL1_XL; (void)HAL_I2C_Mem_Write(&hi2c2, ISM330_ADDR, CTRL1_XL, 1, &v, 1, 100);
+  v = LIVE_CTRL8_XL; (void)HAL_I2C_Mem_Write(&hi2c2, ISM330_ADDR, CTRL8_XL, 1, &v, 1, 100);
+  v = LIVE_CTRL2_G;  (void)HAL_I2C_Mem_Write(&hi2c2, ISM330_ADDR, CTRL2_G,  1, &v, 1, 100);
+
+  m = &cap_missions[cap_active_idx];
+  m->sealed = 1U;
+  sprintf(uart_buf, "[CAPTURE] mission %u sealed: %lu words, %lu B, ovr=%lu\r\n",
+          (unsigned)m->mission_id, (unsigned long)m->word_count,
+          (unsigned long)m->byte_count, (unsigned long)m->overrun_evts);
+  HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+  cap_active_idx = -1;
+}
+
 /* USER CODE END 0 */
 
 /**
@@ -627,6 +1076,33 @@ int main(void)
   MX_UCPD1_Init();
   MX_USB_OTG_FS_PCD_Init();
   /* USER CODE BEGIN 2 */
+
+  // -----------------------------------------------------------------
+  // PSRAM BRING-UP (APS6408 on OCTOSPI1) — ADR-020 capture buffer
+  // -----------------------------------------------------------------
+  /* Finish device-side config (CubeMX only init the peripheral) and enter
+     memory-mapped mode, then self-test before relying on the 8 MB region. */
+  if (PSRAM_Init() == 0)
+  {
+    sprintf(uart_buf, "[PSRAM] APS6408 memory-mapped at 0x%08lX (%lu KB)\r\n",
+            PSRAM_BASE_ADDR, PSRAM_SIZE_BYTES / 1024U);
+    HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
+
+    if (PSRAM_SelfTest() == 0)
+    {
+      sprintf(uart_buf, "[PSRAM] self-test PASS\r\n");
+    }
+    else
+    {
+      sprintf(uart_buf, "[PSRAM] ERROR: self-test FAILED\r\n");
+    }
+    HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
+  }
+  else
+  {
+    sprintf(uart_buf, "[PSRAM] ERROR: init failed\r\n");
+    HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
+  }
 
   // -----------------------------------------------------------------
   // ACCELEROMETER INITIALIZATION (ISM330)
@@ -689,6 +1165,13 @@ int main(void)
   uint8_t gyro_filter = 0x07;   /* CTRL6_C: FTYPE=111, other fields default 0 */
   (void)HAL_I2C_Mem_Write(&hi2c2, ISM330_ADDR, CTRL6_C, 1, &gyro_filter, 1, 100);
 
+  /* ADR-020: arm the high-rate FIFO capture engine (FIFO bypassed until first MOVING). */
+  if (Capture_Init() != 0)
+  {
+    sprintf(uart_buf, "[CAPTURE] ERROR: FIFO init failed\r\n");
+    HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+  }
+
   // -----------------------------------------------------------------
   // HUMIDITY/TEMPERATURE INITIALIZATION (HTS221)
   // -----------------------------------------------------------------
@@ -706,158 +1189,41 @@ int main(void)
   sprintf(uart_buf, "[NETWORK] WiFi init sequence starting...\r\n");
   HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
 
-  WIFI_SPI_ApplySafeTiming();
-  sprintf(uart_buf, "[NETWORK] SPI2 reconfigured for MXCHIP safe mode (~10 MHz)\r\n");
-  HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
-
-  sprintf(uart_buf, "[NETWORK] Registering WiFi SPI bus...\r\n");
-  HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
-
-  void *wifi_ll_context = NULL;
-  uint32_t probe_start = HAL_GetTick();
-  int probe_result = mxwifi_probe(&wifi_ll_context);
-  uint32_t probe_duration = HAL_GetTick() - probe_start;
-
-  wifi_obj = (MX_WIFIObject_t *)wifi_ll_context;
-
-  sprintf(uart_buf, "[NETWORK] WiFi SPI bus probe result: %d (took %lu ms)\r\n", probe_result, probe_duration);
-  HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
-
-  if ((probe_result == 0) && (wifi_obj != NULL))
+  /* Bring the radio fully online (probe + reset + init + connect + DHCP + socket).
+   * This is now the single on-demand power gate (WIFI_PowerOn); the ADR-020 drain
+   * model toggles it off during MOVING and back on only to drain. */
+  if (WIFI_PowerOn() != 0)
   {
-    MX_WIFI_STATUS_T reset_status = MX_WIFI_STATUS_OK;
-
-    if (wifi_obj->Runtime.interfaces == 0U)
-    {
-      uint32_t reset_start = HAL_GetTick();
-      sprintf(uart_buf, "[NETWORK] Performing WiFi module hard reset...\r\n");
-      HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
-
-      reset_status = MX_WIFI_HardResetModule(wifi_obj);
-
-      sprintf(uart_buf, "[NETWORK] MX_WIFI_HardResetModule returned: 0x%02X after %lu ms\r\n",
-              reset_status, HAL_GetTick() - reset_start);
-      HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
-    }
-
-    if (reset_status == MX_WIFI_STATUS_OK)
-    {
-      uint32_t init_start_time = HAL_GetTick();
-
-      sprintf(uart_buf, "[NETWORK] Initializing MXCHIP (SPI Handshake)...\r\n");
-      HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
-
-      MX_WIFI_STATUS_T init_status = MX_WIFI_Init(wifi_obj);
-      uint32_t init_duration = HAL_GetTick() - init_start_time;
-
-      sprintf(uart_buf, "[NETWORK] MX_WIFI_Init returned: 0x%02X after %lu ms\r\n", init_status, init_duration);
-      HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
-
-      if (init_status == MX_WIFI_STATUS_OK)
-      {
-        MX_WIFI_STATUS_T callback_status;
-
-        wifi_driver_initialized = 1U;
-        wifi_obj->NetSettings.DHCP_IsEnabled = 1U;
-        wifi_station_event = 0xFF;
-        wifi_station_ready = 0U;
-
-        callback_status = MX_WIFI_RegisterStatusCallback_if(wifi_obj, WIFI_StatusCallback, NULL, MC_STATION);
-        sprintf(uart_buf, "[NETWORK] MX_WIFI_RegisterStatusCallback_if returned: 0x%02X\r\n", callback_status);
-        HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
-
-        sprintf(uart_buf, "[NETWORK] SPI link OK. Connecting to WiFi: '%s'\r\n", WIFI_SSID);
-        HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
-
-        uint32_t connect_start = HAL_GetTick();
-        MX_WIFI_STATUS_T connect_status = MX_WIFI_Connect(wifi_obj, WIFI_SSID, WIFI_PASSWORD, MX_WIFI_SEC_AUTO);
-        uint32_t connect_duration = HAL_GetTick() - connect_start;
-
-        sprintf(uart_buf, "[NETWORK] MX_WIFI_Connect returned: 0x%02X after %lu ms\r\n",
-                connect_status, connect_duration);
-        HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
-
-        if (connect_status == MX_WIFI_STATUS_OK)
-        {
-          uint8_t ip_addr[4] = {0};
-          MX_WIFI_STATUS_T ip_wait_status = WIFI_WaitForStationIP(ip_addr, 15000U);
-
-          sprintf(uart_buf, "[NETWORK] DHCP wait result: 0x%02X\r\n", ip_wait_status);
-          HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
-
-          if (ip_wait_status == MX_WIFI_STATUS_OK)
-          {
-            sprintf(uart_buf, "[NETWORK] SUCCESS! Station IP: %d.%d.%d.%d\r\n",
-                    ip_addr[0], ip_addr[1], ip_addr[2], ip_addr[3]);
-            HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
-            /* Store for beacon subnet filter — BEACON_Run rejects IPs outside this /24. */
-            (void)memcpy(stm32_ip, ip_addr, 4U);
-
-            /* Try beacon first; fall back to JETSON_IP if the Jetson is not yet reachable.
-             * The main loop retries the beacon every BEACON_RETRY_PERIOD_MS (IDLE only),
-             * so a late-starting Jetson is picked up automatically without a reflash. */
-            if (BEACON_Run(BEACON_MAX_RETRIES, BEACON_TIMEOUT_MS) == 0U)
-            {
-              /* Bounded copy: JETSON_IP comes from wifi_credentials.h; if a misconfigured
-               * value is longer than the 16-byte jetson_ip buffer, strncpy clamps safely. */
-              strncpy(jetson_ip, JETSON_IP, sizeof(jetson_ip) - 1U);
-              jetson_ip[sizeof(jetson_ip) - 1U] = 0;
-              sprintf(uart_buf, "[BEACON] Timed out — fallback IP: %s\r\n", JETSON_IP);
-              HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
-            }
-
-            socket_id = MX_WIFI_Socket_create(wifi_obj, MX_AF_INET, MX_SOCK_DGRAM, MX_IPPROTO_UDP);
-            if (socket_id >= 0)
-            {
-              sprintf(uart_buf, "[NETWORK] UDP Socket created (ID: %ld)\r\n", (long)socket_id);
-              HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
-              sprintf(uart_buf, "[NETWORK] PludosTelemetry stream armed → udp://%s:%u\r\n",
-                      jetson_ip, (unsigned)TELEMETRY_PORT);
-            }
-            else
-            {
-              sprintf(uart_buf, "[NETWORK] ERROR: Failed to create UDP socket\r\n");
-              socket_id = -1;
-            }
-            HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
-          }
-          else
-          {
-            sprintf(uart_buf, "[NETWORK] ERROR: WiFi connected command accepted, but no station IP was assigned\r\n");
-            HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
-            socket_id = -1;
-          }
-        }
-        else
-        {
-          sprintf(uart_buf, "[NETWORK] Connection failed - check SSID/password/security mode\r\n");
-          HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
-          socket_id = -1;
-        }
-      }
-      else
-      {
-        wifi_driver_initialized = 0U;
-        sprintf(uart_buf, "[NETWORK] Module init failed\r\n");
-        HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
-        socket_id = -1;
-      }
-    }
-    else
-    {
-      wifi_driver_initialized = 0U;
-      sprintf(uart_buf, "[NETWORK] Hard reset failed - check module power and firmware\r\n");
-      HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
-      socket_id = -1;
-    }
-  }
-  else
-  {
-    wifi_driver_initialized = 0U;
-    sprintf(uart_buf, "[NETWORK] ERROR: WiFi SPI bus registration failed\r\n");
+    sprintf(uart_buf, "[NETWORK] WiFi bring-up failed — telemetry disabled this boot\r\n");
     HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
-    socket_id = -1;
   }
+
+#if WIFI_POWERCYCLE_SELFTEST
+  /* One-shot reversibility check: power the radio down to held-in-reset, then back
+   * up, and confirm the socket re-arms. Validates the load-bearing ADR-020 drain
+   * assumption that WiFi can be cycled. Remove (set define to 0) after verifying. */
+  if (socket_id >= 0)
+  {
+    sprintf(uart_buf, "[SELFTEST] WiFi power-cycle: powering OFF...\r\n");
+    HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
+    WIFI_PowerOff();
+    HAL_Delay(1000);
+    sprintf(uart_buf, "[SELFTEST] WiFi power-cycle: powering ON...\r\n");
+    HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
+    sprintf(uart_buf, (WIFI_PowerOn() == 0)
+            ? "[SELFTEST] WiFi power-cycle PASS (socket re-armed)\r\n"
+            : "[SELFTEST] WiFi power-cycle FAIL (re-arm failed)\r\n");
+    HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
+  }
+#endif
+
+#if BENCH_THROUGHPUT
+  /* One-shot radio throughput sweep on a freshly armed socket, then normal telemetry resumes. */
+  if (socket_id >= 0)
+  {
+    TELEMETRY_BenchThroughput();
+  }
+#endif
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -947,6 +1313,7 @@ int main(void)
               sprintf(uart_buf, "[FSM] IDLE -> MOVING  (dwell %ums reached)\r\n",
                       (unsigned)MOVEMENT_DWELL_MS);
               HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+              Capture_EnterMoving(); /* start high-rate FIFO capture for this mission */
             }
           }
         }
@@ -969,6 +1336,7 @@ int main(void)
               sprintf(uart_buf, "[FSM] MOVING -> IDLE  (no movement %us)\r\n",
                       (unsigned)(NO_MOVEMENT_TIMEOUT_MS / 1000U));
               HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+              Capture_EnterIdle(); /* drain + seal the mission, restore live config */
             }
           }
         }
@@ -981,6 +1349,14 @@ int main(void)
         HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
       }
       (void)a_mag_g2; /* suppress unused-warning when FSM branches don't read it directly */
+    }
+
+    /* -----------------------------------------------------------------
+     * PHASE 2b: drain the high-rate ISM330 FIFO into PSRAM while MOVING
+     * --------------------------------------------------------------- */
+    if (current_state == STATE_MOVING)
+    {
+      cap_words_window += Capture_Service();
     }
 
     /* -----------------------------------------------------------------
@@ -1072,12 +1448,27 @@ int main(void)
     if ((HAL_GetTick() - tx_window_start_tick) >= 1000U)
     {
       sprintf(uart_buf,
-              "[STREAM] st=%u tx=%lu/s accel=(%.2f,%.2f,%.2f)g gyro=(%.1f,%.1f,%.1f)dps temp=%.1fC hum=%.0f%%\r\n",
-              (unsigned)current_state, (unsigned long)tx_count_window,
+              "[STREAM] %s tx=%lu/s (live decimated view) accel=(%.2f,%.2f,%.2f)g gyro=(%.1f,%.1f,%.1f)dps temp=%.1fC hum=%.0f%%\r\n",
+              (current_state == STATE_MOVING) ? "MOVING" : "IDLE",
+              (unsigned long)tx_count_window,
               vib_x, vib_y, vib_z,
               gyro_x, gyro_y, gyro_z,
               cached_temp_c, cached_humidity_pct);
       HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+
+      /* Capture throughput while MOVING (expect ~3749 words/s = 3332 accel + 416 gyro). */
+      if ((current_state == STATE_MOVING) || (cap_words_window > 0U))
+      {
+        CaptureMission_t *cm = (cap_active_idx >= 0) ? &cap_missions[cap_active_idx] : NULL;
+        sprintf(uart_buf, "[CAPTURE] %lu words/s ring=%luKB ovr=%lu wtm=%u\r\n",
+                (unsigned long)cap_words_window,
+                (unsigned long)((cm != NULL) ? (cm->byte_count / 1024U) : 0U),
+                (unsigned long)((cm != NULL) ? cm->overrun_evts : 0U),
+                (unsigned)cap_wtm_hit);
+        HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+      }
+      cap_words_window = 0U;
+
       tx_count_window      = 0U;
       tx_window_start_tick = HAL_GetTick();
     }
@@ -1287,7 +1678,7 @@ static void MX_I2C2_Init(void)
 
   /* USER CODE END I2C2_Init 1 */
   hi2c2.Instance = I2C2;
-  hi2c2.Init.Timing = 0x30909DEC;
+  hi2c2.Init.Timing = 0x00F07BFF;
   hi2c2.Init.OwnAddress1 = 0;
   hi2c2.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
   hi2c2.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
@@ -1496,12 +1887,12 @@ static void MX_SPI2_Init(void)
   hspi2.Init.CLKPolarity = SPI_POLARITY_LOW;
   hspi2.Init.CLKPhase = SPI_PHASE_1EDGE;
   hspi2.Init.NSS = SPI_NSS_SOFT;
-  hspi2.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_2;
+  hspi2.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_16;
   hspi2.Init.FirstBit = SPI_FIRSTBIT_MSB;
   hspi2.Init.TIMode = SPI_TIMODE_DISABLE;
   hspi2.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
   hspi2.Init.CRCPolynomial = 0x7;
-  hspi2.Init.NSSPMode = SPI_NSS_PULSE_ENABLE;
+  hspi2.Init.NSSPMode = SPI_NSS_PULSE_DISABLE;
   hspi2.Init.NSSPolarity = SPI_NSS_POLARITY_LOW;
   hspi2.Init.FifoThreshold = SPI_FIFO_THRESHOLD_01DATA;
   hspi2.Init.MasterSSIdleness = SPI_MASTER_SS_IDLENESS_00CYCLE;

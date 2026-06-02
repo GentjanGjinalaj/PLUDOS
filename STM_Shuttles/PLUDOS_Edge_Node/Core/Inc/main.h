@@ -201,7 +201,4 @@ void Error_Handler(void);
 }
 #endif
 
-/* Forward declaration for WiFi ISR callback */
-extern void mxchip_WIFI_ISR(uint16_t isr_source);
-
 #endif /* __MAIN_H */

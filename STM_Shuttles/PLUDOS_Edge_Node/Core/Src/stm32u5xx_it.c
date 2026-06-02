@@ -51,11 +51,23 @@
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+/* MXCHIP EMW3080 SPI flow/notify IRQ routing. HAL_GPIO_EXTI_IRQHandler calls
+   this on every rising edge; without it the WiFi SPI semaphores (SpiTxRxSem /
+   SpiFlowRiseSem) are never signalled and MX_WIFI_Init times out after 10 s.
+   Kept inside this guard so CubeMX regeneration cannot wipe it
+   (see docs/WIFI_FIX_AND_BUILD.md). */
+extern void mxchip_WIFI_ISR(uint16_t isr_source);
 
+void HAL_GPIO_EXTI_Rising_Callback(uint16_t GPIO_Pin)
+{
+  if ((GPIO_Pin == WRLS_NOTIFY_Pin) || (GPIO_Pin == WRLS_FLOW_Pin))
+  {
+    mxchip_WIFI_ISR(GPIO_Pin);
+  }
+}
 /* USER CODE END 0 */
 
 /* External variables --------------------------------------------------------*/
-extern SPI_HandleTypeDef hspi2;
 
 /* USER CODE BEGIN EV */
 
@@ -200,14 +212,6 @@ void SysTick_Handler(void)
 /******************************************************************************/
 
 /**
-  * @brief This function handles SPI2 global interrupt.
-  */
-void SPI2_IRQHandler(void)
-{
-  HAL_SPI_IRQHandler(&hspi2);
-}
-
-/**
   * @brief This function handles EXTI Line14 interrupt.
   */
 void EXTI14_IRQHandler(void)
@@ -233,52 +237,6 @@ void EXTI15_IRQHandler(void)
   /* USER CODE BEGIN EXTI15_IRQn 1 */
 
   /* USER CODE END EXTI15_IRQn 1 */
-}
-
-/**
-  * @brief  Weak function called by HAL_GPIO_EXTI_IRQHandler for EXTI interrupts
-  *         Routes WiFi interrupt events to the MXCHIP driver
-  */
-extern void mxchip_WIFI_ISR(uint16_t isr_source);
-extern void HAL_SPI_TransferCallback(void *hspi);
-
-void HAL_GPIO_EXTI_Rising_Callback(uint16_t GPIO_Pin)
-{
-  /* Route WRLS_NOTIFY_Pin (EXTI14) and WRLS_FLOW_Pin (EXTI15) interrupts to WiFi driver */
-  if (GPIO_Pin == WRLS_NOTIFY_Pin)
-  {
-    /* NOTIFY interrupt - data ready from MXCHIP */
-    mxchip_WIFI_ISR(GPIO_Pin);
-  }
-  else if (GPIO_Pin == WRLS_FLOW_Pin)
-  {
-    /* FLOW interrupt - ready for more data */
-    mxchip_WIFI_ISR(GPIO_Pin);
-  }
-}
-
-void HAL_SPI_RxCpltCallback(SPI_HandleTypeDef *hspi)
-{
-  if (hspi == &hspi2)
-  {
-    HAL_SPI_TransferCallback(hspi);
-  }
-}
-
-void HAL_SPI_TxCpltCallback(SPI_HandleTypeDef *hspi)
-{
-  if (hspi == &hspi2)
-  {
-    HAL_SPI_TransferCallback(hspi);
-  }
-}
-
-void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi)
-{
-  if (hspi == &hspi2)
-  {
-    HAL_SPI_TransferCallback(hspi);
-  }
 }
 
 /* USER CODE BEGIN 1 */
