@@ -633,3 +633,172 @@ write. Trigger via a CoAP CON control message (ADR-001's reserved use).
   this with ECDSA signing.
 - SBSFU integration (TrustZone flash layout, signing toolchain) is a multi-week
   effort — hence the phase split rather than jumping straight to secure OTA.
+
+## ADR-020 — High-rate vibration capture: PSRAM mission buffer + burst drain
+**Status:** Open (proposed). EMW3080 benchmark **resolved 2026-06-01**; now gated
+on one `.ioc` change (I²C2 → Fast mode) plus implementation. Adds a new capture
+mode *alongside* ADR-015's continuous stream — it does not replace it. The full
+executable strategy (rates, filters, drain protocol, CubeMX steps, Jetson
+changes) lives in `sampling_strategy.md`; this ADR is the decision record.
+
+**Context:** ADR-015 deliberately removed the SRAM buffer in favour of a
+continuous 50 Hz UDP motion-context stream. That is the right design for the
+idle/moving FSM. It is the wrong design for **machine-health / vibration ML**,
+which wants kHz accelerometer data (ISO 20816 content reaches ~1 kHz). The
+ISM330DHCX supports ODRs up to 6.66 kHz, but the EMW3080 Wi-Fi link cannot ship
+kHz raw continuously. Two facts make a buffered approach viable:
+- **Missions are short:** ~15 s average, 30 s worst case (real Savoye XTPS
+  pick-to-elevator cycle). A whole mission of raw fits in memory.
+- **The board has external memory:** B-U585I-IOT02A carries **8 MB Octo-SPI
+  PSRAM** (64-Mbit) and 64 MB QSPI flash on top of the 768 KB internal SRAM
+  (UM2839 §1 / DB4410). 8 MB ≫ any single mission at kHz.
+
+The EMW3080 radio ceiling was measured with the `BENCH_THROUGHPUT` one-shot sweep
+in `main.c` (sender-side pkt/s is the real limit because `MX_WIFI_Socket_sendto`
+backpressures at the module's rate). **Result (paired UART sender + Jetson pcap,
+desk, single shuttle, 3 runs within ~1 %):** throughput is packet-rate-bound and
+climbs monotonically with datagram size — 24 B = 0.22 Mbps, 256 B = 1.78,
+512 B = 2.81, 1024 B = 3.92, **1472 B = 4.49 Mbps**. Air loss was ~0 % at ≥256 B
+(24 B lost ~5 % from its high packet rate). **Caveat:** that ~0 % loss is a desk
+best case; real deployment (moving shuttles, range, 6-way 2.4 GHz contention)
+will be lossy and bursty — hence the reliable-drain protocol below. A 675 KB
+worst-case mission drains in ~1.2 s single-shuttle (~7 s under 6-way contention),
+both inside a normal IDLE gap if drains are staggered.
+
+**Decision (proposed):**
+1. **Capture mode, separate from the context stream.** During MOVING, sample
+   accel at a high ODR (start **3333 Hz**, see open items) into a raw buffer.
+   Gyro at **416 Hz** or duty-cycled (context, not vibration). Temp/humidity stay
+   at the existing **2 Hz** cache. The 50 Hz ADR-015 context stream is unaffected.
+2. **Buffer in Octo-SPI PSRAM, not internal SRAM.** Memory-mapped PSRAM is
+   directly load/store addressable (so it *can* be computed on) with bandwidth far
+   above the 20–80 KB/s sample rate. Hold one mission with headroom to
+   **double-buffer** (capture mission N+1 while draining N). Internal SRAM is
+   reserved for DMA staging and DSP scratch, **not** bulk storage. QSPI flash is
+   **not** used as the ring (erase-before-write latency + endurance).
+3. **ISM330 FIFO + batched I²C reads.** Per-sample polling at kHz does not fit the
+   I²C2 bus (6667 Hz × 12 B ≈ 720 kbit/s payload > 400 kHz bus). Use the sensor's
+   on-chip FIFO with a watermark interrupt and burst reads, likely at I²C
+   fast-mode-plus (1 MHz). FIFO depth + I²C speed set the real usable ODR.
+4. **Burst drain on mission-end (IDLE), in ~1400 B datagrams.** Pack many samples
+   per datagram (≈116 accel samples at 1400 B), sequence them, frame the mission
+   (`mission_id, shuttle_id, odr, sample_count, t0_ms, layout`). Gateway
+   reassembles to one Parquet per mission (int16 + zstd). Store `t0 + ODR` once and
+   derive per-sample time by index — never per-sample timestamps.
+5. **Idle telemetry stays live and unbuffered** (0.1 Hz, 24 B), independent of the
+   drain. The drain and the sparse idle packets share the radio without conflict.
+6. **Loss handling = NAK selective-repeat ARQ over the buffered mission.** Real
+   deployment loss is significant, so the drain must recover it. Frame the
+   mission into ~1400 B chunks (`mission_id, chunk_seq, total_chunks, crc32`),
+   blast all chunks, then the gateway returns one NAK listing missing
+   `chunk_seq` ranges (or `ACK_COMPLETE`); STM re-sends only those from PSRAM;
+   repeat to completion or a bounded round cap (then write `complete=false`).
+   Not per-packet ACK (kills throughput), not FEC (constant overhead vs free
+   IDLE latency). Idempotent via `mission_id`; control packets re-prompt on
+   timeout. Full spec in `sampling_strategy.md §9`.
+
+**Sizing (6 B/sample = 3× int16; arithmetic, not measured):**
+
+| Config | rate | 30 s mission | internal 768 KB? | 8 MB PSRAM? |
+|---|---|---|---|---|
+| accel 1667 Hz | 10 KB/s | 300 KB | ✓ | ✓ |
+| accel 3333 Hz | 20 KB/s | 600 KB | ✓ tight | ✓ |
+| accel 3333 + gyro 416 | 22.4 KB/s | 672 KB | ✗ | ✓ |
+| accel 6667 + gyro 6667 | 80 KB/s | 2.4 MB | ✗ | ✓ |
+
+**Open items / prerequisites (must resolve before coding):**
+- ~~**EMW3080 throughput**~~ — **DONE** (see Context: 4.49 Mbps @ 1472 B,
+  ~0 % loss nominal). Datagram size = 1472 B; drain fits IDLE; loss handled by ARQ.
+- **ODR ≠ usable bandwidth.** The ISM330DHCX is a general 6-axis IMU, not a
+  dedicated wideband vibration sensor (cf. ST IIS3DWB, ~6.3 kHz flat). The on-chip
+  LPF2 widest cutoff is ODR/4, so 3333 Hz gives a ~833 Hz clean band. Confirm the
+  flat-bandwidth/noise figures in the ISM330DHCX datasheet before trusting content
+  above a few hundred Hz. `hardware_refs.md` line 32 also mis-cites the part as
+  "ISM330DLC" — fix to DHCX.
+- **CubeMX `.ioc` changes — now narrowed** (full click-path in
+  `sampling_strategy.md §10`):
+  - ~~**REQUIRED:** I²C2 speed Standard → Fast mode~~ — **DONE** (now 421 kHz
+    Fast mode, regenerated and booting; sufficient, FM+ 1 MHz only if later going
+    to 6667 Hz).
+  - **OPTIONAL:** ISM330 INT1→EXTI (else poll FIFO_STATUS); I²C2 RX DMA (else
+    blocking burst reads — RX DMA deferred, U5 GPDMA1 flow blocked it).
+  - ~~PSRAM memory-mapping~~ — **DONE in user code** (`Core/Src/psram.c`):
+    APS6408 mode-register config + `HAL_OSPI_MemoryMapped()` on the CubeMX
+    `hospi1` handle, called from `USER CODE BEGIN 2`. Hardware-verified
+    (`[PSRAM] self-test PASS`, 8 MB mapped at 0x90000000). No `.ioc` edit.
+
+**Trade-offs accepted:**
+- Reintroduces a buffer, against ADR-015's no-buffer stance — but only for the new
+  capture mode; the context stream stays buffer-free.
+- Draining during IDLE keeps the radio on longer → energy cost, in tension with
+  the battery goal. The eventual answer is **on-device feature extraction**
+  (FFT band energy, RMS, kurtosis, crest factor from SRAM windows) transmitted at
+  ~1 Hz — small, FL-friendly, radio-mostly-off. Raw drain is kept **now** for the
+  research phase (we don't yet know which features carry the fault signal);
+  feature extraction is the deployment path, tracked as a follow-up to this ADR.
+- PSRAM adds active power vs internal SRAM; measure it (ADR-011 path).
+
+> **Revised by ADR-021** (2026-06-01): decision points 1 and 5 (capture only during
+> MOVING; live 50 Hz/0.1 Hz stream stays on alongside the drain) are superseded by
+> the power-aware model — capture runs in *both* states at state-rated ODR, and the
+> radio is powered **off** except to drain. The buffer/drain/ARQ core (points 2–4, 6)
+> is unchanged.
+
+---
+
+## ADR-021 — Power-aware capture + WiFi duty-cycling (revises ADR-020)
+**Status:** Open (proposed). Capture/drain core from ADR-020 stands; this ADR fixes
+*when the radio is on* and *what is captured in each state*. WiFi power primitives
+**implemented and hardware-verified 2026-06-01**; capture engine + drain still to build.
+
+**Context:** profiling the ADR-015 firmware showed the dominant edge-node power
+draw is the EMW3080: it is associated to the AP 100 % of the time and transmits a
+50 Hz UDP stream throughout every MOVING window (TX bursts ~200 mA). For a
+battery shuttle that is the wrong trade — the live stream's only consumers are the
+FSM state and a liveness heartbeat, neither of which needs the radio lit during
+motion. Meanwhile ADR-020 already buffers the valuable (vibration) data in PSRAM
+and drains it in ~1 s. So the radio only needs to wake to drain.
+
+ADR-020 as written kept capture MOVING-only and the live stream always-on. Two
+corrections from the field design review:
+- The ISM330DHCX has **one ODR at a time** — a 104 Hz live-stream config and a
+  3333 Hz capture config cannot coexist on the same chip. The live stream must
+  become a *decimated view* of the capture stream, not an independent reader.
+- Data is wanted in IDLE too (low-rate baseline / health), not just MOVING.
+
+**Decision (proposed):**
+1. **Unified capture, state-rated ODR.** The ISM330 runs through its FIFO at all
+   times; the FSM state sets the rate. **MOVING:** accel 3333 Hz / gyro 416 Hz
+   (vibration). **IDLE:** both at a few Hz (lowest clean ODR ≈ 12.5 Hz) for
+   baseline. The FSM and any live heartbeat read the latest sample out of the
+   FIFO drain — one source of truth, no second ODR config.
+2. **Radio off by default; on only to drain.** WiFi is powered **off** (module
+   held in hardware reset) during MOVING and between drains. It is powered **on**
+   to drain at: (a) MOVING→IDLE (the just-captured mission), and (b) a PSRAM
+   **flush watermark** during long IDLE — a shuttle parked for hours still wakes
+   periodically to flush so the ring never overruns. After `ACK_COMPLETE` the
+   radio powers off again.
+3. **On-demand power primitives.** `WIFI_PowerOn()` (probe-once → hard-reset →
+   init → connect → DHCP → socket) and `WIFI_PowerOff()` (close socket →
+   disconnect → hold EMW3080 RESET low). Re-power costs ~4 s (DHCP-dominated) —
+   negligible amortized over a mission or hours of idle. The boot path now calls
+   `WIFI_PowerOn()`; the off→on cycle was verified reversible on hardware
+   (`[SELFTEST] WiFi power-cycle PASS`). `jetson_ip` is cached across cycles so
+   re-draining skips the beacon wait.
+
+**Trade-offs accepted:**
+- No real-time stream during motion. The gateway no longer sees 50 Hz live state
+  while a shuttle moves; it learns the mission (incl. state timeline) at drain
+  time. Acceptable: real-time motion state is not a current consumer requirement,
+  and the energy saving is large. Revisit if a live-during-motion need appears
+  (could keep a 1 Hz heartbeat with the radio in 802.11 power-save instead of off).
+- Re-init latency (~4 s) on every drain wake — paid during IDLE where latency is
+  free.
+- Flush-watermark policy adds a wake even with no mission (long idle). Bounded by
+  the low IDLE ODR (~12.5 Hz × 6 B × 2 = ~150 B/s → the ring fills slowly).
+
+**Still open (unchanged from ADR-020 §open):** anti-alias filter corners per ODR,
+ISM330 achieved bandwidth/noise, IMU current per mode, fault frequencies. Plus new:
+the flush-watermark threshold and IDLE ODR are provisional — set them once IMU
+idle current and ring-fill rate are measured. Also: the MCU itself still busy-waits
+in `WIFI_DelayWithYield` (no `WFI` sleep) — a separate power follow-up.
