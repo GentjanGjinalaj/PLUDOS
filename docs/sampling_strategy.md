@@ -161,15 +161,26 @@ crest factor), and retune once real fault data exists.
 - Could drop to 0.1–1 Hz with no information loss; 2 Hz kept for FSM/logging
   simplicity and a small margin.
 
-### Live-stream rates (ADR-015, currently flashed) — for completeness
+### Live-stream rates (ADR-015) — removed by ADR-021 Phase 1
 
-| State | Internal sample | Transmit | Why |
+Historically the firmware transmitted a continuous UDP stream on :5683 — 50 Hz
+while MOVING, a 0.1 Hz heartbeat while IDLE — purely to gate state and prove the
+link alive (never to capture vibration; that is the buffered high-rate path).
+
+**As of ADR-021 Phase 1 (firmware 2026-06-03) this live stream is gone.** The
+EMW3080 radio is the dominant power draw, so it is now held in hardware reset
+(off) during MOVING and IDLE, and powered on *only* to drain a finished mission:
+
+| State | Sensor | Radio | What the gateway sees |
 |---|---|---|---|
-| IDLE | 10 Hz | 0.1 Hz | 10 Hz is the *minimum* that lets the FSM detect a movement dwell (500 ms window) reliably; 0.1 Hz TX is a liveness heartbeat — health, not dynamics. |
-| MOVING | 50 Hz | 50 Hz | Resolves bulk shuttle motion (0–~20 Hz) for real-time state; anti-aliased by LPF at ~10–11 Hz (§5). This is the *motion-context* stream, distinct from the ADR-020 vibration capture. |
+| IDLE | accel polled for the FSM (decimated read) | **off** | nothing until the next drain |
+| MOVING | high-rate FIFO capture → PSRAM (no TX) | **off** | nothing — data is buffered, not streamed |
+| MOVING→IDLE | mission sealed | **on ~5 s** to drain, then off | one drain burst on :5684 → one Parquet per stream |
 
-These exist to gate state and prove the link is alive, **not** to capture
-vibration — that is the job of the buffered high-rate path.
+The FSM still runs every loop on a decimated accelerometer read (I²C, radio-
+independent), so movement detection is unaffected by the radio being off. Whether
+to *also* capture a low-rate baseline during IDLE is an open question (see the
+note below) — Phase 1 captures **only** while MOVING.
 
 ---
 

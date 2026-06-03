@@ -20,6 +20,15 @@ measurement on the Jetson is tracked in ADR-011 (P2-2).
 
 **Firmware responsibilities (ADR-015 v2):**
 
+> **Superseded by ADR-020/021 Phase 1 (firmware 2026-06-03).** The continuous
+> 50 Hz / 0.1 Hz live UDP stream described below is **removed**. The node now
+> captures high-rate IMU vibration into PSRAM during MOVING and drains the sealed
+> mission in one burst on :5684 at MOVING→IDLE; the radio is held off otherwise to
+> save battery. The FSM still polls the accelerometer over I²C every loop (radio-
+> independent). See `sampling_strategy.md §4` and `decisions.md` ADR-020/021. The
+> ADR-015 description below is retained for the beacon/bonding and packet-format
+> details that still apply to the drain path's gateway discovery.
+
 - Sample the accelerometer (104 Hz ODR, on-chip LPF2 cutoff ≈10.4 Hz; polled at
   50 Hz in MOVING, 10 Hz in IDLE for FSM responsiveness), run the idle/moving
   state machine, and stream telemetry directly. No SRAM buffer — every sample

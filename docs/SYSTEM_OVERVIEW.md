@@ -12,9 +12,17 @@
 
 PLUDOS is a three-tier, energy-aware federated-learning system for predictive
 maintenance on Savoye XTPS warehouse shuttles. Each shuttle carries an STM32U585
-edge node that streams 24-byte IMU/environment telemetry over Wi-Fi UDP. A Jetson
-Orin Nano gateway per minifloor ingests the stream, writes Parquet, and trains a
-local XGBoost anomaly model. A central laptop server aggregates the per-gateway
+edge node that captures high-rate IMU vibration into PSRAM during a mission and
+**drains it in one burst over Wi-Fi UDP when the mission ends**, keeping the radio
+off the rest of the time to save battery (ADR-020/021). A Jetson Orin Nano gateway
+per minifloor receives each drained mission, writes Parquet, and trains a local
+XGBoost anomaly model.
+
+> **Note (ADR-021 Phase 1, 2026-06-03):** earlier revisions of this document
+> describe a continuous 50 Hz live telemetry stream on :5683. That stream has been
+> removed — the radio is now duty-cycled (off during MOVING/IDLE, on only to drain
+> on :5684). See `sampling_strategy.md §4` and `decisions.md` ADR-021 for the
+> current model; sections below that mention "50 Hz TX" describe the superseded path. A central laptop server aggregates the per-gateway
 boosters via horizontal tree-set union and closes an energy-aware control loop
 that adapts model size to a measured per-round energy budget. **The original and
 still-primary goal is reliable data collection; the ML, federation, and
