@@ -751,9 +751,13 @@ both inside a normal IDLE gap if drains are staggered.
 *when the radio is on* and *what is captured in each state*. WiFi power primitives
 **implemented and hardware-verified 2026-06-01**. **Phase 1 implemented and
 hardware-verified 2026-06-03:** radio off during MOVING, powered on only to drain at
-MOVING→IDLE then off; live 5683 stream dropped. **Still to build:** unified IDLE
-low-rate capture (decision 1) and the total-ring 75% watermark flush (the per-mission
-watermark at main.c is not yet a cross-mission accumulator).
+MOVING→IDLE then off; live 5683 stream dropped. **Phase 2 implemented 2026-06-03:**
+unified IDLE capture (decision 1) — a 10 s snapshot every 5 min at 12.5 Hz on the same
+accel+gyro, stamped with HTS221 temp + LPS22HH pressure, queued in PSRAM and drained
+piggyback on the next MOVING→IDLE wake; and the total-ring 75 % watermark is now a
+cross-mission accumulator (`cap_undrained_bytes`) that forces a standalone safety
+drain on a long idle park. Snapshot period/duration and the 12.5 Hz idle ODR are
+provisional pending IMU idle-current measurement.
 
 **Context:** profiling the ADR-015 firmware showed the dominant edge-node power
 draw is the EMW3080: it is associated to the AP 100 % of the time and transmits a

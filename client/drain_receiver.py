@@ -62,11 +62,18 @@ TYPE_BEGIN = 1
 TYPE_CHUNK = 2
 TYPE_END   = 3
 
-# DrainBegin_t: magic(4) type(1) sid(1) mid(2) total_chunks(2) odr_a(2)
-#               odr_g(2) _pad(2) byte_count(4) word_count(4) t0_tick_ms(4) = 28 B.
-BEGIN_FMT  = "<IBBHHHHHIII"
+# DrainBegin_t: magic(4) type(1) sid(1) mid(2) total_chunks(2) odr_a(2) odr_g(2)
+#               temp_c_x100(2,int16) pressure_hpa_x10(2) is_idle_snapshot(1) _pad(1)
+#               byte_count(4) word_count(4) t0_tick_ms(4) = 32 B (ADR-021 §1).
+BEGIN_FMT  = "<IBBHHHHhHBBIII"
 BEGIN_SIZE = struct.calcsize(BEGIN_FMT)
-assert BEGIN_SIZE == 28, f"DrainBegin must be 28 bytes, got {BEGIN_SIZE}"
+assert BEGIN_SIZE == 32, f"DrainBegin must be 32 bytes, got {BEGIN_SIZE}"
+
+# Sentinels for an absent env stamp (MOVING missions / failed sensor read).
+TEMP_INVALID_X100 = 0x7FFF
+# Idle snapshots run both axes at 12.5 Hz; the integer wire field can't carry .5,
+# so the receiver uses this authoritative rate whenever is_idle_snapshot is set.
+IDLE_SNAP_ODR_HZ = 12.5
 
 # DrainChunkHdr_t: magic(4) type(1) sid(1) mid(2) chunk_seq(2) total_chunks(2)
 #                  payload_len(2) crc32(4) = 18 B header, then payload bytes.
@@ -122,8 +129,19 @@ class MissionReassembler:
         self.shuttle_id = shuttle_id
         self.mission_id = mission_id
         self.total_chunks = begin["total_chunks"]
-        self.odr_accel_hz = begin["odr_accel_hz"]
-        self.odr_gyro_hz = begin["odr_gyro_hz"]
+        # Idle snapshots are 12.5 Hz on both axes (overrides the integer wire field).
+        self.is_idle_snapshot = bool(begin.get("is_idle_snapshot", 0))
+        if self.is_idle_snapshot:
+            self.odr_accel_hz = IDLE_SNAP_ODR_HZ
+            self.odr_gyro_hz = IDLE_SNAP_ODR_HZ
+        else:
+            self.odr_accel_hz = float(begin["odr_accel_hz"])
+            self.odr_gyro_hz = float(begin["odr_gyro_hz"])
+        # Env stamp (idle snapshots only); None when absent/invalid.
+        temp_raw = begin.get("temp_c_x100", TEMP_INVALID_X100)
+        self.temp_c = (temp_raw / 100.0) if temp_raw != TEMP_INVALID_X100 else None
+        press_raw = begin.get("pressure_hpa_x10", 0)
+        self.pressure_hpa = (press_raw / 10.0) if press_raw else None
         self.byte_count = begin["byte_count"]
         self.t0_tick_ms = begin["t0_tick_ms"]
         # Wall-clock time the BEGIN arrived — fallback t0 anchor if no NTP offset.
@@ -238,9 +256,19 @@ def _write_stream_parquet(
     # Mission metadata — constant per file, broadcast across all rows.
     df["shuttle_id"] = pd.array([re.shuttle_id] * n, dtype="int16")
     df["mission_id"] = pd.array([re.mission_id] * n, dtype="int32")
-    df["odr_accel_hz"] = pd.array([re.odr_accel_hz] * n, dtype="int32")
-    df["odr_gyro_hz"] = pd.array([re.odr_gyro_hz] * n, dtype="int32")
+    # float ODR columns — idle snapshots carry 12.5 Hz, which int can't represent.
+    df["odr_accel_hz"] = pd.array([re.odr_accel_hz] * n, dtype="float64")
+    df["odr_gyro_hz"] = pd.array([re.odr_gyro_hz] * n, dtype="float64")
     df["t0_wall_ms"] = pd.array([t0] * n, dtype="int64")
+    # Capture mode + env stamp (idle snapshots only; NaN/False for MOVING missions).
+    df["is_idle_snapshot"] = re.is_idle_snapshot
+    df["temp_c"] = pd.array(
+        [re.temp_c if re.temp_c is not None else float("nan")] * n, dtype="float32"
+    )
+    df["pressure_hpa"] = pd.array(
+        [re.pressure_hpa if re.pressure_hpa is not None else float("nan")] * n,
+        dtype="float32",
+    )
     df["complete"] = complete
     df["missing_chunk_ranges"] = missing
 
@@ -299,11 +327,13 @@ def _parse_packet(data: bytes):
     if ptype == TYPE_BEGIN:
         if len(data) < BEGIN_SIZE:
             return None
-        (_, _, sid, mid, total, odr_a, odr_g, _pad,
+        (_, _, sid, mid, total, odr_a, odr_g, temp_x100, press_x10, is_idle, _pad,
          byte_count, word_count, t0_tick) = struct.unpack_from(BEGIN_FMT, data, 0)
         return (TYPE_BEGIN, {
             "shuttle_id": sid, "mission_id": mid, "total_chunks": total,
             "odr_accel_hz": odr_a, "odr_gyro_hz": odr_g,
+            "temp_c_x100": temp_x100, "pressure_hpa_x10": press_x10,
+            "is_idle_snapshot": is_idle,
             "byte_count": byte_count, "word_count": word_count, "t0_tick_ms": t0_tick,
         })
 
@@ -368,11 +398,17 @@ class DrainProtocol(asyncio.DatagramProtocol):
             return  # already finalised this mission; ignore re-announce.
         if key in self.missions:
             return  # duplicate BEGIN (sent ×3) — keep the first.
-        self.missions[key] = MissionReassembler(f["shuttle_id"], f["mission_id"], f)
+        re = MissionReassembler(f["shuttle_id"], f["mission_id"], f)
+        self.missions[key] = re
+        kind = "idle-snapshot" if re.is_idle_snapshot else "mission"
         logger.info(
-            "[DRAIN] BEGIN s%d m%d | chunks=%d odr_a=%d odr_g=%d bytes=%d from %s",
-            f["shuttle_id"], f["mission_id"], f["total_chunks"],
-            f["odr_accel_hz"], f["odr_gyro_hz"], f["byte_count"], addr,
+            "[DRAIN] BEGIN s%d m%d (%s) | chunks=%d odr_a=%g odr_g=%g bytes=%d "
+            "temp=%s press=%s from %s",
+            f["shuttle_id"], f["mission_id"], kind, f["total_chunks"],
+            re.odr_accel_hz, re.odr_gyro_hz, f["byte_count"],
+            f"{re.temp_c:.2f}C" if re.temp_c is not None else "n/a",
+            f"{re.pressure_hpa:.1f}hPa" if re.pressure_hpa is not None else "n/a",
+            addr,
         )
 
     # CHUNK: validate CRC32, dedup, store. Tolerates a missing BEGIN by
@@ -392,6 +428,7 @@ class DrainProtocol(asyncio.DatagramProtocol):
             # ODRs unknown here → 0; t0 falls back to arrival wall time.
             synth = {
                 "total_chunks": f["total_chunks"], "odr_accel_hz": 0, "odr_gyro_hz": 0,
+                "temp_c_x100": TEMP_INVALID_X100, "pressure_hpa_x10": 0, "is_idle_snapshot": 0,
                 "byte_count": 0, "word_count": 0, "t0_tick_ms": 0,
             }
             re = MissionReassembler(f["shuttle_id"], f["mission_id"], synth)

@@ -173,14 +173,22 @@ EMW3080 radio is the dominant power draw, so it is now held in hardware reset
 
 | State | Sensor | Radio | What the gateway sees |
 |---|---|---|---|
-| IDLE | accel polled for the FSM (decimated read) | **off** | nothing until the next drain |
-| MOVING | high-rate FIFO capture → PSRAM (no TX) | **off** | nothing — data is buffered, not streamed |
-| MOVING→IDLE | mission sealed | **on ~5 s** to drain, then off | one drain burst on :5684 → one Parquet per stream |
+| IDLE | accel polled for the FSM (decimated read) + 12.5 Hz snapshot 10 s every 5 min | **off** | nothing until the next drain |
+| MOVING | high-rate FIFO capture (accel 3332 Hz / gyro 416 Hz) → PSRAM (no TX) | **off** | nothing — data is buffered, not streamed |
+| MOVING→IDLE | mission sealed | **on ~5 s** to drain, then off | one wake drains the mission **plus** queued idle snapshots on :5684 → one Parquet per stream |
 
 The FSM still runs every loop on a decimated accelerometer read (I²C, radio-
-independent), so movement detection is unaffected by the radio being off. Whether
-to *also* capture a low-rate baseline during IDLE is an open question (see the
-note below) — Phase 1 captures **only** while MOVING.
+independent), so movement detection is unaffected by the radio being off.
+
+**ADR-021 §1 (firmware 2026-06-03): unified IDLE capture is now built.** Every
+5 minutes the IDLE node takes a 10 s snapshot with the *same* ISM330DHCX
+accel+gyro at the lowest clean ODR (**12.5 Hz**, 1:1) — directly comparable to
+the MOVING capture in the shared sub-6 Hz band. Each snapshot is stamped with the
+cached HTS221 temperature and LPS22HH pressure (so Grafana still sees the idle
+environment despite the live stream being off) and queued in the PSRAM ring; it
+drains for free on the next MOVING→IDLE wake. A cross-mission 75 % ring watermark
+forces a standalone safety drain if a node sits idle long enough to fill the ring
+(overnight park).
 
 ---
 

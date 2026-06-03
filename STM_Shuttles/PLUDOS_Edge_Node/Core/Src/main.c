@@ -187,10 +187,12 @@ static volatile uint8_t wifi_station_ready = 0;
 static char     jetson_ip[16]      = {0};   /* populated from JETSON_IP define at init */
 static uint8_t  stm32_ip[4]        = {0};   /* STM32's own DHCP address; used for beacon subnet filter */
 static uint8_t  hts221_initialized  = 0U;    /* SENSOR_Humidity_Init succeeded */
+static uint8_t  lps22hh_initialized = 0U;    /* SENSOR_Pressure_Init succeeded */
 /* Environmental sensor cache (refreshed every ENV_READ_PERIOD_MS so the I²C bus
  * stays out of the 50 Hz hot path; cached values stamp every outgoing packet). */
 static float    cached_temp_c       = -999.0f;
 static float    cached_humidity_pct =    0.0f;
+static float    cached_pressure_hpa =    0.0f;  /* LPS22HH; 0 = no valid read yet */
 
 /* TX bookkeeping for periodic per-second status log. */
 static uint32_t last_tx_tick      = 0U;
@@ -224,6 +226,17 @@ static uint32_t tx_window_start_tick = 0U;
 #define CAP_FIFO_CTRL3_MOVING 0x69U   /* BDR_GY=417Hz (6), BDR_XL=3333Hz (9) */
 #define CAP_FIFO_MODE_STREAM  0x06U   /* FIFO_CTRL4: continuous/stream mode */
 #define CAP_FIFO_MODE_BYPASS  0x00U   /* FIFO_CTRL4: bypass (FIFO off / flush) */
+
+/* ADR-021 §1 IDLE snapshot config: same accel+gyro chip at the lowest clean ODR
+ * (12.5 Hz, 1:1) so idle data is directly comparable to MOVING capture in the
+ * shared sub-6 Hz band. CTRL8_XL stays at LIVE (0x20, LPF2 cutoff ODR/10 ≈ 1.25 Hz
+ * < 6.25 Hz Nyquist → alias-free). Codes derived from the MOVING/LIVE defines:
+ * ODR 12.5 Hz = 0001 (cf. 104 Hz = 0100 in LIVE_CTRL1_XL=0x42). */
+#define CAP_CTRL1_XL_IDLE     0x12U   /* accel ODR=12.5Hz (0001), FS=±2g, LPF2_XL_EN=1 */
+#define CAP_CTRL2_G_IDLE      0x10U   /* gyro  ODR=12.5Hz (0001), FS=±250 dps */
+#define CAP_FIFO_CTRL3_IDLE   0x11U   /* BDR_GY=12.5Hz (1), BDR_XL=12.5Hz (1) */
+#define CAP_IDLE_SNAP_PERIOD_MS  300000U  /* take an idle snapshot every 5 min */
+#define CAP_IDLE_SNAP_DUR_MS      10000U  /* each idle snapshot lasts 10 s */
 /* Gyro LPF1 (CTRL4_C=0x02, CTRL6_C=0x07 FTYPE=111) left at boot setting: FTYPE=111 is
  * the narrowest LPF1, so its corner is the lowest of all FTYPE codes and stays below
  * the 208 Hz Nyquist at 416 Hz ODR. Exact corner: AN5192/AN5398 Table 14. */
@@ -249,6 +262,10 @@ typedef struct
     uint32_t overrun_evts;   /* FIFO overrun events seen during this mission (data loss markers) */
     uint32_t start_tick_ms;  /* HAL_GetTick() at mission start — drain t0 for the gateway */
     uint8_t  sealed;         /* 1 once MOVING→IDLE finalizes the mission */
+    uint8_t  drained;        /* 1 once Drain_Mission has blasted it (piggyback bookkeeping) */
+    uint8_t  is_idle_snapshot; /* 1 = low-rate IDLE snapshot, 0 = MOVING mission */
+    int16_t  temp_c_x100;    /* cached HTS221 temp ×100 at seal (idle snapshots); 0x7FFF = invalid */
+    uint16_t pressure_hpa_x10; /* cached LPS22HH pressure ×10 at seal (idle snapshots); 0 = invalid */
 } CaptureMission_t;
 
 static CaptureMission_t cap_missions[CAP_MAX_MISSIONS];
@@ -257,7 +274,11 @@ static int8_t   cap_active_idx    = -1;  /* index of in-progress mission, -1 = n
 static uint32_t cap_ring_wptr     = 0U;  /* next PSRAM write offset [0, PSRAM_SIZE_BYTES) */
 static uint16_t cap_next_id       = 1U;
 static uint8_t  cap_initialized   = 0U;
-static uint8_t  cap_wtm_hit       = 0U;  /* set when the ring crosses 75% (step-4 drain trigger) */
+static uint8_t  cap_wtm_hit       = 0U;  /* set when total un-drained bytes cross 75% (safety-flush trigger) */
+static uint32_t cap_undrained_bytes = 0U; /* cross-mission accumulator: bytes captured but not yet drained */
+static uint8_t  cap_snapshot_active    = 0U;  /* 1 while an idle snapshot is capturing */
+static uint32_t cap_last_snapshot_tick = 0U;  /* HAL_GetTick() of the last snapshot start */
+static uint32_t cap_snapshot_start_tick = 0U; /* HAL_GetTick() when the active snapshot began */
 static uint32_t cap_words_window  = 0U;  /* words captured in the current 1 s log window */
 static uint8_t  cap_fifo_buf[CAP_FIFO_READ_WORDS * CAP_FIFO_WORD_BYTES]; /* SRAM staging for the burst read */
 
@@ -277,7 +298,11 @@ static uint8_t  cap_fifo_buf[CAP_FIFO_READ_WORDS * CAP_FIFO_WORD_BYTES]; /* SRAM
 typedef struct __attribute__((packed))
 {
   uint32_t magic; uint8_t type; uint8_t shuttle_id; uint16_t mission_id;
-  uint16_t total_chunks; uint16_t odr_accel_hz; uint16_t odr_gyro_hz; uint16_t _pad;
+  uint16_t total_chunks; uint16_t odr_accel_hz; uint16_t odr_gyro_hz;
+  int16_t  temp_c_x100;       /* idle-snapshot env stamp ×100; 0x7FFF = invalid */
+  uint16_t pressure_hpa_x10;  /* idle-snapshot env stamp ×10; 0 = invalid */
+  uint8_t  is_idle_snapshot;  /* 1 = low-rate idle snapshot, 0 = MOVING mission */
+  uint8_t  _pad;
   uint32_t byte_count; uint32_t word_count; uint32_t t0_tick_ms;
 } DrainBegin_t;
 
@@ -294,7 +319,6 @@ typedef struct __attribute__((packed))
 } DrainEnd_t;
 
 static uint8_t drain_buf[sizeof(DrainChunkHdr_t) + DRAIN_CHUNK_PAYLOAD]; /* one chunk datagram staging */
-static int8_t  cap_last_sealed_idx = -1;  /* mission index sealed by the last EnterIdle, -1 = none */
 
 /* USER CODE END PV */
 
@@ -327,11 +351,13 @@ static void WIFI_PowerOff(void);
 /* ADR-020 high-rate ISM330 FIFO capture engine (state-rated) */
 static int8_t   Capture_Init(void);
 static void     Capture_EnterMoving(void);
+static void     Capture_EnterIdleSnapshot(void);
 static void     Capture_EnterIdle(void);
 static uint16_t Capture_Service(void);
 /* ADR-020/021 mission drain to the gateway (UDP 5684, blast-first) */
 static uint32_t Drain_CRC32(const uint8_t *data, uint32_t len);
 static void     Drain_Mission(int8_t idx);
+static void     Drain_AllPending(void);
 
 /* USER CODE END PFP */
 
@@ -485,6 +511,16 @@ static void TELEMETRY_RefreshEnvCache(void)
     {
       cached_temp_c       = new_temp;
       cached_humidity_pct = new_hum;
+    }
+  }
+
+  if (lps22hh_initialized != 0U)
+  {
+    /* Same cache-on-success policy; pressure stamps the idle snapshots (ADR-021 §1). */
+    float new_press = 0.0f;
+    if (SENSOR_Pressure_Read(&hi2c2, &new_press) == 0)
+    {
+      cached_pressure_hpa = new_press;
     }
   }
 }
@@ -940,9 +976,62 @@ static void Capture_EnterMoving(void)
   m->overrun_evts  = 0U;
   m->start_tick_ms = HAL_GetTick();
   m->sealed        = 0U;
-  cap_wtm_hit      = 0U;
+  m->drained       = 0U;
+  m->is_idle_snapshot = 0U;
+  m->temp_c_x100      = (int16_t)0x7FFF; /* MOVING missions carry no env stamp */
+  m->pressure_hpa_x10 = 0U;
 
   sprintf(uart_buf, "[CAPTURE] mission %u start @0x%06lX (accel 3332Hz, gyro 416Hz)\r\n",
+          (unsigned)m->mission_id, (unsigned long)m->start_offset);
+  HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+}
+
+/* ADR-021 §1: open a low-rate IDLE snapshot (accel+gyro both 12.5 Hz, FIFO stream).
+ * Same chip/axes/path as MOVING capture — only the ODR differs — so idle and mission
+ * data compare directly in the shared sub-6 Hz band. Sealed by Capture_EnterIdle();
+ * drains piggyback on the next MOVING→IDLE WiFi wake (no radio cost here). */
+static void Capture_EnterIdleSnapshot(void)
+{
+  uint8_t v;
+  CaptureMission_t *m;
+
+  if ((cap_initialized == 0U) || (cap_active_idx >= 0))
+  {
+    return; /* nothing if uninitialised or a capture is already in progress */
+  }
+
+  /* Low-rate config; CTRL8_XL left at LIVE (anti-alias cutoff already < Nyquist). */
+  v = CAP_CTRL1_XL_IDLE; (void)HAL_I2C_Mem_Write(&hi2c2, ISM330_ADDR, CTRL1_XL, 1, &v, 1, 100);
+  v = CAP_CTRL2_G_IDLE;  (void)HAL_I2C_Mem_Write(&hi2c2, ISM330_ADDR, CTRL2_G,  1, &v, 1, 100);
+
+  /* Batch rates, then BYPASS→STREAM toggle to flush any stale words before capture. */
+  v = CAP_FIFO_CTRL3_IDLE;  (void)HAL_I2C_Mem_Write(&hi2c2, ISM330_ADDR, ISM330_FIFO_CTRL3, 1, &v, 1, 100);
+  v = CAP_FIFO_MODE_BYPASS; (void)HAL_I2C_Mem_Write(&hi2c2, ISM330_ADDR, ISM330_FIFO_CTRL4, 1, &v, 1, 100);
+  v = CAP_FIFO_MODE_STREAM; (void)HAL_I2C_Mem_Write(&hi2c2, ISM330_ADDR, ISM330_FIFO_CTRL4, 1, &v, 1, 100);
+
+  if (cap_mission_count < CAP_MAX_MISSIONS)
+  {
+    cap_active_idx = (int8_t)cap_mission_count;
+    cap_mission_count++;
+  }
+  else
+  {
+    cap_active_idx = (int8_t)(CAP_MAX_MISSIONS - 1U);
+  }
+  m = &cap_missions[cap_active_idx];
+  m->mission_id   = cap_next_id++;
+  m->start_offset = cap_ring_wptr;
+  m->byte_count   = 0U;
+  m->word_count   = 0U;
+  m->overrun_evts  = 0U;
+  m->start_tick_ms = HAL_GetTick();
+  m->sealed        = 0U;
+  m->drained       = 0U;
+  m->is_idle_snapshot = 1U;
+  m->temp_c_x100      = (int16_t)0x7FFF;  /* stamped at seal from the env cache */
+  m->pressure_hpa_x10 = 0U;
+
+  sprintf(uart_buf, "[CAPTURE] idle snapshot %u start @0x%06lX (accel/gyro 12.5Hz)\r\n",
           (unsigned)m->mission_id, (unsigned long)m->start_offset);
   HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
 }
@@ -1016,6 +1105,7 @@ static uint16_t Capture_Service(void)
     }
     m->byte_count += bytes;
     m->word_count += n;
+    cap_undrained_bytes += bytes; /* cross-mission total, reset only when missions drain */
     total = (uint16_t)(total + n);
 
     if (n < CAP_FIFO_READ_WORDS)
@@ -1024,8 +1114,9 @@ static uint16_t Capture_Service(void)
     }
   }
 
-  /* Watermark for the step-4 mid-mission drain (WiFi on once the ring crosses ~75%). */
-  if ((cap_wtm_hit == 0U) && (m->byte_count >= CAP_RING_WTM_BYTES))
+  /* Safety-flush watermark (ADR-021 §1): total un-drained bytes across all missions
+   * crossing ~75% of the ring forces a WiFi-on drain even mid-idle (overnight park). */
+  if ((cap_wtm_hit == 0U) && (cap_undrained_bytes >= CAP_RING_WTM_BYTES))
   {
     cap_wtm_hit = 1U;
   }
@@ -1062,13 +1153,23 @@ static void Capture_EnterIdle(void)
   v = LIVE_CTRL2_G;  (void)HAL_I2C_Mem_Write(&hi2c2, ISM330_ADDR, CTRL2_G,  1, &v, 1, 100);
 
   m = &cap_missions[cap_active_idx];
+
+  /* Idle snapshots carry the environment at seal time so Grafana can chart idle
+   * temp/pressure (the live telemetry stream is off during IDLE, ADR-021 Phase 1). */
+  if (m->is_idle_snapshot != 0U)
+  {
+    m->temp_c_x100 = (cached_temp_c > -998.0f) ? (int16_t)(cached_temp_c * 100.0f)
+                                               : (int16_t)0x7FFF;
+    m->pressure_hpa_x10 = (cached_pressure_hpa > 0.0f)
+                          ? (uint16_t)(cached_pressure_hpa * 10.0f) : 0U;
+  }
+
   m->sealed = 1U;
   sprintf(uart_buf, "[CAPTURE] mission %u sealed: %lu words, %lu B, ovr=%lu\r\n",
           (unsigned)m->mission_id, (unsigned long)m->word_count,
           (unsigned long)m->byte_count, (unsigned long)m->overrun_evts);
   HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
-  cap_last_sealed_idx = cap_active_idx;  /* hand the sealed mission to the drain stage */
-  cap_active_idx = -1;
+  cap_active_idx = -1;  /* mission is sealed; Drain_AllPending picks it up on the next wake */
 }
 
 /* Running zlib/IEEE CRC-32 register (reflected, poly 0xEDB88320, no init/final).
@@ -1134,8 +1235,13 @@ static void Drain_Mission(int8_t idx)
   beg.shuttle_id   = (uint8_t)SHUTTLE_ID;
   beg.mission_id   = m->mission_id;
   beg.total_chunks = (uint16_t)total_chunks;
-  beg.odr_accel_hz = DRAIN_ODR_ACCEL_HZ;
-  beg.odr_gyro_hz  = DRAIN_ODR_GYRO_HZ;
+  /* ODR depends on the capture mode so the gateway rebuilds each stream's timeline
+   * correctly (idle snapshots are 12.5 Hz on both axes; MOVING is 3332/416). */
+  beg.odr_accel_hz = (m->is_idle_snapshot != 0U) ? 12U : DRAIN_ODR_ACCEL_HZ;
+  beg.odr_gyro_hz  = (m->is_idle_snapshot != 0U) ? 12U : DRAIN_ODR_GYRO_HZ;
+  beg.temp_c_x100      = m->temp_c_x100;
+  beg.pressure_hpa_x10 = m->pressure_hpa_x10;
+  beg.is_idle_snapshot = m->is_idle_snapshot;
   beg.byte_count   = m->byte_count;
   beg.word_count   = m->word_count;
   beg.t0_tick_ms   = m->start_tick_ms;
@@ -1193,6 +1299,56 @@ static void Drain_Mission(int8_t idx)
           (unsigned)m->mission_id, (unsigned long)total_chunks,
           (unsigned long)m->byte_count, (unsigned long)crc_all);
   HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+
+  /* Retire the mission from the un-drained accumulator; clear the watermark once
+   * the ring drops back below 75% so the safety flush re-arms for the next fill. */
+  m->drained = 1U;
+  cap_undrained_bytes = (cap_undrained_bytes >= m->byte_count)
+                        ? (cap_undrained_bytes - m->byte_count) : 0U;
+  if (cap_undrained_bytes < CAP_RING_WTM_BYTES)
+  {
+    cap_wtm_hit = 0U;
+  }
+}
+
+/* Wake the radio once to blast every sealed-but-undrained mission (the just-ended
+ * MOVING mission plus any idle snapshots queued since the last wake), then power it
+ * back down. Amortises the ~4 s WiFi bring-up across all pending data (ADR-021 §1). */
+static void Drain_AllPending(void)
+{
+  uint8_t i;
+  uint8_t any = 0U;
+
+  for (i = 0U; i < cap_mission_count; i++)
+  {
+    if ((cap_missions[i].sealed != 0U) && (cap_missions[i].drained == 0U) &&
+        (cap_missions[i].byte_count != 0U))
+    {
+      any = 1U;
+      break;
+    }
+  }
+  if (any == 0U)
+  {
+    return; /* nothing pending — keep the radio dark */
+  }
+
+  if (WIFI_PowerOn() == 0)
+  {
+    for (i = 0U; i < cap_mission_count; i++)
+    {
+      if ((cap_missions[i].sealed != 0U) && (cap_missions[i].drained == 0U))
+      {
+        Drain_Mission((int8_t)i);
+      }
+    }
+  }
+  else
+  {
+    sprintf(uart_buf, "[DRAIN] skipped — WiFi power-on failed\r\n");
+    HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+  }
+  WIFI_PowerOff();
 }
 
 /* USER CODE END 0 */
@@ -1351,6 +1507,20 @@ int main(void)
   }
   HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
 
+  // -----------------------------------------------------------------
+  // PRESSURE INITIALIZATION (LPS22HH) — stamps idle snapshots (ADR-021 §1)
+  // -----------------------------------------------------------------
+  if (SENSOR_Pressure_Init(&hi2c2) == 0)
+  {
+    lps22hh_initialized = 1U;
+    sprintf(uart_buf, "[SENSOR] LPS22HH initialized (pressure)\r\n");
+  }
+  else
+  {
+    sprintf(uart_buf, "[SENSOR] WARNING: LPS22HH not found on I2C2 — pressure disabled\r\n");
+  }
+  HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+
   sprintf(uart_buf, "[NETWORK] WiFi init sequence starting...\r\n");
   HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
 
@@ -1485,6 +1655,14 @@ int main(void)
               sprintf(uart_buf, "[FSM] IDLE -> MOVING  (dwell %ums reached)\r\n",
                       (unsigned)MOVEMENT_DWELL_MS);
               HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+              /* A real mission interrupted an idle snapshot: seal the partial snapshot
+               * (stamped + queued for the next drain) before starting MOVING capture. */
+              if (cap_snapshot_active != 0U)
+              {
+                Capture_EnterIdle();
+                cap_snapshot_active    = 0U;
+                cap_last_snapshot_tick = HAL_GetTick();
+              }
               Capture_EnterMoving(); /* start high-rate FIFO capture for this mission */
             }
           }
@@ -1509,19 +1687,11 @@ int main(void)
                       (unsigned)(NO_MOVEMENT_TIMEOUT_MS / 1000U));
               HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
               Capture_EnterIdle(); /* drain + seal the mission, restore live config */
-              /* ADR-021: wake the radio only to drain this mission, then power it back
-               * down for the idle window. The ~4 s power-on cost is paid in IDLE where
-               * latency is free; jetson_ip is cached so the beacon wait is skipped. */
-              if (WIFI_PowerOn() == 0)
-              {
-                Drain_Mission(cap_last_sealed_idx); /* blast the sealed mission to the gateway (UDP 5684) */
-              }
-              else
-              {
-                sprintf(uart_buf, "[DRAIN] skipped — WiFi power-on failed\r\n");
-                HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
-              }
-              WIFI_PowerOff();
+              /* ADR-021: wake the radio once to drain this mission plus any idle
+               * snapshots queued since the last wake, then power it back down. The
+               * ~4 s power-on cost is paid in IDLE where latency is free; jetson_ip
+               * is cached so the beacon wait is skipped. */
+              Drain_AllPending();
             }
           }
         }
@@ -1542,6 +1712,52 @@ int main(void)
     if (current_state == STATE_MOVING)
     {
       cap_words_window += Capture_Service();
+    }
+
+    /* -----------------------------------------------------------------
+     * PHASE 2c: low-rate IDLE snapshot (ADR-021 §1) — 10 s every 5 min,
+     * accel+gyro at 12.5 Hz, stamped with temp/pressure at seal, drained on
+     * the next MOVING→IDLE WiFi wake. Skipped entirely while MOVING.
+     * --------------------------------------------------------------- */
+    if (current_state == STATE_IDLE)
+    {
+      if (cap_snapshot_active == 0U)
+      {
+        if ((HAL_GetTick() - cap_last_snapshot_tick) >= CAP_IDLE_SNAP_PERIOD_MS)
+        {
+          Capture_EnterIdleSnapshot();
+          cap_snapshot_active     = 1U;
+          cap_snapshot_start_tick = HAL_GetTick();
+        }
+      }
+      else
+      {
+        cap_words_window += Capture_Service();
+        if ((HAL_GetTick() - cap_snapshot_start_tick) >= CAP_IDLE_SNAP_DUR_MS)
+        {
+          Capture_EnterIdle();          /* stamps env + seals; data waits for next drain */
+          cap_snapshot_active    = 0U;
+          cap_last_snapshot_tick = HAL_GetTick();
+        }
+      }
+    }
+
+    /* -----------------------------------------------------------------
+     * PHASE 2d: ADR-021 safety flush — total un-drained ring crossed 75%.
+     * Force a drain without a mission boundary (overnight idle-park guard).
+     * --------------------------------------------------------------- */
+    if ((cap_wtm_hit != 0U) && (current_state == STATE_IDLE))
+    {
+      if (cap_snapshot_active != 0U)
+      {
+        Capture_EnterIdle();          /* seal the in-flight snapshot first */
+        cap_snapshot_active    = 0U;
+        cap_last_snapshot_tick = HAL_GetTick();
+      }
+      sprintf(uart_buf, "[DRAIN] safety flush — undrained %luB >= 75%%\r\n",
+              (unsigned long)cap_undrained_bytes);
+      HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+      Drain_AllPending();
     }
 
     /* -----------------------------------------------------------------

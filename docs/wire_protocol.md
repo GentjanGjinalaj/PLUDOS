@@ -130,21 +130,30 @@ format without changing the on-wire layout of types 1–3.
 
 ### Packet types
 ```c
-/* type=1 DRAIN_BEGIN — control, sent x3 for robustness. 28 bytes. */
+/* type=1 DRAIN_BEGIN — control, sent x3 for robustness. 32 bytes. */
 typedef struct __attribute__((packed)) {
   uint32_t magic;        /* 0x52444C50                                   */
   uint8_t  type;         /* 1                                            */
   uint8_t  shuttle_id;
   uint16_t mission_id;
   uint16_t total_chunks; /* number of CHUNK packets that follow          */
-  uint16_t odr_accel_hz; /* 3332                                         */
-  uint16_t odr_gyro_hz;  /* 416                                          */
-  uint16_t _pad;
+  uint16_t odr_accel_hz; /* MOVING: 3332; idle snapshot: 12 (see below)  */
+  uint16_t odr_gyro_hz;  /* MOVING: 416;  idle snapshot: 12 (see below)  */
+  int16_t  temp_c_x100;  /* idle snapshot env stamp ×100; 0x7FFF=invalid */
+  uint16_t pressure_hpa_x10; /* idle snapshot env stamp ×10; 0=invalid   */
+  uint8_t  is_idle_snapshot; /* 1 = low-rate 12.5 Hz idle snapshot,      */
+                         /*     0 = MOVING mission (ADR-021 §1)           */
+  uint8_t  _pad;
   uint32_t byte_count;   /* total payload bytes across all chunks        */
   uint32_t word_count;   /* FIFO words = byte_count / 7                   */
-  uint32_t t0_tick_ms;   /* mission-start HAL_GetTick(); gateway maps to  */
+  uint32_t t0_tick_ms;   /* capture-start HAL_GetTick(); gateway maps to  */
                          /* wall time via its per-shuttle NTP offset      */
 } DrainBegin_t;
+/* Idle snapshots (ADR-021 §1) run accel+gyro both at 12.5 Hz. The integer
+ * odr_* fields can't carry .5, so when is_idle_snapshot=1 the gateway uses
+ * the authoritative 12.5 Hz rate and ignores the rounded odr_* values. The
+ * temp/pressure stamp lets Grafana chart the idle environment even though the
+ * live 5683 telemetry stream is off during IDLE (ADR-021 Phase 1). */
 
 /* type=2 CHUNK — data. 18-byte header + payload (<=1400 B = <=200 FIFO words). */
 typedef struct __attribute__((packed)) {
@@ -185,7 +194,10 @@ Demux accel/gyro by tag into **separate streams — do not upsample/pad** the gy
 to the accel rate. Per-sample time is derived, never per-sample stamped:
 `t_ms = t0_wall + sample_index * 1000 / odr` (per stream, using its own ODR).
 Mission metadata columns: `shuttle_id, mission_id, odr_accel_hz, odr_gyro_hz,
-t0_wall_ms, complete (bool), missing_chunk_ranges`.
+t0_wall_ms, is_idle_snapshot (bool), temp_c, pressure_hpa, complete (bool),
+missing_chunk_ranges`. `odr_*` are float (idle snapshots are 12.5 Hz);
+`temp_c`/`pressure_hpa` are NaN for MOVING missions (stamped on idle snapshots
+only).
 
 ### CRC32
 Standard zlib/IEEE CRC32 (reflected, poly `0xEDB88320`, init `0xFFFFFFFF`, final
