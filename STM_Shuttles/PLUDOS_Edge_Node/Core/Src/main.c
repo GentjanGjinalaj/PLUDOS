@@ -247,6 +247,7 @@ typedef struct
     uint32_t byte_count;     /* raw FIFO bytes captured */
     uint32_t word_count;     /* FIFO words captured (accel + gyro interleaved) */
     uint32_t overrun_evts;   /* FIFO overrun events seen during this mission (data loss markers) */
+    uint32_t start_tick_ms;  /* HAL_GetTick() at mission start — drain t0 for the gateway */
     uint8_t  sealed;         /* 1 once MOVING→IDLE finalizes the mission */
 } CaptureMission_t;
 
@@ -259,6 +260,41 @@ static uint8_t  cap_initialized   = 0U;
 static uint8_t  cap_wtm_hit       = 0U;  /* set when the ring crosses 75% (step-4 drain trigger) */
 static uint32_t cap_words_window  = 0U;  /* words captured in the current 1 s log window */
 static uint8_t  cap_fifo_buf[CAP_FIFO_READ_WORDS * CAP_FIFO_WORD_BYTES]; /* SRAM staging for the burst read */
+
+/* ADR-020/021 drain protocol — blast the sealed PSRAM mission to the gateway on
+ * UDP 5684. Frame layout is the authoritative contract in wire_protocol.md §2.
+ * Phase 1 = blast-only (no back-channel); NAK/ACK ARQ layers on later (§9). */
+#define DRAIN_PORT             5684U
+#define DRAIN_MAGIC            0x52444C50UL  /* "PLDR" little-endian */
+#define DRAIN_TYPE_BEGIN       1U
+#define DRAIN_TYPE_CHUNK       2U
+#define DRAIN_TYPE_END         3U
+#define DRAIN_CHUNK_PAYLOAD    1400U         /* 200 FIFO words — never splits a word across chunks */
+#define DRAIN_CTRL_REPEAT      3U            /* resend BEGIN/END N times (control-loss tolerance) */
+#define DRAIN_ODR_ACCEL_HZ     3332U
+#define DRAIN_ODR_GYRO_HZ      416U
+
+typedef struct __attribute__((packed))
+{
+  uint32_t magic; uint8_t type; uint8_t shuttle_id; uint16_t mission_id;
+  uint16_t total_chunks; uint16_t odr_accel_hz; uint16_t odr_gyro_hz; uint16_t _pad;
+  uint32_t byte_count; uint32_t word_count; uint32_t t0_tick_ms;
+} DrainBegin_t;
+
+typedef struct __attribute__((packed))
+{
+  uint32_t magic; uint8_t type; uint8_t shuttle_id; uint16_t mission_id;
+  uint16_t chunk_seq; uint16_t total_chunks; uint16_t payload_len; uint32_t crc32;
+} DrainChunkHdr_t;
+
+typedef struct __attribute__((packed))
+{
+  uint32_t magic; uint8_t type; uint8_t shuttle_id; uint16_t mission_id;
+  uint16_t total_chunks; uint16_t _pad; uint32_t crc32_all;
+} DrainEnd_t;
+
+static uint8_t drain_buf[sizeof(DrainChunkHdr_t) + DRAIN_CHUNK_PAYLOAD]; /* one chunk datagram staging */
+static int8_t  cap_last_sealed_idx = -1;  /* mission index sealed by the last EnterIdle, -1 = none */
 
 /* USER CODE END PV */
 
@@ -293,6 +329,9 @@ static int8_t   Capture_Init(void);
 static void     Capture_EnterMoving(void);
 static void     Capture_EnterIdle(void);
 static uint16_t Capture_Service(void);
+/* ADR-020/021 mission drain to the gateway (UDP 5684, blast-first) */
+static uint32_t Drain_CRC32(const uint8_t *data, uint32_t len);
+static void     Drain_Mission(int8_t idx);
 
 /* USER CODE END PFP */
 
@@ -898,9 +937,10 @@ static void Capture_EnterMoving(void)
   m->start_offset = cap_ring_wptr;
   m->byte_count   = 0U;
   m->word_count   = 0U;
-  m->overrun_evts = 0U;
-  m->sealed       = 0U;
-  cap_wtm_hit     = 0U;
+  m->overrun_evts  = 0U;
+  m->start_tick_ms = HAL_GetTick();
+  m->sealed        = 0U;
+  cap_wtm_hit      = 0U;
 
   sprintf(uart_buf, "[CAPTURE] mission %u start @0x%06lX (accel 3332Hz, gyro 416Hz)\r\n",
           (unsigned)m->mission_id, (unsigned long)m->start_offset);
@@ -1027,7 +1067,132 @@ static void Capture_EnterIdle(void)
           (unsigned)m->mission_id, (unsigned long)m->word_count,
           (unsigned long)m->byte_count, (unsigned long)m->overrun_evts);
   HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+  cap_last_sealed_idx = cap_active_idx;  /* hand the sealed mission to the drain stage */
   cap_active_idx = -1;
+}
+
+/* Running zlib/IEEE CRC-32 register (reflected, poly 0xEDB88320, no init/final).
+ * Lets the whole-mission CRC accumulate across chunks without a second pass. */
+static uint32_t Drain_CRC32_Update(uint32_t crc, const uint8_t *data, uint32_t len)
+{
+  uint32_t i; uint8_t b;
+  for (i = 0U; i < len; i++)
+  {
+    crc ^= data[i];
+    for (b = 0U; b < 8U; b++)
+    {
+      crc = (crc & 1U) ? ((crc >> 1) ^ 0xEDB88320UL) : (crc >> 1);
+    }
+  }
+  return crc;
+}
+
+/* One-shot zlib.crc32-compatible CRC over a buffer; matches the gateway's check. */
+static uint32_t Drain_CRC32(const uint8_t *data, uint32_t len)
+{
+  return Drain_CRC32_Update(0xFFFFFFFFUL, data, len) ^ 0xFFFFFFFFUL;
+}
+
+/* Blast a sealed PSRAM mission to the gateway on UDP 5684 (ADR-020/021, Phase 1).
+ * Sends BEGIN ×3, all CHUNKs once (raw 7-byte FIFO words, CRC per chunk), END ×3.
+ * No back-channel yet — the gateway reassembles best-effort and flags gaps; the
+ * NAK/ACK selective-repeat layer (sampling_strategy.md §9) builds on top later. */
+static void Drain_Mission(int8_t idx)
+{
+  CaptureMission_t *m;
+  volatile uint8_t *ring;
+  struct mx_sockaddr_in dest = {0};
+  DrainBegin_t  beg = {0};
+  DrainEnd_t    end = {0};
+  DrainChunkHdr_t *hdr;
+  uint32_t total_chunks, chunk, off, remaining, crc_all = 0xFFFFFFFFUL;
+  uint16_t payload_len, k;
+
+  if ((idx < 0) || (idx >= (int8_t)CAP_MAX_MISSIONS)) { return; }
+  m = &cap_missions[idx];
+  if ((m->sealed == 0U) || (m->byte_count == 0U)) { return; }
+
+  if ((socket_id < 0) || (wifi_station_ready == 0U) || (jetson_ip[0] == 0))
+  {
+    sprintf(uart_buf, "[DRAIN] skipped: WiFi/socket not ready (mission %u)\r\n",
+            (unsigned)m->mission_id);
+    HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+    return;
+  }
+
+  ring = (volatile uint8_t *)PSRAM_BASE_ADDR;
+  dest.sin_len         = sizeof(dest);
+  dest.sin_family      = MX_AF_INET;
+  dest.sin_port        = PLUDOS_HTONS(DRAIN_PORT);
+  dest.sin_addr.s_addr = (uint32_t)mx_aton_r(jetson_ip);
+
+  total_chunks = (m->byte_count + DRAIN_CHUNK_PAYLOAD - 1U) / DRAIN_CHUNK_PAYLOAD;
+
+  /* BEGIN — repeated so a single control-packet loss doesn't strand the mission. */
+  beg.magic        = DRAIN_MAGIC;
+  beg.type         = DRAIN_TYPE_BEGIN;
+  beg.shuttle_id   = (uint8_t)SHUTTLE_ID;
+  beg.mission_id   = m->mission_id;
+  beg.total_chunks = (uint16_t)total_chunks;
+  beg.odr_accel_hz = DRAIN_ODR_ACCEL_HZ;
+  beg.odr_gyro_hz  = DRAIN_ODR_GYRO_HZ;
+  beg.byte_count   = m->byte_count;
+  beg.word_count   = m->word_count;
+  beg.t0_tick_ms   = m->start_tick_ms;
+  for (k = 0U; k < DRAIN_CTRL_REPEAT; k++)
+  {
+    (void)MX_WIFI_Socket_sendto(wifi_obj, socket_id, (uint8_t *)&beg, sizeof(beg),
+                                0, (struct mx_sockaddr *)&dest, sizeof(dest));
+  }
+
+  /* CHUNKs — copy each window out of the PSRAM ring (byte-wise wrap), CRC it, send. */
+  hdr = (DrainChunkHdr_t *)drain_buf;
+  off = m->start_offset;
+  for (chunk = 0U; chunk < total_chunks; chunk++)
+  {
+    remaining   = m->byte_count - (chunk * DRAIN_CHUNK_PAYLOAD);
+    payload_len = (remaining > DRAIN_CHUNK_PAYLOAD) ? (uint16_t)DRAIN_CHUNK_PAYLOAD
+                                                    : (uint16_t)remaining;
+    for (k = 0U; k < payload_len; k++)
+    {
+      drain_buf[sizeof(DrainChunkHdr_t) + k] = ring[off];
+      off++;
+      if (off >= PSRAM_SIZE_BYTES) { off = 0U; } /* ring wrap */
+    }
+
+    hdr->magic        = DRAIN_MAGIC;
+    hdr->type         = DRAIN_TYPE_CHUNK;
+    hdr->shuttle_id   = (uint8_t)SHUTTLE_ID;
+    hdr->mission_id   = m->mission_id;
+    hdr->chunk_seq    = (uint16_t)chunk;
+    hdr->total_chunks = (uint16_t)total_chunks;
+    hdr->payload_len  = payload_len;
+    hdr->crc32        = Drain_CRC32(&drain_buf[sizeof(DrainChunkHdr_t)], payload_len);
+    crc_all = Drain_CRC32_Update(crc_all, &drain_buf[sizeof(DrainChunkHdr_t)], payload_len);
+
+    (void)MX_WIFI_Socket_sendto(wifi_obj, socket_id, drain_buf,
+                                (int32_t)(sizeof(DrainChunkHdr_t) + payload_len),
+                                0, (struct mx_sockaddr *)&dest, sizeof(dest));
+  }
+  crc_all ^= 0xFFFFFFFFUL;
+
+  /* END — carries the whole-mission CRC so the gateway can validate completeness. */
+  end.magic        = DRAIN_MAGIC;
+  end.type         = DRAIN_TYPE_END;
+  end.shuttle_id   = (uint8_t)SHUTTLE_ID;
+  end.mission_id   = m->mission_id;
+  end.total_chunks = (uint16_t)total_chunks;
+  end.crc32_all    = crc_all;
+  for (k = 0U; k < DRAIN_CTRL_REPEAT; k++)
+  {
+    (void)MX_WIFI_Socket_sendto(wifi_obj, socket_id, (uint8_t *)&end, sizeof(end),
+                                0, (struct mx_sockaddr *)&dest, sizeof(dest));
+  }
+
+  sprintf(uart_buf, "[DRAIN] mission %u sent: %lu chunks, %lu B, crc=%08lX\r\n",
+          (unsigned)m->mission_id, (unsigned long)total_chunks,
+          (unsigned long)m->byte_count, (unsigned long)crc_all);
+  HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
 }
 
 /* USER CODE END 0 */
@@ -1337,6 +1502,7 @@ int main(void)
                       (unsigned)(NO_MOVEMENT_TIMEOUT_MS / 1000U));
               HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
               Capture_EnterIdle(); /* drain + seal the mission, restore live config */
+              Drain_Mission(cap_last_sealed_idx); /* blast the sealed mission to the gateway (UDP 5684) */
             }
           }
         }

@@ -104,15 +104,93 @@ visibility of environmental data take priority over per-packet delivery.
 
 ---
 
-## 2. UDP 5684 (Legacy NonCriticalPayload) — DEPRECATED
+## 2. High-rate capture drain (STM32 → Jetson, UDP 5684)
 
-Removed by ADR-015. The 30-byte `NonCriticalPayload` struct on port 5684
-no longer exists. `temp_c` and `humidity_pct` are now part of `PludosTelemetry`
-in §1 and arrive at the gateway with every packet. `pressure_hpa` was dropped
-entirely from the wire in the v2 refinement — the LPS22HH is still read on the
-STM32 for local UART debug logging but is not transmitted.
+ADR-020/021. After a mission ends (MOVING→IDLE), the STM32 drains the raw
+ISM330DHCX FIFO words buffered in PSRAM to the gateway as a burst of UDP
+datagrams on port **5684** (the legacy `NonCriticalPayload` use of this port was
+removed by ADR-015; the port is now reused for the drain). The live 24-byte
+`PludosTelemetry` path on 5683 (§1) is untouched.
 
-Gateway port 5684 listener has been removed in `data-engine.py`.
+**Phase 1 (current): blast-only.** STM sends `DRAIN_BEGIN` (×3), then all chunks
+back-to-back, then `DRAIN_END` (×3). No back-channel. The gateway reassembles by
+`chunk_seq`, validates each chunk's CRC32, and writes one Parquet per
+`(shuttle_id, mission_id)` on `DRAIN_END` (or a quiet timeout), marking
+`complete=false` and recording gap ranges if any chunk is missing.
+**Phase 2 (planned): NAK selective-repeat ARQ** (`sampling_strategy.md §9`) layers
+`NAK`/`ACK_COMPLETE` back-channel packets (types 4/5) on top of this same frame
+format without changing the on-wire layout of types 1–3.
+
+### Common framing
+- All multi-byte fields **little-endian** (both ends are LE; structs are packed).
+- Every packet starts with `u32 magic = 0x52444C50` (ASCII `"PLDR"` in memory
+  order `P,L,D,R`) and `u8 type`.
+- One UDP datagram = one packet. Max datagram 1418 B (18 B chunk header + 1400 B
+  payload) — well under the 1472 B non-fragmenting limit (§1 / `sampling_strategy.md §1`).
+
+### Packet types
+```c
+/* type=1 DRAIN_BEGIN — control, sent x3 for robustness. 28 bytes. */
+typedef struct __attribute__((packed)) {
+  uint32_t magic;        /* 0x52444C50                                   */
+  uint8_t  type;         /* 1                                            */
+  uint8_t  shuttle_id;
+  uint16_t mission_id;
+  uint16_t total_chunks; /* number of CHUNK packets that follow          */
+  uint16_t odr_accel_hz; /* 3332                                         */
+  uint16_t odr_gyro_hz;  /* 416                                          */
+  uint16_t _pad;
+  uint32_t byte_count;   /* total payload bytes across all chunks        */
+  uint32_t word_count;   /* FIFO words = byte_count / 7                   */
+  uint32_t t0_tick_ms;   /* mission-start HAL_GetTick(); gateway maps to  */
+                         /* wall time via its per-shuttle NTP offset      */
+} DrainBegin_t;
+
+/* type=2 CHUNK — data. 18-byte header + payload (<=1400 B = <=200 FIFO words). */
+typedef struct __attribute__((packed)) {
+  uint32_t magic;        /* 0x52444C50                                   */
+  uint8_t  type;         /* 2                                            */
+  uint8_t  shuttle_id;
+  uint16_t mission_id;
+  uint16_t chunk_seq;    /* 0 .. total_chunks-1                          */
+  uint16_t total_chunks;
+  uint16_t payload_len;  /* <=1400, multiple of 7 except possibly last   */
+  uint32_t crc32;        /* zlib/IEEE CRC32 of the payload bytes only     */
+  /* uint8_t payload[payload_len] — raw 7-byte FIFO words [tag,Xl,Xh,Yl,Yh,Zl,Zh] */
+} DrainChunkHdr_t;
+
+/* type=3 DRAIN_END — control, sent x3. 16 bytes. */
+typedef struct __attribute__((packed)) {
+  uint32_t magic;        /* 0x52444C50                                   */
+  uint8_t  type;         /* 3                                            */
+  uint8_t  shuttle_id;
+  uint16_t mission_id;
+  uint16_t total_chunks;
+  uint16_t _pad;
+  uint32_t crc32_all;    /* CRC32 of the full concatenated payload, 0 = unused */
+} DrainEnd_t;
+```
+
+### Payload semantics
+Chunk payloads are the **raw FIFO byte stream**, concatenated in `chunk_seq`
+order, reproducing the PSRAM ring contents exactly. Each 7-byte word is
+`[tag, X_L, X_H, Y_L, Y_H, Z_L, Z_H]`; `tag >> 3` selects sensor
+(`0x02`=accel `XL_NC`, `0x01`=gyro `GYRO_NC`). Payloads are sized at 1400 B =
+200 words so word boundaries never split across chunks (the last chunk holds the
+remainder). Axes are int16 little-endian at the ISM330 FS scale (±2 g accel,
+±250 dps gyro for the current capture config).
+
+### Gateway Parquet schema (one file per completed mission)
+Demux accel/gyro by tag into **separate streams — do not upsample/pad** the gyro
+to the accel rate. Per-sample time is derived, never per-sample stamped:
+`t_ms = t0_wall + sample_index * 1000 / odr` (per stream, using its own ODR).
+Mission metadata columns: `shuttle_id, mission_id, odr_accel_hz, odr_gyro_hz,
+t0_wall_ms, complete (bool), missing_chunk_ranges`.
+
+### CRC32
+Standard zlib/IEEE CRC32 (reflected, poly `0xEDB88320`, init `0xFFFFFFFF`, final
+XOR `0xFFFFFFFF`) — matches Python `zlib.crc32`. The STM uses a software bitwise
+implementation; the drain runs during IDLE where the CPU cost is free.
 
 ---
 
