@@ -1389,6 +1389,13 @@ int main(void)
     TELEMETRY_BenchThroughput();
   }
 #endif
+
+  /* ADR-021: enter the main loop with the radio dark. jetson_ip is cached from the
+   * boot beacon (or fallback); WiFi powers on again only to drain at MOVING→IDLE. */
+  if (wifi_driver_initialized != 0U)
+  {
+    WIFI_PowerOff();
+  }
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -1502,7 +1509,19 @@ int main(void)
                       (unsigned)(NO_MOVEMENT_TIMEOUT_MS / 1000U));
               HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
               Capture_EnterIdle(); /* drain + seal the mission, restore live config */
-              Drain_Mission(cap_last_sealed_idx); /* blast the sealed mission to the gateway (UDP 5684) */
+              /* ADR-021: wake the radio only to drain this mission, then power it back
+               * down for the idle window. The ~4 s power-on cost is paid in IDLE where
+               * latency is free; jetson_ip is cached so the beacon wait is skipped. */
+              if (WIFI_PowerOn() == 0)
+              {
+                Drain_Mission(cap_last_sealed_idx); /* blast the sealed mission to the gateway (UDP 5684) */
+              }
+              else
+              {
+                sprintf(uart_buf, "[DRAIN] skipped — WiFi power-on failed\r\n");
+                HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+              }
+              WIFI_PowerOff();
             }
           }
         }
@@ -1575,7 +1594,9 @@ int main(void)
      * Skipped during MOVING to avoid a 500 ms pause in the 50 Hz stream.
      * On success: jetson_ip updated immediately. On miss: existing IP kept as-is.
      * --------------------------------------------------------------- */
-    if (current_state == STATE_IDLE)
+    /* Gated on wifi_driver_initialized: in the ADR-021 duty-cycle the radio is off
+     * through IDLE, so beacon retry only runs in the brief drain window. */
+    if ((current_state == STATE_IDLE) && (wifi_driver_initialized != 0U))
     {
       static uint32_t last_beacon_retry_tick = 0U;
       if ((HAL_GetTick() - last_beacon_retry_tick) >= BEACON_RETRY_PERIOD_MS)
@@ -1601,7 +1622,9 @@ int main(void)
         should_tx = 1U;
       }
 
-      if (should_tx)
+      /* ADR-021: the live 5683 stream is gone in the duty-cycle model — the radio is
+       * off except to drain, so TELEMETRY_Send only fires inside a drain window. */
+      if (should_tx && (wifi_driver_initialized != 0U))
       {
         (void)TELEMETRY_Send();
         last_tx_tick = HAL_GetTick();

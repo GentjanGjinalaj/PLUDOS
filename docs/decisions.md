@@ -749,7 +749,11 @@ both inside a normal IDLE gap if drains are staggered.
 ## ADR-021 — Power-aware capture + WiFi duty-cycling (revises ADR-020)
 **Status:** Open (proposed). Capture/drain core from ADR-020 stands; this ADR fixes
 *when the radio is on* and *what is captured in each state*. WiFi power primitives
-**implemented and hardware-verified 2026-06-01**; capture engine + drain still to build.
+**implemented and hardware-verified 2026-06-01**. **Phase 1 implemented and
+hardware-verified 2026-06-03:** radio off during MOVING, powered on only to drain at
+MOVING→IDLE then off; live 5683 stream dropped. **Still to build:** unified IDLE
+low-rate capture (decision 1) and the total-ring 75% watermark flush (the per-mission
+watermark at main.c is not yet a cross-mission accumulator).
 
 **Context:** profiling the ADR-015 firmware showed the dominant edge-node power
 draw is the EMW3080: it is associated to the AP 100 % of the time and transmits a
