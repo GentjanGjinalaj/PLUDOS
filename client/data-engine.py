@@ -44,6 +44,8 @@ import pandas as pd
 from influxdb_client import InfluxDBClient, Point, WritePrecision  # type: ignore
 from influxdb_client.client.write_api import SYNCHRONOUS           # type: ignore
 
+import drain_receiver  # high-rate capture drain receiver (ADR-020, UDP 5684)
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -412,6 +414,15 @@ def _unpack_telemetry(raw: bytes) -> dict:
         "tick_ms":  tick,  # HAL_GetTick() ms since boot; anchored to UTC via NTP offset
         "seq_wire": seq,   # raw uint16 counter; used for wrap detection only
     }
+
+
+# NTP-offset accessor for the drain receiver. Drain packets carry the 1-based
+# integer shuttle_id, but _ntp_offsets is keyed by name ("shuttle-{n}"); map
+# through SHUTTLE_NAMES like the telemetry path does. Returns None if no offset
+# has been anchored yet (shuttle never streamed on 5683 this session).
+def get_ntp_offset(shuttle_id: int) -> int | None:
+    name = SHUTTLE_NAMES.get(shuttle_id, f"shuttle-{shuttle_id}")
+    return _ntp_offsets.get(name)
 
 
 def _reset_shuttle_state(shuttle_id: str) -> None:
@@ -893,6 +904,10 @@ async def main() -> None:
         local_addr=("0.0.0.0", TELEMETRY_PORT),
     )
     logger.info("Telemetry UDP listener bound on port %d", TELEMETRY_PORT)
+
+    # High-rate capture drain receiver on UDP 5684 (ADR-020). Separate path from
+    # the 5683 live hot loop; reuses the per-shuttle NTP offset to anchor t0.
+    await drain_receiver.start_drain_receiver(get_ntp_offset, BUFFER_DIR)
 
     # Consolidate any mission files from days before today (handles Jetson restarts / downtime).
     _consolidate_stale()
