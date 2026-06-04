@@ -157,7 +157,12 @@ int8_t SENSOR_Humidity_Read(I2C_HandleTypeDef *hi2c, float *temp_c, float *humid
  * Verify address against board schematic if WHO_AM_I fails at startup.
  * ========================================================================= */
 
-#define LPS22HH_ADDR            0xB8U   /* 8-bit: 0x5C << 1 (SA0 tied to GND on IOT02A) */
+/* Two legal LPS22HH I2C addresses, selected by the SA0 strap (datasheet §6.1.1).
+ * Earlier boots failed WHO_AM_I at 0xB8, so init probes both and keeps whichever
+ * answers — no invented number, just the two straps the part actually supports. */
+#define LPS22HH_ADDR_SA0_LOW    0xB8U   /* 8-bit: 0x5C << 1 (SA0=GND) */
+#define LPS22HH_ADDR_SA0_HIGH   0xBAU   /* 8-bit: 0x5D << 1 (SA0=VDD) */
+static uint8_t lps22hh_addr =   LPS22HH_ADDR_SA0_LOW; /* resolved by SENSOR_Pressure_Init */
 #define LPS22HH_WHO_AM_I        0x0FU
 #define LPS22HH_WHOAMI_VAL      0xB3U
 #define LPS22HH_CTRL_REG1       0x10U
@@ -170,23 +175,34 @@ int8_t SENSOR_Humidity_Read(I2C_HandleTypeDef *hi2c, float *temp_c, float *humid
 #define LPS22HH_I2C_TIMEOUT     25U
 #define LPS22HH_DRDY_WAIT_MS    10U
 
-/* Probe WHO_AM_I, set ODR=1Hz + BDU. No calibration registers — factory trimmed. */
+/* Probe WHO_AM_I on both SA0 straps, latch the responding address, then set
+ * ODR=1Hz + BDU. No calibration registers — factory trimmed. */
 int8_t SENSOR_Pressure_Init(I2C_HandleTypeDef *hi2c)
 {
+    const uint8_t candidates[2] = { LPS22HH_ADDR_SA0_LOW, LPS22HH_ADDR_SA0_HIGH };
     uint8_t val;
+    uint8_t found = 0U;
+    uint8_t i;
 
-    if (HAL_I2C_Mem_Read(hi2c, LPS22HH_ADDR, LPS22HH_WHO_AM_I,
-                         I2C_MEMADD_SIZE_8BIT, &val, 1, LPS22HH_I2C_TIMEOUT) != HAL_OK)
+    /* WHO_AM_I (0xB3) must answer on one of the two straps; first match wins. */
+    for (i = 0U; i < 2U; i++)
     {
-        return -1;
+        if ((HAL_I2C_Mem_Read(hi2c, candidates[i], LPS22HH_WHO_AM_I,
+                              I2C_MEMADD_SIZE_8BIT, &val, 1, LPS22HH_I2C_TIMEOUT) == HAL_OK)
+            && (val == LPS22HH_WHOAMI_VAL))
+        {
+            lps22hh_addr = candidates[i];
+            found = 1U;
+            break;
+        }
     }
-    if (val != LPS22HH_WHOAMI_VAL)
+    if (found == 0U)
     {
         return -1;
     }
 
     val = LPS22HH_CTRL_REG1_VAL;
-    if (HAL_I2C_Mem_Write(hi2c, LPS22HH_ADDR, LPS22HH_CTRL_REG1,
+    if (HAL_I2C_Mem_Write(hi2c, lps22hh_addr, LPS22HH_CTRL_REG1,
                           I2C_MEMADD_SIZE_8BIT, &val, 1, LPS22HH_I2C_TIMEOUT) != HAL_OK)
     {
         return -1;
@@ -208,7 +224,7 @@ int8_t SENSOR_Pressure_Read(I2C_HandleTypeDef *hi2c, float *pressure_hpa)
     }
 
     /* Poll P_DA (bit 0) — pressure data available */
-    if (HAL_I2C_Mem_Read(hi2c, LPS22HH_ADDR, LPS22HH_STATUS,
+    if (HAL_I2C_Mem_Read(hi2c, lps22hh_addr, LPS22HH_STATUS,
                          I2C_MEMADD_SIZE_8BIT, &status, 1, LPS22HH_I2C_TIMEOUT) != HAL_OK)
     {
         return -1;
@@ -216,7 +232,7 @@ int8_t SENSOR_Pressure_Read(I2C_HandleTypeDef *hi2c, float *pressure_hpa)
     if ((status & 0x01U) == 0U)
     {
         HAL_Delay(LPS22HH_DRDY_WAIT_MS);
-        if (HAL_I2C_Mem_Read(hi2c, LPS22HH_ADDR, LPS22HH_STATUS,
+        if (HAL_I2C_Mem_Read(hi2c, lps22hh_addr, LPS22HH_STATUS,
                              I2C_MEMADD_SIZE_8BIT, &status, 1, LPS22HH_I2C_TIMEOUT) != HAL_OK)
         {
             return -1;
@@ -228,7 +244,7 @@ int8_t SENSOR_Pressure_Read(I2C_HandleTypeDef *hi2c, float *pressure_hpa)
     }
 
     /* Read PRESS_OUT_XL + PRESS_OUT_L + PRESS_OUT_H in one burst */
-    if (HAL_I2C_Mem_Read(hi2c, LPS22HH_ADDR, LPS22HH_PRESS_OUT_XL,
+    if (HAL_I2C_Mem_Read(hi2c, lps22hh_addr, LPS22HH_PRESS_OUT_XL,
                          I2C_MEMADD_SIZE_8BIT, raw, 3, LPS22HH_I2C_TIMEOUT) != HAL_OK)
     {
         return -1;
