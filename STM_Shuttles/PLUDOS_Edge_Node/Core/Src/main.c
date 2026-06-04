@@ -115,13 +115,15 @@ static ShuttleState_t current_state = STATE_IDLE;
 static uint32_t last_movement_tick = 0U;        /* tick of the most recent above-threshold sample */
 static uint32_t last_above_threshold_tick = 0U; /* same value, separate name for debounce clarity */
 static uint32_t continuous_movement_start_tick = 0U; /* tick when the current dwell began */
+static uint32_t fsm_settle_until_tick = 0U; /* suppress motion trigger until this tick: OUTX is filter-settling after a CTRL1_XL ODR change */
 
 /* UNCALIBRATED — set threshold = mean(idle_mag²) + 5σ after recording
    5 min IDLE + 5 min motion on the actual fixture. Current 0.05 is a guess. */
-#define MOVEMENT_THRESHOLD_G2   0.05f    /* |mag² - 1g²| threshold to detect motion */
-#define MOVEMENT_DWELL_MS       500U     /* continuous-above duration to enter STATE_MOVING */
+#define MOVEMENT_THRESHOLD_G2   0.06f    /* |mag² - 1g²| trigger — tilt-immune (magnitude stays 1g at any orientation) and captures horizontal travel (deviation ~= a_horiz²). TUNE from UART rest-floor capture. */
+#define MOVEMENT_DWELL_MS       500U     /* continuous-above duration to enter STATE_MOVING (0.5s: reliable real-world trigger without qualifying transient shakes) */
 #define MOVEMENT_DEBOUNCE_MS    300U     /* sub-threshold tolerance inside a dwell — survives motion microbreaks */
 #define NO_MOVEMENT_TIMEOUT_MS  20000U   /* no above-threshold sample for this long → STATE_IDLE */
+#define ACCEL_SETTLE_MS         1000U    /* blank the motion trigger this long after any CTRL1_XL ODR change. Switching ODR (e.g. 104Hz↔12.5Hz at idle-snapshot entry/exit) resets the LPF2 digital filter; OUTX reads mid-reset return ~0g, so |mag²-1g²|≈1.0 and a phantom MOVING dwell completes. 1s covers the slow 12.5Hz settle while leaving 9s of real detection in a 10s snapshot. Empirical — TUNE from UART. */
 
 #define SAMPLE_PERIOD_IDLE_MS   100U     /* 10 Hz internal sampling in IDLE (FSM responsiveness) */
 #define SAMPLE_PERIOD_MOVING_MS 20U      /* 50 Hz sampling + transmit in MOVING (UDP send self-throttles if WiFi can't keep up) */
@@ -235,7 +237,7 @@ static uint32_t tx_window_start_tick = 0U;
 #define CAP_CTRL1_XL_IDLE     0x12U   /* accel ODR=12.5Hz (0001), FS=±2g, LPF2_XL_EN=1 */
 #define CAP_CTRL2_G_IDLE      0x10U   /* gyro  ODR=12.5Hz (0001), FS=±250 dps */
 #define CAP_FIFO_CTRL3_IDLE   0x11U   /* BDR_GY=12.5Hz (1), BDR_XL=12.5Hz (1) */
-#define CAP_IDLE_SNAP_PERIOD_MS  300000U  /* take an idle snapshot every 5 min */
+#define CAP_IDLE_SNAP_PERIOD_MS  60000U  /* TEST: idle snapshot every 1 min; production = 300000 (5 min) */
 #define CAP_IDLE_SNAP_DUR_MS      10000U  /* each idle snapshot lasts 10 s */
 /* Gyro LPF1 (CTRL4_C=0x02, CTRL6_C=0x07 FTYPE=111) left at boot setting: FTYPE=111 is
  * the narrowest LPF1, so its corner is the lowest of all FTYPE codes and stays below
@@ -292,6 +294,8 @@ static uint8_t  cap_fifo_buf[CAP_FIFO_READ_WORDS * CAP_FIFO_WORD_BYTES]; /* SRAM
 #define DRAIN_TYPE_END         3U
 #define DRAIN_CHUNK_PAYLOAD    1400U         /* 200 FIFO words — never splits a word across chunks */
 #define DRAIN_CTRL_REPEAT      3U            /* resend BEGIN/END N times (control-loss tolerance) */
+#define DRAIN_WARMUP_PACKETS   24U           /* sacrificial datagrams to absorb the post-power-on loss window (~16 pkts measured) */
+#define DRAIN_WARMUP_GAP_MS    8U            /* inter-packet pace so each junk pkt actually reaches air (advances ARP/MAC-learning) instead of piling into the SPI TX queue */
 #define DRAIN_ODR_ACCEL_HZ     3332U
 #define DRAIN_ODR_GYRO_HZ      416U
 
@@ -428,6 +432,35 @@ static void WIFI_LogStationEvent(uint8_t event)
   HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
 }
 
+/* ADR-021 recovery net: hand-rolled independent watchdog. The HAL IWDG module is not
+ * enabled in this CubeMX project, so we drive the IWDG registers directly (CMSIS only,
+ * no HAL/.ioc dependency). The EMW3080 drain re-init (WIFI_PowerOn) can wedge forever
+ * on a silent SPI/EXTI handshake — the BSP's own MX_WIFI_CMD_TIMEOUT never advances
+ * when the module is mute. A hang stops kicking the dog, so the chip resets (~16 s) and
+ * re-inits cleanly on the next boot instead of freezing in the field until manual reset. */
+#define IWDG_PR_DIV128   (0x05U)    /* prescaler /128 (LSI nominal 32 kHz) */
+#define IWDG_RLR_RELOAD  (0x0FFFU)  /* 4095 -> (4096 * 128) / 32000 ~= 16.4 s timeout */
+
+/* Start the IWDG with a ~16 s period. Period must exceed the longest single blocking
+ * BSP call (MX_WIFI_CMD_TIMEOUT = 10 s) so a slow-but-alive module is not falsely reset.
+ * Once started the IWDG cannot be stopped (hardware), so arm only after boot bring-up. */
+static void IWDG_Arm(void)
+{
+  IWDG->KR  = 0x0000CCCCU;     /* start watchdog (also forces LSI on) */
+  IWDG->KR  = 0x00005555U;     /* unlock PR/RLR for write */
+  IWDG->PR  = IWDG_PR_DIV128;
+  IWDG->RLR = IWDG_RLR_RELOAD;
+  while (IWDG->SR != 0U) { }   /* wait for PR/RLR to sync into the LSI clock domain */
+  IWDG->KR  = 0x0000AAAAU;     /* initial reload */
+}
+
+/* Refresh the watchdog counter. No-op before IWDG_Arm() (the reload key does nothing
+ * until the watchdog is started), so it is safe on code paths shared by boot and drain. */
+static void IWDG_Kick(void)
+{
+  IWDG->KR = 0x0000AAAAU;
+}
+
 static MX_WIFI_STATUS_T WIFI_WaitForStationIP(uint8_t ip_addr[4], uint32_t timeout_ms)
 {
   uint32_t start_tick = HAL_GetTick();
@@ -443,6 +476,7 @@ static MX_WIFI_STATUS_T WIFI_WaitForStationIP(uint8_t ip_addr[4], uint32_t timeo
 
   while ((HAL_GetTick() - start_tick) < timeout_ms)
   {
+    IWDG_Kick();  /* forward progress: DHCP wait can legitimately run up to timeout_ms */
     (void)MX_WIFI_IO_YIELD(wifi_obj, 100);
 
     if (wifi_station_event != last_event)
@@ -475,6 +509,7 @@ static void WIFI_DelayWithYield(uint32_t delay_ms)
 
   while ((HAL_GetTick() - start_tick) < delay_ms)
   {
+    IWDG_Kick();  /* forward progress during link-settle / warm-up gap waits */
     uint32_t elapsed = HAL_GetTick() - start_tick;
     uint32_t remaining = delay_ms - elapsed;
     uint32_t slice_ms = (remaining > 10U) ? 10U : remaining;
@@ -796,6 +831,11 @@ static void TELEMETRY_BenchThroughput(void)
 }
 #endif /* BENCH_THROUGHPUT */
 
+/* Post-association settle: time to wait after the socket is armed before the
+ * caller's first send, so the AP can learn our MAC / resolve ARP and the first
+ * UDP datagrams aren't dropped. Tune empirically (paid in IDLE, latency-free). */
+#define WIFI_LINK_SETTLE_MS  1200U
+
 /* Power up the EMW3080 and bring the station fully online: probe the SPI bus
  * (once), hard-reset the module, init the driver, register the status callback,
  * connect to the AP, wait for a DHCP lease and arm the telemetry UDP socket.
@@ -822,6 +862,7 @@ static int8_t WIFI_PowerOn(void)
 
   /* Always hard-reset: releases the RESET pin and reboots the module from the
    * held-in-reset (off) state into a clean SPI handshake. */
+  IWDG_Kick();  /* fresh window: each BSP call below can block up to MX_WIFI_CMD_TIMEOUT */
   if (MX_WIFI_HardResetModule(wifi_obj) != MX_WIFI_STATUS_OK)
   {
     sprintf(uart_buf, "[NETWORK] ERROR: hard reset failed\r\n");
@@ -830,6 +871,7 @@ static int8_t WIFI_PowerOn(void)
     return -1;
   }
 
+  IWDG_Kick();
   if (MX_WIFI_Init(wifi_obj) != MX_WIFI_STATUS_OK)
   {
     sprintf(uart_buf, "[NETWORK] ERROR: module init failed\r\n");
@@ -844,6 +886,7 @@ static int8_t WIFI_PowerOn(void)
   wifi_station_ready               = 0U;
   (void)MX_WIFI_RegisterStatusCallback_if(wifi_obj, WIFI_StatusCallback, NULL, MC_STATION);
 
+  IWDG_Kick();
   if (MX_WIFI_Connect(wifi_obj, WIFI_SSID, WIFI_PASSWORD, MX_WIFI_SEC_AUTO) != MX_WIFI_STATUS_OK)
   {
     sprintf(uart_buf, "[NETWORK] ERROR: connect failed (check SSID/password)\r\n");
@@ -886,6 +929,14 @@ static int8_t WIFI_PowerOn(void)
   sprintf(uart_buf, "[NETWORK] PludosTelemetry stream armed → udp://%s:%u\r\n",
           jetson_ip, (unsigned)TELEMETRY_PORT);
   HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+
+  /* ADR-021: a DHCP lease does not mean the data path is flushed. The AP still
+   * has to learn our MAC and resolve ARP, so the first few UDP datagrams after a
+   * fresh association are silently dropped — fatal for a single-chunk idle-snapshot
+   * drain that has no chunk redundancy to recover. Settle (yielding to the SPI
+   * driver) before the caller's first send so that first BEGIN actually lands.
+   * Paid in IDLE where latency is free. Tune WIFI_LINK_SETTLE_MS empirically. */
+  WIFI_DelayWithYield(WIFI_LINK_SETTLE_MS);
   return 0;
 }
 
@@ -951,6 +1002,7 @@ static void Capture_EnterMoving(void)
   v = CAP_CTRL1_XL_MOVING; (void)HAL_I2C_Mem_Write(&hi2c2, ISM330_ADDR, CTRL1_XL, 1, &v, 1, 100);
   v = CAP_CTRL8_XL_MOVING; (void)HAL_I2C_Mem_Write(&hi2c2, ISM330_ADDR, CTRL8_XL, 1, &v, 1, 100);
   v = CAP_CTRL2_G_MOVING;  (void)HAL_I2C_Mem_Write(&hi2c2, ISM330_ADDR, CTRL2_G,  1, &v, 1, 100);
+  fsm_settle_until_tick = HAL_GetTick() + ACCEL_SETTLE_MS; /* ODR just changed — blank trigger while LPF2 re-settles */
 
   /* Batch rates, then BYPASS→STREAM toggle to flush any stale words before capture. */
   v = CAP_FIFO_CTRL3_MOVING; (void)HAL_I2C_Mem_Write(&hi2c2, ISM330_ADDR, ISM330_FIFO_CTRL3, 1, &v, 1, 100);
@@ -978,7 +1030,7 @@ static void Capture_EnterMoving(void)
   m->sealed        = 0U;
   m->drained       = 0U;
   m->is_idle_snapshot = 0U;
-  m->temp_c_x100      = (int16_t)0x7FFF; /* MOVING missions carry no env stamp */
+  m->temp_c_x100      = (int16_t)0x7FFF;  /* stamped at seal from the env cache */
   m->pressure_hpa_x10 = 0U;
 
   sprintf(uart_buf, "[CAPTURE] mission %u start @0x%06lX (accel 3332Hz, gyro 416Hz)\r\n",
@@ -1003,6 +1055,7 @@ static void Capture_EnterIdleSnapshot(void)
   /* Low-rate config; CTRL8_XL left at LIVE (anti-alias cutoff already < Nyquist). */
   v = CAP_CTRL1_XL_IDLE; (void)HAL_I2C_Mem_Write(&hi2c2, ISM330_ADDR, CTRL1_XL, 1, &v, 1, 100);
   v = CAP_CTRL2_G_IDLE;  (void)HAL_I2C_Mem_Write(&hi2c2, ISM330_ADDR, CTRL2_G,  1, &v, 1, 100);
+  fsm_settle_until_tick = HAL_GetTick() + ACCEL_SETTLE_MS; /* 104Hz→12.5Hz resets LPF2 — blank trigger to kill the phantom-MOVING transient */
 
   /* Batch rates, then BYPASS→STREAM toggle to flush any stale words before capture. */
   v = CAP_FIFO_CTRL3_IDLE;  (void)HAL_I2C_Mem_Write(&hi2c2, ISM330_ADDR, ISM330_FIFO_CTRL3, 1, &v, 1, 100);
@@ -1151,18 +1204,17 @@ static void Capture_EnterIdle(void)
   v = LIVE_CTRL1_XL; (void)HAL_I2C_Mem_Write(&hi2c2, ISM330_ADDR, CTRL1_XL, 1, &v, 1, 100);
   v = LIVE_CTRL8_XL; (void)HAL_I2C_Mem_Write(&hi2c2, ISM330_ADDR, CTRL8_XL, 1, &v, 1, 100);
   v = LIVE_CTRL2_G;  (void)HAL_I2C_Mem_Write(&hi2c2, ISM330_ADDR, CTRL2_G,  1, &v, 1, 100);
+  fsm_settle_until_tick = HAL_GetTick() + ACCEL_SETTLE_MS; /* restoring 104Hz also resets LPF2 — blank trigger through the settle */
 
   m = &cap_missions[cap_active_idx];
 
-  /* Idle snapshots carry the environment at seal time so Grafana can chart idle
-   * temp/pressure (the live telemetry stream is off during IDLE, ADR-021 Phase 1). */
-  if (m->is_idle_snapshot != 0U)
-  {
-    m->temp_c_x100 = (cached_temp_c > -998.0f) ? (int16_t)(cached_temp_c * 100.0f)
-                                               : (int16_t)0x7FFF;
-    m->pressure_hpa_x10 = (cached_pressure_hpa > 0.0f)
-                          ? (uint16_t)(cached_pressure_hpa * 10.0f) : 0U;
-  }
+  /* Every mission (idle snapshot AND MOVING) carries the environment at seal time
+   * so Grafana can chart temp/pressure for both — the live telemetry stream is off
+   * during IDLE (ADR-021 Phase 1) and absent for the high-rate MOVING capture. */
+  m->temp_c_x100 = (cached_temp_c > -998.0f) ? (int16_t)(cached_temp_c * 100.0f)
+                                             : (int16_t)0x7FFF;
+  m->pressure_hpa_x10 = (cached_pressure_hpa > 0.0f)
+                        ? (uint16_t)(cached_pressure_hpa * 10.0f) : 0U;
 
   m->sealed = 1U;
   sprintf(uart_buf, "[CAPTURE] mission %u sealed: %lu words, %lu B, ovr=%lu\r\n",
@@ -1256,6 +1308,7 @@ static void Drain_Mission(int8_t idx)
   off = m->start_offset;
   for (chunk = 0U; chunk < total_chunks; chunk++)
   {
+    IWDG_Kick();  /* large missions = many unyielded sends; keep the dog fed per chunk */
     remaining   = m->byte_count - (chunk * DRAIN_CHUNK_PAYLOAD);
     payload_len = (remaining > DRAIN_CHUNK_PAYLOAD) ? (uint16_t)DRAIN_CHUNK_PAYLOAD
                                                     : (uint16_t)remaining;
@@ -1314,6 +1367,44 @@ static void Drain_Mission(int8_t idx)
 /* Wake the radio once to blast every sealed-but-undrained mission (the just-ended
  * MOVING mission plus any idle snapshots queued since the last wake), then power it
  * back down. Amortises the ~4 s WiFi bring-up across all pending data (ADR-021 §1). */
+/* Sacrificial warm-up burst — fire DRAIN_WARMUP_PACKETS zero-magic datagrams
+ * before any real mission. The radio reliably loses ~16 packets right after
+ * WIFI_PowerOn while the AP learns our MAC / resolves ARP; this is packet-count
+ * driven, NOT time driven — a passive settle delay does NOT help (verified on
+ * hardware 2026-06-04, WIFI_LINK_SETTLE_MS=1200 still lost two idle snapshots).
+ * Only actual outbound traffic warms the path, so we sacrifice junk packets into
+ * that window. magic=0 (!= DRAIN_MAGIC) so the gateway drops them silently and
+ * never reassembles or writes them. Sized to a real BEGIN for wire realism. */
+static void Drain_WarmupBurst(void)
+{
+  struct mx_sockaddr_in dest = {0};
+  uint8_t warm[sizeof(DrainBegin_t)] = {0};  /* all-zero payload → magic 0 → gateway discards */
+  uint8_t k;
+
+  if ((socket_id < 0) || (wifi_station_ready == 0U) || (jetson_ip[0] == 0)) { return; }
+
+  dest.sin_len         = sizeof(dest);
+  dest.sin_family      = MX_AF_INET;
+  dest.sin_port        = PLUDOS_HTONS(DRAIN_PORT);
+  dest.sin_addr.s_addr = (uint32_t)mx_aton_r(jetson_ip);
+
+  /* Pace the burst: an unspaced loop dumps all 24 packets into the EMW3080 SPI TX
+   * queue in <5 ms, so only a handful actually hit the air before real data follows
+   * and the BEGIN still lands inside the ARP/association loss window. Spacing each
+   * junk packet by DRAIN_WARMUP_GAP_MS forces them onto the air over ~200 ms, which
+   * reliably completes ARP/MAC-learning before the first real BEGIN. */
+  for (k = 0U; k < DRAIN_WARMUP_PACKETS; k++)
+  {
+    (void)MX_WIFI_Socket_sendto(wifi_obj, socket_id, warm, (int32_t)sizeof(warm),
+                                0, (struct mx_sockaddr *)&dest, sizeof(dest));
+    WIFI_DelayWithYield(DRAIN_WARMUP_GAP_MS);
+  }
+
+  sprintf(uart_buf, "[DRAIN] warm-up burst sent: %u x %u B @ %u ms gap (sacrificial)\r\n",
+          (unsigned)DRAIN_WARMUP_PACKETS, (unsigned)sizeof(warm), (unsigned)DRAIN_WARMUP_GAP_MS);
+  HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+}
+
 static void Drain_AllPending(void)
 {
   uint8_t i;
@@ -1333,8 +1424,21 @@ static void Drain_AllPending(void)
     return; /* nothing pending — keep the radio dark */
   }
 
-  if (WIFI_PowerOn() == 0)
+  /* One bounded retry: a soft bring-up failure (transient connect / no DHCP) shouldn't
+   * strand a whole batch of sealed missions until the next MOVING run. PowerOff fully
+   * resets the module (RESET pin low) so the retry starts from a known-cold state. A
+   * true silent-SPI hang never returns here — the IWDG handles that path. */
+  int8_t powered = WIFI_PowerOn();
+  if (powered != 0)
   {
+    WIFI_PowerOff();
+    WIFI_DelayWithYield(500U);
+    powered = WIFI_PowerOn();
+  }
+
+  if (powered == 0)
+  {
+    Drain_WarmupBurst();  /* absorb the post-power-on loss window before real data */
     for (i = 0U; i < cap_mission_count; i++)
     {
       if ((cap_missions[i].sealed != 0U) && (cap_missions[i].drained == 0U))
@@ -1345,7 +1449,7 @@ static void Drain_AllPending(void)
   }
   else
   {
-    sprintf(uart_buf, "[DRAIN] skipped — WiFi power-on failed\r\n");
+    sprintf(uart_buf, "[DRAIN] skipped — WiFi power-on failed (after retry)\r\n");
     HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
   }
   WIFI_PowerOff();
@@ -1566,6 +1670,12 @@ int main(void)
   {
     WIFI_PowerOff();
   }
+
+  /* Arm the watchdog only now — past the boot beacon (up to 30 s) and the one-shot
+   * self-test/bench blocks, which would otherwise false-trip it. From here on, any
+   * hang in the on-demand drain re-init (the observed field failure) stops the kicks
+   * and the chip self-resets into a clean boot instead of freezing. */
+  IWDG_Arm();
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -1575,6 +1685,8 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+
+    IWDG_Kick();  /* steady-state heartbeat; each loop iteration is well under the ~16 s period */
 
     /* Drive MXCHIP IO so async events (STA_UP / STA_DOWN / IP changes) are processed. */
     if ((wifi_obj != NULL) && (wifi_driver_initialized != 0U))
@@ -1634,8 +1746,25 @@ int main(void)
         a_mag_g2 = (vib_x * vib_x) + (vib_y * vib_y) + (vib_z * vib_z);
         deviation = fabsf(a_mag_g2 - 1.0f);
 
+        /* Magnitude-deviation detection: |a_mag² - 1g²|. Tilt-immune (gravity keeps
+         * total magnitude at 1g for any mounting orientation, so static tilt reads ~0)
+         * yet still catches travel in any axis — for flat-mount horizontal motion
+         * deviation ≈ a_horiz². A raw X/Y trigger would false-fire on tilt because
+         * gravity leaks onto X/Y, so it is deliberately not used. */
+        /* Filter-settle guard: after any CTRL1_XL ODR change the LPF2 chain re-settles
+         * and OUTX briefly reads ~0g (|mag²-1g²|≈1.0). Skip the whole trigger evaluation
+         * during the window so that transient cannot phantom-complete a MOVING dwell, and
+         * so it neither advances the dwell nor trips the MOVING→IDLE timeout. */
+        if (HAL_GetTick() < fsm_settle_until_tick)
+        {
+          /* settling — leave FSM state untouched this cycle */
+        }
+        else
+        {
+        uint8_t moving_now = (deviation > MOVEMENT_THRESHOLD_G2);
+
         /* Above threshold: refresh timestamps, advance dwell if in IDLE. */
-        if (deviation > MOVEMENT_THRESHOLD_G2)
+        if (moving_now)
         {
           last_above_threshold_tick = HAL_GetTick();
           last_movement_tick        = HAL_GetTick();
@@ -1695,6 +1824,7 @@ int main(void)
             }
           }
         }
+        } /* end filter-settle guard else */
       }
       else
       {
