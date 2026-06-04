@@ -321,8 +321,13 @@ per-packet ACK (which would halve throughput with round-trips):
 **Why this is robust and simple:**
 - Nominal link (~0 % loss) ⇒ usually **one pass, zero retransmits**.
 - Lossy link ⇒ a single compact NAK recovers many gaps per round; bounded rounds.
-- **Idempotent:** `mission_id` lets the gateway ignore duplicate/late chunks and
-  reject chunks for an already-completed mission.
+- **Idempotent (within a boot session):** `mission_id` lets the gateway group a
+  drain's packets and ignore duplicate/late chunks of a still-fresh drain. Note the
+  firmware `mission_id` **resets to 0 on every STM32 reset** (incl. the IWDG
+  watchdog), so it is unique only within one boot session — the gateway dedups over a
+  short TTL window, not permanently, and a re-used id after a reset is treated as a
+  new drain. Parquet filenames/columns use a gateway-assigned unix-ms id, never the
+  firmware `mission_id` (see `decisions.md` ADR-021 implementation notes).
 - **Control-packet loss tolerated:** if STM hears no NAK/ACK within a timeout, it
   re-sends DRAIN_END to re-prompt the gateway. All waits are bounded.
 - **CRC32 per chunk** catches corruption (Wi-Fi has its own FCS, but app-level

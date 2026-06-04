@@ -195,7 +195,10 @@ to the accel rate. Per-sample time is derived, never per-sample stamped:
 `t_ms = t0_wall + sample_index * 1000 / odr` (per stream, using its own ODR).
 Mission metadata columns: `shuttle_id, mission_id, odr_accel_hz, odr_gyro_hz,
 t0_wall_ms, is_idle_snapshot (bool), temp_c, pressure_hpa, complete (bool),
-missing_chunk_ranges`. `odr_*` are float (idle snapshots are 12.5 Hz);
+missing_chunk_ranges`. **`mission_id` here (and the `_m<id>` filename suffix) is a
+gateway-assigned unix-ms id, not the on-wire firmware `mission_id`** — the latter
+resets to 0 on every STM32 reset, so it is used only for in-flight reassembly
+grouping, never for filenames or cross-reboot dedup (see `decisions.md` ADR-021). `odr_*` are float (idle snapshots are 12.5 Hz);
 `temp_c`/`pressure_hpa` are NaN for MOVING missions (stamped on idle snapshots
 only).
 

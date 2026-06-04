@@ -810,3 +810,23 @@ ISM330 achieved bandwidth/noise, IMU current per mode, fault frequencies. Plus n
 the flush-watermark threshold and IDLE ODR are provisional — set them once IMU
 idle current and ring-fill rate are measured. Also: the MCU itself still busy-waits
 in `WIFI_DelayWithYield` (no `WFI` sleep) — a separate power follow-up.
+
+**Implementation notes (2026-06-04) — drain-hang recovery + reset-safe dedup.**
+Two fixes from a cycle test that reproduced a drain-wake hang and a silent
+gateway-side data loss:
+- *Firmware (`main.c`):* decision-3 re-power can wedge forever if the EMW3080 SPI
+  handshake goes silent (the BSP call never times out). Added (a) a hand-rolled
+  **IWDG watchdog** (~16 s, driven via bare CMSIS — HAL IWDG module is off, no `.ioc`
+  change), kicked along every bounded wait so a true wedge self-resets the MCU; and
+  (b) **one bounded `WIFI_PowerOff`→`WIFI_PowerOn` retry** before a drain is skipped,
+  so a soft bring-up failure recovers instead of dropping the mission.
+- *Gateway (`drain_receiver.py`):* the firmware `mission_id` **resets to 0 on every
+  STM32 reset** (now incl. the IWDG above), but the receiver had parked finalised
+  `(shuttle_id, mission_id)` keys in a *permanent* `done` set — so after a reset the
+  re-used low ids collided and every drain was silently dropped (no log, no parquet).
+  Fix: `done` is now a **short-TTL** map (`DEDUP_TTL_S`, default 10 s) — long enough
+  to drop late duplicates of a fresh drain, short enough that a post-reset re-use is
+  accepted as new. Parquet filename `_m<id>` and the `mission_id` column now carry a
+  **gateway-assigned unix-ms id** (monotonic, never re-used across reboots); the
+  firmware `mission_id` is kept only as the in-flight reassembly key that separates
+  back-to-back drains within one boot session.
