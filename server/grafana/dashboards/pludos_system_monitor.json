@@ -24,273 +24,9 @@
       }
     },
     {
-      "id": 2,
-      "type": "stat",
-      "title": "Shuttle 1 \u2014 State",
-      "datasource": {
-        "type": "influxdb",
-        "uid": "efmtstss6rcw0d"
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "query": "from(bucket: \"alumet_energy\")\n  |> range(start: -2m)\n  |> filter(fn: (r) => r._measurement == \"stm_telemetry\" and r._field == \"state\" and r.shuttle_id == \"1\")\n  |> last()\n  |> yield(name: \"A\")",
-          "datasource": {
-            "type": "influxdb",
-            "uid": "efmtstss6rcw0d"
-          }
-        }
-      ],
-      "gridPos": {
-        "h": 4,
-        "w": 4,
-        "x": 0,
-        "y": 1
-      },
-      "options": {
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ]
-        },
-        "colorMode": "background",
-        "graphMode": "none",
-        "orientation": "horizontal",
-        "mappings": [
-          {
-            "type": "value",
-            "options": {
-              "0": {
-                "text": "IDLE",
-                "color": "blue",
-                "index": 0
-              },
-              "1": {
-                "text": "MOVING",
-                "color": "green",
-                "index": 1
-              }
-            }
-          }
-        ]
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "value": 0,
-                "color": "blue"
-              },
-              {
-                "value": 1,
-                "color": "green"
-              }
-            ]
-          }
-        }
-      }
-    },
-    {
-      "id": 3,
-      "type": "stat",
-      "title": "Shuttle 2 \u2014 State",
-      "datasource": {
-        "type": "influxdb",
-        "uid": "efmtstss6rcw0d"
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "query": "from(bucket: \"alumet_energy\")\n  |> range(start: -2m)\n  |> filter(fn: (r) => r._measurement == \"stm_telemetry\" and r._field == \"state\" and r.shuttle_id == \"2\")\n  |> last()\n  |> yield(name: \"A\")",
-          "datasource": {
-            "type": "influxdb",
-            "uid": "efmtstss6rcw0d"
-          }
-        }
-      ],
-      "gridPos": {
-        "h": 4,
-        "w": 4,
-        "x": 4,
-        "y": 1
-      },
-      "options": {
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ]
-        },
-        "colorMode": "background",
-        "graphMode": "none",
-        "orientation": "horizontal",
-        "mappings": [
-          {
-            "type": "value",
-            "options": {
-              "0": {
-                "text": "IDLE",
-                "color": "blue",
-                "index": 0
-              },
-              "1": {
-                "text": "MOVING",
-                "color": "green",
-                "index": 1
-              }
-            }
-          }
-        ]
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "value": 0,
-                "color": "blue"
-              },
-              {
-                "value": 1,
-                "color": "green"
-              }
-            ]
-          }
-        }
-      }
-    },
-    {
-      "id": 4,
-      "type": "stat",
-      "title": "Shuttle 1 \u2014 TX Rate (Hz)",
-      "datasource": {
-        "type": "influxdb",
-        "uid": "efmtstss6rcw0d"
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "query": "from(bucket: \"alumet_energy\")\n  |> range(start: -2m)\n  |> filter(fn: (r) => r._measurement == \"stm_telemetry\" and r._field == \"tx_rate_hz\" and r.shuttle_id == \"1\")\n  |> last()\n  |> yield(name: \"A\")",
-          "datasource": {
-            "type": "influxdb",
-            "uid": "efmtstss6rcw0d"
-          }
-        }
-      ],
-      "gridPos": {
-        "h": 4,
-        "w": 4,
-        "x": 8,
-        "y": 1
-      },
-      "options": {
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ]
-        },
-        "colorMode": "background",
-        "graphMode": "none",
-        "orientation": "horizontal"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "hertz",
-          "color": {
-            "mode": "thresholds"
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "value": 0,
-                "color": "dark-blue"
-              },
-              {
-                "value": 0.05,
-                "color": "green"
-              },
-              {
-                "value": 9,
-                "color": "dark-green"
-              }
-            ]
-          }
-        }
-      }
-    },
-    {
-      "id": 5,
-      "type": "stat",
-      "title": "Shuttle 2 \u2014 TX Rate (Hz)",
-      "datasource": {
-        "type": "influxdb",
-        "uid": "efmtstss6rcw0d"
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "query": "from(bucket: \"alumet_energy\")\n  |> range(start: -2m)\n  |> filter(fn: (r) => r._measurement == \"stm_telemetry\" and r._field == \"tx_rate_hz\" and r.shuttle_id == \"2\")\n  |> last()\n  |> yield(name: \"A\")",
-          "datasource": {
-            "type": "influxdb",
-            "uid": "efmtstss6rcw0d"
-          }
-        }
-      ],
-      "gridPos": {
-        "h": 4,
-        "w": 4,
-        "x": 12,
-        "y": 1
-      },
-      "options": {
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ]
-        },
-        "colorMode": "background",
-        "graphMode": "none",
-        "orientation": "horizontal"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "hertz",
-          "color": {
-            "mode": "thresholds"
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "value": 0,
-                "color": "dark-blue"
-              },
-              {
-                "value": 0.05,
-                "color": "green"
-              },
-              {
-                "value": 9,
-                "color": "dark-green"
-              }
-            ]
-          }
-        }
-      }
-    },
-    {
       "id": 6,
       "type": "stat",
-      "title": "Missions \u2014 Last 24 h",
+      "title": "Drains \u2014 Last 24 h",
       "datasource": {
         "type": "influxdb",
         "uid": "efmtstss6rcw0d"
@@ -298,7 +34,7 @@
       "targets": [
         {
           "refId": "A",
-          "query": "from(bucket:\"alumet_energy\") |> range(start: -24h) |> filter(fn: (r) => r._measurement == \"stm_mission\" and r._field == \"packets\") |> count() |> yield(name: \"A\")",
+          "query": "from(bucket:\"alumet_energy\") |> range(start: -24h) |> filter(fn: (r) => r._measurement == \"stm_mission\" and r._field == \"packets_total\") |> count() |> yield(name: \"A\")",
           "datasource": {
             "type": "influxdb",
             "uid": "efmtstss6rcw0d"
@@ -392,193 +128,6 @@
       }
     },
     {
-      "id": 8,
-      "type": "row",
-      "title": "\ud83d\udce1 Shuttle Motion",
-      "collapsed": false,
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 5
-      }
-    },
-    {
-      "id": 9,
-      "type": "timeseries",
-      "title": "Acceleration X / Y / Z (g) \u2014 both shuttles",
-      "datasource": {
-        "type": "influxdb",
-        "uid": "efmtstss6rcw0d"
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "query": "from(bucket: \"alumet_energy\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"stm_telemetry\" and r._field == \"accel_x\")\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> yield(name: \"A\")",
-          "datasource": {
-            "type": "influxdb",
-            "uid": "efmtstss6rcw0d"
-          }
-        },
-        {
-          "refId": "B",
-          "query": "from(bucket: \"alumet_energy\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"stm_telemetry\" and r._field == \"accel_y\")\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> yield(name: \"B\")",
-          "datasource": {
-            "type": "influxdb",
-            "uid": "efmtstss6rcw0d"
-          }
-        },
-        {
-          "refId": "C",
-          "query": "from(bucket: \"alumet_energy\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"stm_telemetry\" and r._field == \"accel_z\")\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> yield(name: \"C\")",
-          "datasource": {
-            "type": "influxdb",
-            "uid": "efmtstss6rcw0d"
-          }
-        }
-      ],
-      "gridPos": {
-        "h": 8,
-        "w": 16,
-        "x": 0,
-        "y": 6
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "custom": {
-            "lineWidth": 1,
-            "fillOpacity": 0,
-            "drawStyle": "line",
-            "lineInterpolation": "linear",
-            "showPoints": "never",
-            "spanNulls": false
-          }
-        }
-      }
-    },
-    {
-      "id": 10,
-      "type": "timeseries",
-      "title": "State (0 = IDLE \u00b7 1 = MOVING)",
-      "datasource": {
-        "type": "influxdb",
-        "uid": "efmtstss6rcw0d"
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "query": "from(bucket: \"alumet_energy\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"stm_telemetry\" and r._field == \"state\")\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> yield(name: \"A\")",
-          "datasource": {
-            "type": "influxdb",
-            "uid": "efmtstss6rcw0d"
-          }
-        }
-      ],
-      "gridPos": {
-        "h": 8,
-        "w": 8,
-        "x": 16,
-        "y": 6
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "min": -0.1,
-          "max": 1.1,
-          "custom": {
-            "lineWidth": 0,
-            "fillOpacity": 60,
-            "drawStyle": "bars",
-            "lineInterpolation": "stepAfter",
-            "showPoints": "never"
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "value": 0,
-                "color": "blue"
-              },
-              {
-                "value": 0.5,
-                "color": "green"
-              }
-            ]
-          },
-          "color": {
-            "mode": "thresholds"
-          }
-        }
-      }
-    },
-    {
-      "id": 11,
-      "type": "row",
-      "title": "\ud83d\udd04 Gyroscope Components",
-      "collapsed": false,
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 14
-      }
-    },
-    {
-      "id": 12,
-      "type": "timeseries",
-      "title": "Gyroscope X / Y / Z (dps)",
-      "datasource": {
-        "type": "influxdb",
-        "uid": "efmtstss6rcw0d"
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "query": "from(bucket: \"alumet_energy\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"stm_telemetry\" and r._field == \"gyro_x\")\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> yield(name: \"A\")",
-          "datasource": {
-            "type": "influxdb",
-            "uid": "efmtstss6rcw0d"
-          }
-        },
-        {
-          "refId": "B",
-          "query": "from(bucket: \"alumet_energy\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"stm_telemetry\" and r._field == \"gyro_y\")\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> yield(name: \"B\")",
-          "datasource": {
-            "type": "influxdb",
-            "uid": "efmtstss6rcw0d"
-          }
-        },
-        {
-          "refId": "C",
-          "query": "from(bucket: \"alumet_energy\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"stm_telemetry\" and r._field == \"gyro_z\")\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> yield(name: \"C\")",
-          "datasource": {
-            "type": "influxdb",
-            "uid": "efmtstss6rcw0d"
-          }
-        }
-      ],
-      "gridPos": {
-        "h": 7,
-        "w": 24,
-        "x": 0,
-        "y": 15
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "angv",
-          "custom": {
-            "lineWidth": 1,
-            "fillOpacity": 0,
-            "drawStyle": "line",
-            "lineInterpolation": "linear",
-            "showPoints": "never",
-            "spanNulls": false
-          }
-        }
-      }
-    },
-    {
       "id": 13,
       "type": "row",
       "title": "\ud83c\udf21 Environment (STM32 on-board HTS221)",
@@ -587,7 +136,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 22
+        "y": 5
       }
     },
     {
@@ -601,7 +150,7 @@
       "targets": [
         {
           "refId": "A",
-          "query": "from(bucket: \"alumet_energy\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"stm_telemetry\" and r._field == \"temp_c\")\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> yield(name: \"A\")",
+          "query": "from(bucket: \"alumet_energy\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"stm_mission\" and r._field == \"temp_c\" and r.kind == \"idle_snapshot\")\n  |> yield(name: \"A\")",
           "datasource": {
             "type": "influxdb",
             "uid": "efmtstss6rcw0d"
@@ -612,7 +161,7 @@
         "h": 7,
         "w": 12,
         "x": 0,
-        "y": 23
+        "y": 6
       },
       "fieldConfig": {
         "defaults": {
@@ -622,7 +171,8 @@
             "fillOpacity": 10,
             "drawStyle": "line",
             "lineInterpolation": "linear",
-            "showPoints": "never",
+            "showPoints": "always",
+            "pointSize": 6,
             "spanNulls": false
           },
           "min": 15,
@@ -633,7 +183,7 @@
     {
       "id": 15,
       "type": "timeseries",
-      "title": "Relative Humidity (%RH)",
+      "title": "Pressure (hPa) \u2014 idle snapshots",
       "datasource": {
         "type": "influxdb",
         "uid": "efmtstss6rcw0d"
@@ -641,7 +191,7 @@
       "targets": [
         {
           "refId": "A",
-          "query": "from(bucket: \"alumet_energy\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"stm_telemetry\" and r._field == \"humidity_pct\")\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> yield(name: \"A\")",
+          "query": "from(bucket: \"alumet_energy\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"stm_mission\" and r._field == \"pressure_hpa\" and r.kind == \"idle_snapshot\")\n  |> yield(name: \"A\")",
           "datasource": {
             "type": "influxdb",
             "uid": "efmtstss6rcw0d"
@@ -652,21 +202,22 @@
         "h": 7,
         "w": 12,
         "x": 12,
-        "y": 23
+        "y": 6
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "humidity",
+          "unit": "pressurehpa",
           "custom": {
             "lineWidth": 2,
             "fillOpacity": 10,
             "drawStyle": "line",
             "lineInterpolation": "linear",
-            "showPoints": "never",
+            "showPoints": "always",
+            "pointSize": 6,
             "spanNulls": false
           },
-          "min": 0,
-          "max": 100
+          "min": 970,
+          "max": 1010
         }
       }
     },
@@ -679,13 +230,13 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 30
+        "y": 13
       }
     },
     {
       "id": 17,
       "type": "timeseries",
-      "title": "Per-Mission Duration (s)",
+      "title": "Samples per Drain (accel) \u2014 idle vs mission",
       "datasource": {
         "type": "influxdb",
         "uid": "efmtstss6rcw0d"
@@ -693,7 +244,7 @@
       "targets": [
         {
           "refId": "A",
-          "query": "from(bucket:\"alumet_energy\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"stm_mission\" and r._field == \"duration_ms\")\n  |> map(fn: (r) => ({r with _value: r._value / 1000.0}))\n  |> yield(name: \"A\")",
+          "query": "from(bucket:\"alumet_energy\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"stm_mission\" and r._field == \"accel_samples\")\n  |> group(columns: [\"kind\"])\n  |> yield(name: \"A\")",
           "datasource": {
             "type": "influxdb",
             "uid": "efmtstss6rcw0d"
@@ -704,11 +255,11 @@
         "h": 7,
         "w": 12,
         "x": 0,
-        "y": 31
+        "y": 14
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "s",
+          "unit": "short",
           "custom": {
             "lineWidth": 0,
             "fillOpacity": 70,
@@ -721,7 +272,7 @@
     {
       "id": 18,
       "type": "timeseries",
-      "title": "Packets per Mission",
+      "title": "Packets Received per Drain \u2014 idle vs mission",
       "datasource": {
         "type": "influxdb",
         "uid": "efmtstss6rcw0d"
@@ -729,7 +280,7 @@
       "targets": [
         {
           "refId": "A",
-          "query": "from(bucket:\"alumet_energy\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"stm_mission\" and r._field == \"packets\")\n  |> yield(name: \"A\")",
+          "query": "from(bucket:\"alumet_energy\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"stm_mission\" and r._field == \"packets_received\")\n  |> group(columns: [\"kind\"])\n  |> yield(name: \"A\")",
           "datasource": {
             "type": "influxdb",
             "uid": "efmtstss6rcw0d"
@@ -740,7 +291,7 @@
         "h": 7,
         "w": 12,
         "x": 12,
-        "y": 31
+        "y": 14
       },
       "fieldConfig": {
         "defaults": {
@@ -763,7 +314,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 38
+        "y": 21
       }
     },
     {
@@ -788,7 +339,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 39
+        "y": 22
       },
       "fieldConfig": {
         "defaults": {
@@ -828,7 +379,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 39
+        "y": 22
       },
       "fieldConfig": {
         "defaults": {
@@ -867,7 +418,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 39
+        "y": 22
       },
       "fieldConfig": {
         "defaults": {
@@ -894,7 +445,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 47
+        "y": 30
       }
     },
     {
@@ -919,7 +470,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 48
+        "y": 31
       },
       "options": {
         "xField": "fl_round",
@@ -958,7 +509,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 48
+        "y": 31
       },
       "options": {
         "tooltip": {
@@ -991,7 +542,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 56
+        "y": 39
       }
     },
     {
@@ -1005,7 +556,7 @@
       "targets": [
         {
           "refId": "A",
-          "query": "from(bucket:\"alumet_energy\")\n  |> range(start: -24h)\n  |> filter(fn: (r) => r._measurement == \"stm_mission\")\n  |> pivot(rowKey: [\"_time\",\"shuttle_id\",\"gateway\"], columnKey: [\"_field\"], valueColumn: \"_value\")\n  |> keep(columns: [\"_time\",\"shuttle_id\",\"gateway\",\"packets\",\"duration_ms\"])\n  |> map(fn: (r) => ({r with duration_ms: r.duration_ms / 1000.0}))\n  |> sort(columns: [\"_time\"], desc: true)\n  |> limit(n: 100)",
+          "query": "from(bucket:\"alumet_energy\")\n  |> range(start: -24h)\n  |> filter(fn: (r) => r._measurement == \"stm_mission\")\n  |> pivot(rowKey: [\"_time\",\"shuttle_id\",\"gateway\",\"kind\"], columnKey: [\"_field\"], valueColumn: \"_value\")\n  |> keep(columns: [\"_time\",\"shuttle_id\",\"kind\",\"packets_received\",\"packets_total\",\"loss_pct\",\"accel_samples\",\"gyro_samples\"])\n  |> sort(columns: [\"_time\"], desc: true)\n  |> limit(n: 100)",
           "datasource": {
             "type": "influxdb",
             "uid": "efmtstss6rcw0d"
@@ -1016,7 +567,7 @@
         "h": 10,
         "w": 24,
         "x": 0,
-        "y": 57
+        "y": 40
       },
       "options": {
         "footer": {
