@@ -36,6 +36,7 @@ import math
 import os
 import socket
 import struct
+import sys
 import threading
 import time
 from datetime import datetime, timedelta
@@ -380,6 +381,59 @@ def _write_mission_summary(
             )
         except Exception as exc:
             logger.warning("[INFLUXDB] stm_mission write failed (%s): %s", shuttle_id, exc)
+        finally:
+            client.close()
+
+    threading.Thread(target=_write, daemon=True).start()
+
+
+# Mirror one finalised high-rate drain (mission or idle snapshot) into InfluxDB as an
+# stm_mission point so Grafana shows shuttle activity even though the live :5683 stream
+# is off (ADR-021). High-rate waveforms stay in Parquet; only this summary goes to Influx.
+def _write_drain_summary(summary: dict) -> None:
+    # headless mode: collect to Parquet only, skip InfluxDB (mirrors _write_mission_summary).
+    if PLUDOS_MODE == "headless":
+        return
+    sid = str(summary["shuttle_id"])
+
+    # Fire-and-forget background thread so the asyncio loop is never blocked by InfluxDB I/O.
+    def _write() -> None:
+        client = InfluxDBClient(url=_INFLUXDB_URL, token=_INFLUXDB_TOKEN, org=_INFLUXDB_ORG)
+        try:
+            point = (
+                Point("stm_mission")
+                .tag("shuttle_id",  sid)
+                .tag("gateway",     _GATEWAY_TAG)
+                .tag("source",      "drain")
+                .tag("kind",        "idle_snapshot" if summary["is_idle_snapshot"] else "mission")
+                .field("mission_id",       int(summary["mission_id"]))
+                .field("packets_total",    int(summary["packets_total"]))
+                .field("packets_received", int(summary["packets_received"]))
+                .field("packets_lost",     int(summary["packets_lost"]))
+                .field("loss_pct",         float(summary["loss_pct"]))
+                .field("accel_samples",    int(summary["accel_samples"]))
+                .field("gyro_samples",     int(summary["gyro_samples"]))
+                .field("complete",         bool(summary["complete"]))
+                .time(time.time_ns(), WritePrecision.NS)
+            )
+            # Env stamp present on idle snapshots; absent (None) on high-rate missions.
+            if summary.get("temp_c") is not None:
+                point = point.field("temp_c", float(summary["temp_c"]))
+            if summary.get("pressure_hpa") is not None:
+                point = point.field("pressure_hpa", float(summary["pressure_hpa"]))
+
+            client.write_api(write_options=SYNCHRONOUS).write(
+                bucket=_INFLUXDB_BUCKET, record=point
+            )
+            logger.info(
+                "[INFLUXDB] stm_mission(drain) shuttle=%s m=%d kind=%s recv=%d/%d loss=%.1f%%",
+                sid, int(summary["mission_id"]),
+                "idle" if summary["is_idle_snapshot"] else "mission",
+                int(summary["packets_received"]), int(summary["packets_total"]),
+                float(summary["loss_pct"]),
+            )
+        except Exception as exc:
+            logger.warning("[INFLUXDB] stm_mission(drain) write failed (%s): %s", sid, exc)
         finally:
             client.close()
 
@@ -787,10 +841,56 @@ async def _broadcast_beacon() -> None:
 # Daily consolidation — merges per-mission files into one YYYY-MM-DD.parquet
 # ---------------------------------------------------------------------------
 
+def _consolidate_cap_day(date_str: str) -> None:
+    """Merge per-mission drain files cap_{sensor}_s*_m*.parquet (whose mtime falls on date_str,
+    UTC) into one daily file per sensor: cap_{sensor}_{date}.parquet, ordered by (shuttle_id, t_ms).
+    Accel and gyro stay separate — different ODRs give different sample grids, so they can't share
+    one time axis. Source files are deleted on success. Runs on a thread executor (blocking I/O)."""
+    for sensor in ("accel", "gyro"):
+        pattern = os.path.join(BUFFER_DIR, f"{drain_receiver.CAP_PREFIX}_{sensor}_s*_m*.parquet")
+        day_files = []
+        for path in sorted(glob.glob(pattern)):
+            # Cap filenames carry a gateway unix-ms id (cap_accel_s1_m1717....parquet) — still
+            # bucket by file mtime, which is the drain time (same UTC day in practice).
+            mtime_day = datetime.utcfromtimestamp(os.path.getmtime(path)).strftime("%Y-%m-%d")
+            if mtime_day == date_str:
+                day_files.append(path)
+
+        if not day_files:
+            continue
+
+        frames = [pd.read_parquet(f) for f in day_files]
+        df = pd.concat(frames, ignore_index=True)
+        df.sort_values(["shuttle_id", "t_ms"], inplace=True)
+
+        daily_path = os.path.join(BUFFER_DIR, f"{drain_receiver.CAP_PREFIX}_{sensor}_{date_str}.parquet")
+        # Merge with an existing daily file in case consolidation runs more than once for the day.
+        if os.path.exists(daily_path):
+            existing = pd.read_parquet(daily_path)
+            df = pd.concat([existing, df], ignore_index=True)
+            df.sort_values(["shuttle_id", "t_ms"], inplace=True)
+            df.drop_duplicates(subset=["shuttle_id", "mission_id", "sample_index"], keep="last", inplace=True)
+
+        tmp_path = daily_path + ".tmp"
+        df.to_parquet(tmp_path, engine="pyarrow", index=False,
+                      compression="zstd", compression_level=3)
+        os.replace(tmp_path, daily_path)
+
+        for f in day_files:
+            os.remove(f)
+
+        logger.info(
+            "[CONSOLIDATE] %s: merged %d cap_%s file(s), %d total rows → %s",
+            date_str, len(day_files), sensor, len(df), os.path.basename(daily_path),
+        )
+
+
 def _consolidate_day(date_str: str) -> None:
     """Merge all mission_s*_*.parquet files whose flush timestamp falls on date_str (UTC)
     into a single daily file named YYYY-MM-DD.parquet containing all shuttles.
-    Source files are deleted on success. Runs on a thread executor — does blocking I/O."""
+    Source files are deleted on success. Runs on a thread executor — does blocking I/O.
+    Also folds the high-rate drain cap files for the day (separate schema, see _consolidate_cap_day)."""
+    _consolidate_cap_day(date_str)
     pattern   = os.path.join(BUFFER_DIR, "mission_s*_*.parquet")
     day_files = []
     for path in sorted(glob.glob(pattern)):
@@ -848,6 +948,13 @@ def _consolidate_stale() -> None:
                 stale_dates.add(date)
         except (ValueError, IndexError):
             pass
+    # Drain cap files carry no timestamp in the name — bucket by mtime so cap-only stale days
+    # (no live mission file that day) still get consolidated. _consolidate_day folds cap too.
+    for sensor in ("accel", "gyro"):
+        for path in glob.glob(os.path.join(BUFFER_DIR, f"{drain_receiver.CAP_PREFIX}_{sensor}_s*_m*.parquet")):
+            date = datetime.utcfromtimestamp(os.path.getmtime(path)).strftime("%Y-%m-%d")
+            if date < today:
+                stale_dates.add(date)
     for date in sorted(stale_dates):
         logger.info("[CONSOLIDATE] Startup: consolidating stale files for %s", date)
         _consolidate_day(date)
@@ -865,6 +972,42 @@ async def _daily_consolidate_task() -> None:
         yesterday = (datetime.utcnow() - timedelta(seconds=10)).strftime("%Y-%m-%d")
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, _consolidate_day, yesterday)
+
+
+# ---------------------------------------------------------------------------
+# Liveness watchdog
+# ---------------------------------------------------------------------------
+# The event loop wedged silently once: the container stayed "Up" but emitted no
+# logs and its UDP sockets were unbound — `restart: unless-stopped` can't help a
+# hung-but-alive process. An asyncio task bumps a heartbeat; a daemon thread
+# (outside the loop, so a wedge can't stop it) force-exits if the heartbeat goes
+# stale, letting Podman restart a fresh process.
+
+# Monotonic timestamp of the last loop tick; only the running loop can bump it.
+_last_heartbeat = time.monotonic()
+WATCHDOG_INTERVAL_S = 10.0
+# A wedge is declared after this much silence; env-overridable for slow boots.
+WATCHDOG_TIMEOUT_S = float(os.getenv("WATCHDOG_TIMEOUT_S", "60"))
+
+
+# Bump the heartbeat from inside the loop — stops updating the instant it wedges.
+async def _heartbeat_task() -> None:
+    global _last_heartbeat
+    while True:
+        _last_heartbeat = time.monotonic()
+        await asyncio.sleep(WATCHDOG_INTERVAL_S)
+
+
+# Daemon thread: force-exit if the loop stops bumping the heartbeat.
+def _watchdog_thread() -> None:
+    while True:
+        time.sleep(WATCHDOG_INTERVAL_S)
+        stale_s = time.monotonic() - _last_heartbeat
+        if stale_s > WATCHDOG_TIMEOUT_S:
+            # stderr + os._exit: bypass the (possibly wedged) loop and logging handlers.
+            print(f"[WATCHDOG] event loop stale {stale_s:.0f}s > "
+                  f"{WATCHDOG_TIMEOUT_S:.0f}s — forcing restart", file=sys.stderr, flush=True)
+            os._exit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -907,7 +1050,7 @@ async def main() -> None:
 
     # High-rate capture drain receiver on UDP 5684 (ADR-020). Separate path from
     # the 5683 live hot loop; reuses the per-shuttle NTP offset to anchor t0.
-    await drain_receiver.start_drain_receiver(get_ntp_offset, BUFFER_DIR)
+    await drain_receiver.start_drain_receiver(get_ntp_offset, BUFFER_DIR, _write_drain_summary)
 
     # Consolidate any mission files from days before today (handles Jetson restarts / downtime).
     _consolidate_stale()
@@ -917,6 +1060,10 @@ async def main() -> None:
     asyncio.create_task(_mission_end_watchdog())
     asyncio.create_task(_broadcast_beacon())
     asyncio.create_task(_daily_consolidate_task())
+
+    # Liveness watchdog: loop-side heartbeat + out-of-loop daemon that restarts on wedge.
+    asyncio.create_task(_heartbeat_task())
+    threading.Thread(target=_watchdog_thread, name="watchdog", daemon=True).start()
 
     await loop.create_future()  # run forever
 

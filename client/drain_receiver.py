@@ -13,8 +13,8 @@ the design intent.
 PHASE 1 = BLAST-ONLY: no NAK/ACK back-channel yet. The receiver reassembles by
 `chunk_seq`, validates each chunk's CRC32, and writes one (or two) Parquet
 file(s) per `(shuttle_id, mission_id)` on DRAIN_END or a quiet-timeout watchdog.
-If chunks are missing it still writes with `complete=false` and records the gap
-ranges. The code is structured (a `MissionReassembler` class, clear functions)
+If chunks are missing it still writes with `all_packets_received=false` and
+records the gap ranges plus per-mission packet counts. The code is structured (a `MissionReassembler` class, clear functions)
 so the Phase-2 NAK selective-repeat ARQ (`sampling_strategy.md §9`) can be
 layered on without reworking the frame parsing.
 
@@ -49,6 +49,14 @@ DRAIN_QUIET_TIMEOUT_S = float(os.getenv("DRAIN_QUIET_TIMEOUT_S", "3.0"))
 
 # Watchdog poll period — how often we scan reassemblers for quiet timeout.
 _WATCHDOG_PERIOD_S = 1.0
+
+# Recently-finalised dedup window. Late duplicate packets of a just-finalised
+# drain arrive within ~seconds; a firmware reset re-using the same mission_id
+# comes tens of seconds later (re-init WiFi + run + drain). This TTL tells them
+# apart, so a post-reset (or post-IWDG-watchdog) drain is accepted instead of
+# silently dropped as a duplicate. See ADR-021: firmware mission_id restarts at 0
+# on every STM32 reset, so it is unique only within one boot session.
+DEDUP_TTL_S = float(os.getenv("DEDUP_TTL_S", "10.0"))
 
 # ---------------------------------------------------------------------------
 # Wire format — must match wire_protocol.md §2 exactly. All little-endian.
@@ -106,12 +114,18 @@ _ntp_offset_lookup = None
 # Parquet output directory — same dir data-engine uses; injected at startup.
 _buffer_dir = "."
 
+# Callable (summary: dict) -> None invoked once per finalised drain so data-engine
+# can mirror a per-mission summary point into InfluxDB (Grafana). Optional — None
+# means parquet-only. Kept here (not an import of data-engine) to avoid a circular import.
+_summary_sink = None
 
-# Wire the NTP-offset accessor + output dir from data-engine before serving.
-def configure(ntp_offset_lookup, buffer_dir: str) -> None:
-    global _ntp_offset_lookup, _buffer_dir
+
+# Wire the NTP-offset accessor + output dir (+ optional Influx sink) from data-engine.
+def configure(ntp_offset_lookup, buffer_dir: str, summary_sink=None) -> None:
+    global _ntp_offset_lookup, _buffer_dir, _summary_sink
     _ntp_offset_lookup = ntp_offset_lookup
     _buffer_dir = buffer_dir
+    _summary_sink = summary_sink
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +160,12 @@ class MissionReassembler:
         self.t0_tick_ms = begin["t0_tick_ms"]
         # Wall-clock time the BEGIN arrived — fallback t0 anchor if no NTP offset.
         self.begin_wall_ms = int(time.time() * 1000)
+        # Gateway-assigned output id (unix ms). The firmware mission_id resets to
+        # low values on every STM32 reset, so it is unsafe as a filename/dedup key
+        # across reboots; this monotonic id is. Used for the parquet filename, the
+        # mission_id column and the Influx summary — never for in-flight keying
+        # (that still uses the firmware mission_id to separate back-to-back drains).
+        self.gw_mission_id = self.begin_wall_ms
         # chunk_seq -> payload bytes (only CRC-valid, deduped).
         self.chunks: dict[int, bytes] = {}
         # Monotonic time of the most recent accepted chunk — drives quiet timeout.
@@ -255,7 +275,7 @@ def _write_stream_parquet(
     df["z"] = df["z"].astype("int16")
     # Mission metadata — constant per file, broadcast across all rows.
     df["shuttle_id"] = pd.array([re.shuttle_id] * n, dtype="int16")
-    df["mission_id"] = pd.array([re.mission_id] * n, dtype="int32")
+    df["mission_id"] = pd.array([re.gw_mission_id] * n, dtype="int64")
     # float ODR columns — idle snapshots carry 12.5 Hz, which int can't represent.
     df["odr_accel_hz"] = pd.array([re.odr_accel_hz] * n, dtype="float64")
     df["odr_gyro_hz"] = pd.array([re.odr_gyro_hz] * n, dtype="float64")
@@ -269,11 +289,19 @@ def _write_stream_parquet(
         [re.pressure_hpa if re.pressure_hpa is not None else float("nan")] * n,
         dtype="float32",
     )
-    df["complete"] = complete
+    # Packet accounting — each drain chunk is one UDP datagram; counts are per-mission.
+    received = len(re.chunks)
+    lost = re.total_chunks - received
+    loss_pct = (100.0 * lost / re.total_chunks) if re.total_chunks else 0.0
+    df["all_packets_received"] = complete
+    df["packets_total"] = pd.array([re.total_chunks] * n, dtype="int32")
+    df["packets_received"] = pd.array([received] * n, dtype="int32")
+    df["packets_lost"] = pd.array([lost] * n, dtype="int32")
+    df["packet_loss_pct"] = pd.array([round(loss_pct, 2)] * n, dtype="float32")
     df["missing_chunk_ranges"] = missing
 
     file_path = os.path.join(
-        _buffer_dir, f"{CAP_PREFIX}_{sensor}_s{re.shuttle_id}_m{re.mission_id}.parquet"
+        _buffer_dir, f"{CAP_PREFIX}_{sensor}_s{re.shuttle_id}_m{re.gw_mission_id}.parquet"
     )
     tmp_path = file_path + ".tmp"
     # PyArrow write is sync but only fires on mission-end finalisation — acceptable.
@@ -283,7 +311,13 @@ def _write_stream_parquet(
     return file_path
 
 
-# Finalise one mission: assemble bytes, demux, write accel + gyro Parquet files.
+# Log tag: [shuttleN] iK for idle snapshots, mK for moving missions, #K when kind unknown.
+def _tag(shuttle_id: int, mission_id: int, is_idle=None) -> str:
+    prefix = "#" if is_idle is None else ("i" if is_idle else "m")
+    return f"[shuttle{shuttle_id}] {prefix}{mission_id}"
+
+
+# Finalise one capture: assemble bytes, demux, write accel + gyro Parquet files.
 def _finalise_mission(re: MissionReassembler, reason: str) -> None:
     if re.finalised:
         return
@@ -302,14 +336,40 @@ def _finalise_mission(re: MissionReassembler, reason: str) -> None:
     if g_path:
         paths.append(os.path.basename(g_path))
 
+    received = len(re.chunks)
+    lost = re.total_chunks - received
+    loss_pct = (100.0 * lost / re.total_chunks) if re.total_chunks else 0.0
     logger.info(
-        "[DRAIN] mission finalised (%s) s%d m%d | chunks %d/%d | accel=%d gyro=%d | "
-        "complete=%s%s | %s",
-        reason, re.shuttle_id, re.mission_id, len(re.chunks), re.total_chunks,
+        "[DRAIN] finalised (%s) %s | packets %d/%d recv (lost %d, %.1f%%) | "
+        "accel=%d gyro=%d | all_received=%s%s | %s",
+        reason, _tag(re.shuttle_id, re.mission_id, re.is_idle_snapshot),
+        received, re.total_chunks, lost, loss_pct,
         len(accel), len(gyro), complete,
-        "" if complete else f" missing=[{missing}]",
+        "" if complete else f" missing_seq=[{missing}]",
         ", ".join(paths) if paths else "(no samples)",
     )
+
+    # Mirror a per-mission summary into InfluxDB (Grafana). Sink failure must never
+    # break the drain path, so swallow everything — parquet is already written above.
+    if _summary_sink is not None:
+        try:
+            _summary_sink({
+                "shuttle_id":       re.shuttle_id,
+                "mission_id":       re.gw_mission_id,
+                "is_idle_snapshot": re.is_idle_snapshot,
+                "packets_total":    re.total_chunks,
+                "packets_received": received,
+                "packets_lost":     lost,
+                "loss_pct":         loss_pct,
+                "accel_samples":    len(accel),
+                "gyro_samples":     len(gyro),
+                "complete":         complete,
+                "temp_c":           re.temp_c,
+                "pressure_hpa":     re.pressure_hpa,
+            })
+        except Exception as exc:
+            logger.warning("[DRAIN] summary sink failed (%s): %s",
+                           _tag(re.shuttle_id, re.mission_id, re.is_idle_snapshot), exc)
 
 
 # ---------------------------------------------------------------------------
@@ -371,10 +431,23 @@ class DrainProtocol(asyncio.DatagramProtocol):
     """Asyncio datagram handler for the high-rate capture drain on port 5684."""
 
     def __init__(self) -> None:
-        # In-flight reassemblers keyed by (shuttle_id, mission_id).
+        # In-flight reassemblers keyed by (shuttle_id, firmware_mission_id).
         self.missions: dict[tuple[int, int], MissionReassembler] = {}
-        # Completed (shuttle_id, mission_id) keys — reject late/duplicate drains.
-        self.done: set[tuple[int, int]] = set()
+        # Recently-finalised (shuttle_id, firmware_mission_id) -> monotonic finalise
+        # time. TTL-expired (DEDUP_TTL_S) so a firmware reset re-using a low
+        # mission_id is accepted as a new drain, not dropped as a late duplicate.
+        self.recent_done: dict[tuple[int, int], float] = {}
+
+    # True if key was finalised within DEDUP_TTL_S — a late duplicate of a still-
+    # fresh drain. Expired entries are pruned so the id is re-usable after a reset.
+    def _recently_done(self, key) -> bool:
+        t = self.recent_done.get(key)
+        if t is None:
+            return False
+        if (time.monotonic() - t) < DEDUP_TTL_S:
+            return True
+        del self.recent_done[key]
+        return False
 
     def datagram_received(self, data: bytes, addr) -> None:
         parsed = _parse_packet(data)
@@ -394,17 +467,17 @@ class DrainProtocol(asyncio.DatagramProtocol):
 
     # DRAIN_BEGIN: create the reassembler (idempotent — sent ×3 for robustness).
     def _on_begin(self, key, f, addr) -> None:
-        if key in self.done:
-            return  # already finalised this mission; ignore re-announce.
+        if self._recently_done(key):
+            return  # late re-announce of a just-finalised drain; ignore.
         if key in self.missions:
             return  # duplicate BEGIN (sent ×3) — keep the first.
         re = MissionReassembler(f["shuttle_id"], f["mission_id"], f)
         self.missions[key] = re
         kind = "idle-snapshot" if re.is_idle_snapshot else "mission"
         logger.info(
-            "[DRAIN] BEGIN s%d m%d (%s) | chunks=%d odr_a=%g odr_g=%g bytes=%d "
+            "[DRAIN] BEGIN %s (%s) | chunks=%d odr_a=%g odr_g=%g bytes=%d "
             "temp=%s press=%s from %s",
-            f["shuttle_id"], f["mission_id"], kind, f["total_chunks"],
+            _tag(f["shuttle_id"], f["mission_id"], re.is_idle_snapshot), kind, f["total_chunks"],
             re.odr_accel_hz, re.odr_gyro_hz, f["byte_count"],
             f"{re.temp_c:.2f}C" if re.temp_c is not None else "n/a",
             f"{re.pressure_hpa:.1f}hPa" if re.pressure_hpa is not None else "n/a",
@@ -414,12 +487,12 @@ class DrainProtocol(asyncio.DatagramProtocol):
     # CHUNK: validate CRC32, dedup, store. Tolerates a missing BEGIN by
     # synthesising a minimal reassembler from the chunk header's total_chunks.
     def _on_chunk(self, key, f, addr) -> None:
-        if key in self.done:
-            return  # mission already written — drop late chunk.
+        if self._recently_done(key):
+            return  # drain already written — drop late chunk.
         # CRC32 over payload bytes only (zlib/IEEE) — drop on mismatch.
         if zlib.crc32(f["payload"]) != f["crc32"]:
             logger.debug(
-                "[DRAIN] CRC fail s%d m%d seq=%d — dropping", *key, f["chunk_seq"]
+                "[DRAIN] CRC fail %s seq=%d — dropping", _tag(*key), f["chunk_seq"]
             )
             return
         re = self.missions.get(key)
@@ -434,14 +507,14 @@ class DrainProtocol(asyncio.DatagramProtocol):
             re = MissionReassembler(f["shuttle_id"], f["mission_id"], synth)
             self.missions[key] = re
             logger.warning(
-                "[DRAIN] CHUNK before BEGIN s%d m%d — synthesising reassembler (odr unknown)",
-                *key,
+                "[DRAIN] CHUNK before BEGIN %s — synthesising reassembler (odr unknown)",
+                _tag(*key),
             )
         re.add_chunk(f["chunk_seq"], f["payload"])
 
     # DRAIN_END: finalise immediately (sent ×3 — first one wins).
     def _on_end(self, key, f, addr) -> None:
-        if key in self.done:
+        if self._recently_done(key):
             return
         re = self.missions.get(key)
         if re is None:
@@ -451,7 +524,7 @@ class DrainProtocol(asyncio.DatagramProtocol):
         # and reply to `addr` with a NAK (type 4) listing missing chunk_seq ranges,
         # or ACK_COMPLETE (type 5) if re.is_complete(). Only finalise after
         # ACK_COMPLETE or a bounded retransmit-round cap.
-        self.done.add(key)
+        self.recent_done[key] = time.monotonic()
         self.missions.pop(key, None)
 
     def error_received(self, exc: Exception) -> None:
@@ -473,8 +546,11 @@ async def _drain_watchdog(proto: DrainProtocol) -> None:
                 continue
             if (now - re.last_activity) >= DRAIN_QUIET_TIMEOUT_S:
                 _finalise_mission(re, "quiet-timeout")
-                proto.done.add(key)
+                proto.recent_done[key] = now
                 proto.missions.pop(key, None)
+        # Prune expired dedup entries so the map can't grow unbounded over a session.
+        for key in [k for k, t in proto.recent_done.items() if (now - t) >= DEDUP_TTL_S]:
+            del proto.recent_done[key]
 
 
 # ---------------------------------------------------------------------------
@@ -482,8 +558,8 @@ async def _drain_watchdog(proto: DrainProtocol) -> None:
 # ---------------------------------------------------------------------------
 
 # Bind the drain UDP endpoint and start the quiet-timeout watchdog task.
-async def start_drain_receiver(ntp_offset_lookup, buffer_dir: str) -> None:
-    configure(ntp_offset_lookup, buffer_dir)
+async def start_drain_receiver(ntp_offset_lookup, buffer_dir: str, summary_sink=None) -> None:
+    configure(ntp_offset_lookup, buffer_dir, summary_sink)
     loop = asyncio.get_running_loop()
     proto = DrainProtocol()
     await loop.create_datagram_endpoint(
