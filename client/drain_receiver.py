@@ -32,6 +32,7 @@ import struct
 import time
 import zlib
 
+import numpy as np
 import pandas as pd
 
 logger = logging.getLogger("data-engine")
@@ -102,6 +103,11 @@ TAG_GYRO  = 0x01  # tag>>3 == GYRO_NC (gyroscope)
 # Filename prefix so capture files never collide with live mission_s*.parquet.
 CAP_PREFIX = "cap"
 
+# ISM330DHCX raw-LSB → physical scaling. FS kept at ±2 g / ±250 dps in capture mode
+# (firmware main.c §"Capture-mode sensor config"): accel 0.061 mg/LSB, gyro 8.75 mdps/LSB.
+ACCEL_G_PER_LSB  = 0.000061   # 0.061 mg/LSB  (DS13281 ±2 g)
+GYRO_DPS_PER_LSB = 0.00875    # 8.75 mdps/LSB (DS13281 ±250 dps)
+
 # ---------------------------------------------------------------------------
 # t0 wall-clock resolution — reuse the per-shuttle NTP offset data-engine.py
 # already maintains. Injected at startup to avoid a circular import.
@@ -126,6 +132,67 @@ def configure(ntp_offset_lookup, buffer_dir: str, summary_sink=None) -> None:
     _ntp_offset_lookup = ntp_offset_lookup
     _buffer_dir = buffer_dir
     _summary_sink = summary_sink
+
+
+# Lag from a MOVING mission's start tick to its BEGIN arrival, minus the mission
+# duration (derived per drain). A mission drains only after the FSM declares idle
+# (NO_MOVEMENT_TIMEOUT_MS, ~20 s) then powers WiFi on and blasts the ring.
+IDLE_EXIT_MS = int(os.getenv("DRAIN_IDLE_EXIT_MS", "20000"))   # NO_MOVEMENT_TIMEOUT_MS
+DRAIN_TX_MS  = int(os.getenv("DRAIN_TX_MS", "2000"))           # WiFi power-on + blast
+
+# Fallback lag for an idle snapshot that arrives before any MOVING mission has
+# anchored the clock — best-effort only, never stored as the offset.
+IDLE_FALLBACK_LAG_MS = int(os.getenv("DRAIN_IDLE_FALLBACK_LAG_MS", "1000"))
+
+# A MOVING mission whose freshly-computed offset disagrees with the stored one by more
+# than this is treated as a new boot session (HAL_GetTick() zeroed) and re-anchors.
+# Same-boot missions only differ by lag-estimate noise (seconds); a reboot differs by
+# the whole uptime (minutes–days), so the gap is unambiguous.
+REANCHOR_TOL_MS = int(os.getenv("DRAIN_REANCHOR_TOL_MS", "60000"))
+
+# Per-shuttle STM-boot offset: (offset_ms, last_anchor_tick_ms) where offset_ms is the
+# wall-clock time of HAL_GetTick()==0. wall = offset + t0_tick_ms then gives every drain
+# an exact absolute position AND exact inter-drain spacing straight from the STM
+# monotonic clock — so a burst of idle snapshots that piggyback one radio-on get spread
+# back across the minutes they were really captured, not collapsed onto arrival time.
+# Re-derived ONLY from MOVING missions (their lag is predictable) and dropped when the
+# tick regresses (HAL_GetTick() zeroes on STM32 reboot).
+_boot_offsets: dict[int, tuple[int, int]] = {}
+
+
+# Map a drain's start tick to wall clock via the per-shuttle boot offset. MOVING
+# missions (re)anchor the offset from their predictable lag; idle snapshots reuse the
+# stored offset (and so get back-dated, never forward-dated). Result is clamped to the
+# arrival time so a drain is never stamped in the future.
+def _boot_anchored_wall_ms(shuttle_id: int, t0_tick_ms: int, begin_wall_ms: int,
+                           word_count: int, odr_a: float, odr_g: float,
+                           is_idle: bool) -> int:
+    anchor = _boot_offsets.get(shuttle_id)
+
+    # Only MOVING missions anchor: lag = mission_duration + idle-exit + transmit, all
+    # known here. Idle snapshots defer to the next radio-on (unbounded lag) so they must
+    # NOT anchor, and a smaller idle tick is a normal earlier capture, not a reboot.
+    # Re-anchor when there is no anchor, this mission is newer (>= tick), or the offset
+    # disagrees beyond REANCHOR_TOL_MS (a reboot zeroed the tick — new timeline).
+    if not is_idle and odr_a > 0 and odr_g > 0:
+        dur_ms = word_count * 1000.0 / (odr_a + odr_g)
+        ref_wall = begin_wall_ms - dur_ms - IDLE_EXIT_MS - DRAIN_TX_MS
+        new_offset = int(ref_wall - t0_tick_ms)
+        if anchor is None or t0_tick_ms >= anchor[1] or abs(new_offset - anchor[0]) > REANCHOR_TOL_MS:
+            anchor = (new_offset, t0_tick_ms)
+            _boot_offsets[shuttle_id] = anchor
+
+    if anchor is not None:
+        wall = anchor[0] + t0_tick_ms
+    elif is_idle:
+        # No MOVING anchor yet — assume this idle snapshot drained promptly.
+        wall = begin_wall_ms - IDLE_FALLBACK_LAG_MS
+    else:
+        # MOVING with corrupt ODR (can't derive duration): arrival minus fixed lag.
+        wall = begin_wall_ms - IDLE_EXIT_MS - DRAIN_TX_MS
+
+    # Never stamp a drain in the future relative to its own arrival.
+    return min(int(wall), begin_wall_ms)
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +224,8 @@ class MissionReassembler:
         press_raw = begin.get("pressure_hpa_x10", 0)
         self.pressure_hpa = (press_raw / 10.0) if press_raw else None
         self.byte_count = begin["byte_count"]
+        # FIFO word count — duration_ms = word_count*1000/(odr_a+odr_g); anchors t0 wall.
+        self.word_count = begin["word_count"]
         self.t0_tick_ms = begin["t0_tick_ms"]
         # Wall-clock time the BEGIN arrived — fallback t0 anchor if no NTP offset.
         self.begin_wall_ms = int(time.time() * 1000)
@@ -205,16 +274,19 @@ class MissionReassembler:
     def assemble(self) -> bytes:
         return b"".join(self.chunks[s] for s in sorted(self.chunks))
 
-    # Map mission-start t0_tick_ms to wall clock via the per-shuttle NTP offset
-    # data-engine maintains; fall back to BEGIN arrival time (approximation).
+    # Map mission-start t0_tick_ms to wall clock. Prefer the per-shuttle NTP offset
+    # data-engine maintains from the live :5683 stream; with ADR-021 the radio is off
+    # during MOVING so that offset is usually absent — fall back to the tick anchor,
+    # which keeps inter-mission spacing exact via the STM clock (idempotent per mission).
     def t0_wall_ms(self) -> int:
         if _ntp_offset_lookup is not None:
             offset = _ntp_offset_lookup(self.shuttle_id)
             if offset is not None:
                 return self.t0_tick_ms + offset
-        # Fallback: shuttle never streamed on 5683 this session, so no NTP anchor
-        # exists — use BEGIN arrival wall time as an approximate mission t0.
-        return self.begin_wall_ms
+        return _boot_anchored_wall_ms(
+            self.shuttle_id, self.t0_tick_ms, self.begin_wall_ms,
+            self.word_count, self.odr_accel_hz, self.odr_gyro_hz, self.is_idle_snapshot,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -248,12 +320,12 @@ def _write_stream_parquet(
     re: MissionReassembler,
     complete: bool,
     missing: str,
+    t0: int,
 ) -> str | None:
     if not samples:
         # No samples of this sensor in the stream — skip the file entirely.
         return None
 
-    t0 = re.t0_wall_ms()
     # Derived time: t_ms = t0 + index * 1000 / odr (per stream, its own ODR).
     # Guard odr==0 (corrupt BEGIN) by leaving t_ms at t0 for all samples.
     step_ms = (1000.0 / odr_hz) if odr_hz > 0 else 0.0
@@ -317,6 +389,16 @@ def _tag(shuttle_id: int, mission_id: int, is_idle=None) -> str:
     return f"[shuttle{shuttle_id}] {prefix}{mission_id}"
 
 
+# Magnitude RMS + peak (physical units) from raw int16 (x,y,z) samples — vibration
+# intensity for the Grafana per-mission summary. Returns (nan, nan) for an empty stream.
+def _mag_stats(samples: list[tuple[int, int, int]], unit_per_lsb: float) -> tuple[float, float]:
+    if not samples:
+        return (float("nan"), float("nan"))
+    a = np.asarray(samples, dtype=np.float64)
+    mag = np.sqrt((a * a).sum(axis=1)) * unit_per_lsb
+    return (float(np.sqrt((mag * mag).mean())), float(mag.max()))
+
+
 # Finalise one capture: assemble bytes, demux, write accel + gyro Parquet files.
 def _finalise_mission(re: MissionReassembler, reason: str) -> None:
     if re.finalised:
@@ -328,9 +410,12 @@ def _finalise_mission(re: MissionReassembler, reason: str) -> None:
     stream = re.assemble()
     accel, gyro = _demux_fifo(stream)
 
+    # Anchor once; idempotent, so both parquet writers + the summary share one mission t0.
+    t0_wall = re.t0_wall_ms()
+
     paths = []
-    a_path = _write_stream_parquet("accel", accel, re.odr_accel_hz, re, complete, missing)
-    g_path = _write_stream_parquet("gyro", gyro, re.odr_gyro_hz, re, complete, missing)
+    a_path = _write_stream_parquet("accel", accel, re.odr_accel_hz, re, complete, missing, t0_wall)
+    g_path = _write_stream_parquet("gyro", gyro, re.odr_gyro_hz, re, complete, missing, t0_wall)
     if a_path:
         paths.append(os.path.basename(a_path))
     if g_path:
@@ -349,6 +434,10 @@ def _finalise_mission(re: MissionReassembler, reason: str) -> None:
         ", ".join(paths) if paths else "(no samples)",
     )
 
+    # Vibration intensity for Grafana — magnitude RMS/peak in physical units.
+    accel_rms, accel_peak = _mag_stats(accel, ACCEL_G_PER_LSB)
+    _,         gyro_peak  = _mag_stats(gyro,  GYRO_DPS_PER_LSB)
+
     # Mirror a per-mission summary into InfluxDB (Grafana). Sink failure must never
     # break the drain path, so swallow everything — parquet is already written above.
     if _summary_sink is not None:
@@ -366,6 +455,15 @@ def _finalise_mission(re: MissionReassembler, reason: str) -> None:
                 "complete":         complete,
                 "temp_c":           re.temp_c,
                 "pressure_hpa":     re.pressure_hpa,
+                "t0_wall_ms":       t0_wall,
+                "accel_rms_g":      accel_rms,
+                "accel_peak_g":     accel_peak,
+                "gyro_peak_dps":    gyro_peak,
+                # Idle snapshots are small (~12.5 Hz) — carry raw samples so data-engine
+                # can write a per-sample waveform to Influx; None for high-rate missions.
+                "odr_hz":           re.odr_accel_hz,
+                "accel_xyz":        accel if re.is_idle_snapshot else None,
+                "gyro_xyz":         gyro  if re.is_idle_snapshot else None,
             })
         except Exception as exc:
             logger.warning("[DRAIN] summary sink failed (%s): %s",

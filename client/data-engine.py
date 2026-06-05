@@ -387,6 +387,35 @@ def _write_mission_summary(
     threading.Thread(target=_write, daemon=True).start()
 
 
+# Write one idle snapshot's accel/gyro waveform to Influx (stm_idle_wave), one point
+# per sample in physical units, timed off the anchored mission t0 at the snapshot ODR.
+def _write_idle_waveform(write_api, sid: str, summary: dict) -> None:
+    accel = summary["accel_xyz"]
+    gyro  = summary.get("gyro_xyz") or []
+    t0_ms = int(summary["t0_wall_ms"])
+    odr   = float(summary.get("odr_hz") or drain_receiver.IDLE_SNAP_ODR_HZ)
+    step_ms = 1000.0 / odr if odr > 0 else 0.0
+    a_lsb = drain_receiver.ACCEL_G_PER_LSB
+    g_lsb = drain_receiver.GYRO_DPS_PER_LSB
+    points = []
+    for i, (ax, ay, az) in enumerate(accel):
+        p = (Point("stm_idle_wave")
+             .tag("shuttle_id", sid)
+             .tag("gateway",    _GATEWAY_TAG)
+             .field("ax_g", ax * a_lsb)
+             .field("ay_g", ay * a_lsb)
+             .field("az_g", az * a_lsb)
+             .time(int((t0_ms + i * step_ms) * 1_000_000), WritePrecision.NS))
+        if i < len(gyro):
+            gx, gy, gz = gyro[i]
+            p = (p.field("gx_dps", gx * g_lsb)
+                  .field("gy_dps", gy * g_lsb)
+                  .field("gz_dps", gz * g_lsb))
+        points.append(p)
+    if points:
+        write_api.write(bucket=_INFLUXDB_BUCKET, record=points)
+
+
 # Mirror one finalised high-rate drain (mission or idle snapshot) into InfluxDB as an
 # stm_mission point so Grafana shows shuttle activity even though the live :5683 stream
 # is off (ADR-021). High-rate waveforms stay in Parquet; only this summary goes to Influx.
@@ -414,17 +443,31 @@ def _write_drain_summary(summary: dict) -> None:
                 .field("accel_samples",    int(summary["accel_samples"]))
                 .field("gyro_samples",     int(summary["gyro_samples"]))
                 .field("complete",         bool(summary["complete"]))
-                .time(time.time_ns(), WritePrecision.NS)
+                # Stamp the point at the anchored mission start (t0_wall_ms), NOT now —
+                # drains arrive bursted, so wall-clock-of-arrival collapses spacing.
+                .time(int(summary["t0_wall_ms"]) * 1_000_000, WritePrecision.NS)
             )
+            # Vibration intensity (NaN for an empty stream — Influx rejects NaN floats).
+            for fname, key in (("accel_rms_g", "accel_rms_g"),
+                               ("accel_peak_g", "accel_peak_g"),
+                               ("gyro_peak_dps", "gyro_peak_dps")):
+                v = summary.get(key)
+                if v is not None and not math.isnan(v):
+                    point = point.field(fname, float(v))
             # Env stamp present on idle snapshots; absent (None) on high-rate missions.
             if summary.get("temp_c") is not None:
                 point = point.field("temp_c", float(summary["temp_c"]))
             if summary.get("pressure_hpa") is not None:
                 point = point.field("pressure_hpa", float(summary["pressure_hpa"]))
 
-            client.write_api(write_options=SYNCHRONOUS).write(
-                bucket=_INFLUXDB_BUCKET, record=point
-            )
+            write_api = client.write_api(write_options=SYNCHRONOUS)
+            write_api.write(bucket=_INFLUXDB_BUCKET, record=point)
+
+            # Idle snapshots are small — also write the per-sample accel/gyro waveform
+            # (option B) so Grafana can plot rest vibration. High-rate missions stay
+            # in Parquet only (too many samples for Influx).
+            if summary.get("accel_xyz"):
+                _write_idle_waveform(write_api, sid, summary)
             logger.info(
                 "[INFLUXDB] stm_mission(drain) shuttle=%s m=%d kind=%s recv=%d/%d loss=%.1f%%",
                 sid, int(summary["mission_id"]),
