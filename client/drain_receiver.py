@@ -162,8 +162,9 @@ _boot_offsets: dict[int, tuple[int, int]] = {}
 
 # Map a drain's start tick to wall clock via the per-shuttle boot offset. MOVING
 # missions (re)anchor the offset from their predictable lag; idle snapshots reuse the
-# stored offset (and so get back-dated, never forward-dated). Result is clamped to the
-# arrival time so a drain is never stamped in the future.
+# stored offset (and so get back-dated, never forward-dated) unless that offset predates
+# an STM reboot. Result is clamped to the arrival time so a drain is never stamped in the
+# future.
 def _boot_anchored_wall_ms(shuttle_id: int, t0_tick_ms: int, begin_wall_ms: int,
                            word_count: int, odr_a: float, odr_g: float,
                            is_idle: bool) -> int:
@@ -171,7 +172,8 @@ def _boot_anchored_wall_ms(shuttle_id: int, t0_tick_ms: int, begin_wall_ms: int,
 
     # Only MOVING missions anchor: lag = mission_duration + idle-exit + transmit, all
     # known here. Idle snapshots defer to the next radio-on (unbounded lag) so they must
-    # NOT anchor, and a smaller idle tick is a normal earlier capture, not a reboot.
+    # NOT anchor, and a slightly smaller idle tick is a normal earlier capture; only a
+    # large regression (handled below) means a reboot.
     # Re-anchor when there is no anchor, this mission is newer (>= tick), or the offset
     # disagrees beyond REANCHOR_TOL_MS (a reboot zeroed the tick — new timeline).
     if not is_idle and odr_a > 0 and odr_g > 0:
@@ -182,7 +184,15 @@ def _boot_anchored_wall_ms(shuttle_id: int, t0_tick_ms: int, begin_wall_ms: int,
             anchor = (new_offset, t0_tick_ms)
             _boot_offsets[shuttle_id] = anchor
 
-    if anchor is not None:
+    if anchor is not None and is_idle and t0_tick_ms < anchor[1] - REANCHOR_TOL_MS:
+        # Stale anchor from a previous STM boot: within one boot a fresh idle drain's
+        # tick is always >= the last mission's anchor tick (time only advances between
+        # radio-ons), so a large regression means the STM rebooted (tick zeroed) and the
+        # stored offset belongs to a dead timeline. Don't back-date to it — the idle
+        # snapshot was captured this boot, so treat it as a prompt drain. A MOVING
+        # mission in this same batch re-anchors the offset for everything that follows.
+        wall = begin_wall_ms - IDLE_FALLBACK_LAG_MS
+    elif anchor is not None:
         wall = anchor[0] + t0_tick_ms
     elif is_idle:
         # No MOVING anchor yet — assume this idle snapshot drained promptly.
