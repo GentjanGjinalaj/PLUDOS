@@ -10,6 +10,13 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip3 install --no-cache-dir -r requirements.txt
 
+# Cache-bust: podman 3.4.4 (rootless overlay) can reuse the COPY layers below even
+# when the .py files change, shipping stale code. A build ARG set to the git SHA on
+# every deploy invalidates this RUN, which cascades to re-run the code COPYs — while
+# the expensive pip layer above stays cached. Pass via compose build arg CODE_VERSION.
+ARG CODE_VERSION=dev
+RUN echo "$CODE_VERSION" > /app/.code_version
+
 # Copy your Python scripts into the container
 COPY data-engine.py .
 COPY drain_receiver.py .

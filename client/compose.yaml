@@ -21,7 +21,10 @@ services:
   # and avoids CNI firewall plugin version mismatch on rootless Podman (JetPack 6).
   # No profiles: runs in all modes (vpn, standalone, headless, plain up).
   data-engine:
-    build: .
+    build:
+      context: .
+      args:
+        CODE_VERSION: ${CODE_VERSION:-dev}
     container_name: pludos-data-engine
     command: python3 data-engine.py
     network_mode: host
@@ -36,7 +39,10 @@ services:
   # 2. The AI Worker (Jetson <-> Server relay path via Tailscale in federated mode;
   #    local retrain loop in standalone mode — controlled by PLUDOS_MODE env var).
   ai-worker:
-    build: .
+    build:
+      context: .
+      args:
+        CODE_VERSION: ${CODE_VERSION:-dev}
     container_name: pludos-ai-worker
     hostname: ${JETSON_HOSTNAME:-jetson}   # sets socket.gethostname() → InfluxDB device tag
     command: python3 client.py
