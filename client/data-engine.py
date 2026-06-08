@@ -468,8 +468,11 @@ def _write_drain_summary(summary: dict) -> None:
             # in Parquet only (too many samples for Influx).
             if summary.get("accel_xyz"):
                 _write_idle_waveform(write_api, sid, summary)
+            # recv/drain_loss describe the UDP drain from the STM, NOT the Influx write
+            # (which either succeeds above or raises into the except below). Labelled
+            # explicitly so the number isn't misread as a database write failure.
             logger.info(
-                "[INFLUXDB] stm_mission(drain) shuttle=%s m=%d kind=%s recv=%d/%d loss=%.1f%%",
+                "[INFLUXDB] stm_mission(drain) written shuttle=%s m=%d kind=%s recv=%d/%d drain_loss=%.1f%%",
                 sid, int(summary["mission_id"]),
                 "idle" if summary["is_idle_snapshot"] else "mission",
                 int(summary["packets_received"]), int(summary["packets_total"]),
