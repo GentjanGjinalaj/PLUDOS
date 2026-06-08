@@ -237,7 +237,7 @@ static uint32_t tx_window_start_tick = 0U;
 #define CAP_CTRL1_XL_IDLE     0x12U   /* accel ODR=12.5Hz (0001), FS=±2g, LPF2_XL_EN=1 */
 #define CAP_CTRL2_G_IDLE      0x10U   /* gyro  ODR=12.5Hz (0001), FS=±250 dps */
 #define CAP_FIFO_CTRL3_IDLE   0x11U   /* BDR_GY=12.5Hz (1), BDR_XL=12.5Hz (1) */
-#define CAP_IDLE_SNAP_PERIOD_MS  60000U  /* TEST: idle snapshot every 1 min; production = 300000 (5 min) */
+#define CAP_IDLE_SNAP_PERIOD_MS  600000U  /* idle snapshot every 10 min (sit-time is exact via tx_tick) */
 #define CAP_IDLE_SNAP_DUR_MS      10000U  /* each idle snapshot lasts 10 s */
 /* Gyro LPF1 (CTRL4_C=0x02, CTRL6_C=0x07 FTYPE=111) left at boot setting: FTYPE=111 is
  * the narrowest LPF1, so its corner is the lowest of all FTYPE codes and stays below
@@ -314,6 +314,7 @@ typedef struct __attribute__((packed))
   uint8_t  is_idle_snapshot;  /* 1 = low-rate idle snapshot, 0 = MOVING mission */
   uint8_t  _pad;
   uint32_t byte_count; uint32_t word_count; uint32_t t0_tick_ms;
+  uint32_t tx_tick_ms;  /* HAL_GetTick() at drain time; gateway derives capture age = tx-t0 */
 } DrainBegin_t;
 
 typedef struct __attribute__((packed))
@@ -1319,6 +1320,10 @@ static void Drain_Mission(int16_t idx)
   beg.byte_count   = m->byte_count;
   beg.word_count   = m->word_count;
   beg.t0_tick_ms   = m->start_tick_ms;
+  /* Transmit-time tick: tx_tick - t0_tick is the exact STM-measured age of this data
+   * (capture start → drain, same boot/clock). Includes idle-exit wait + WiFi power-on,
+   * so the gateway needs only: capture_wall = BEGIN_arrival - (tx_tick - t0_tick). */
+  beg.tx_tick_ms   = HAL_GetTick();
   for (k = 0U; k < DRAIN_CTRL_REPEAT; k++)
   {
     (void)MX_WIFI_Socket_sendto(wifi_obj, socket_id, (uint8_t *)&beg, sizeof(beg),

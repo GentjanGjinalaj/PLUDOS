@@ -78,10 +78,10 @@ TYPE_END   = 3
 
 # DrainBegin_t: magic(4) type(1) sid(1) mid(2) total_chunks(2) odr_a(2) odr_g(2)
 #               temp_c_x100(2,int16) pressure_hpa_x10(2) is_idle_snapshot(1) _pad(1)
-#               byte_count(4) word_count(4) t0_tick_ms(4) = 32 B (ADR-021 §1).
-BEGIN_FMT  = "<IBBHHHHhHBBIII"
+#               byte_count(4) word_count(4) t0_tick_ms(4) tx_tick_ms(4) = 36 B (ADR-021 §1).
+BEGIN_FMT  = "<IBBHHHHhHBBIIII"
 BEGIN_SIZE = struct.calcsize(BEGIN_FMT)
-assert BEGIN_SIZE == 32, f"DrainBegin must be 32 bytes, got {BEGIN_SIZE}"
+assert BEGIN_SIZE == 36, f"DrainBegin must be 36 bytes, got {BEGIN_SIZE}"
 
 # Sentinels for an absent env stamp (MOVING missions / failed sensor read).
 TEMP_INVALID_X100 = 0x7FFF
@@ -114,13 +114,8 @@ ACCEL_G_PER_LSB  = 0.000061   # 0.061 mg/LSB  (DS13281 ±2 g)
 GYRO_DPS_PER_LSB = 0.00875    # 8.75 mdps/LSB (DS13281 ±250 dps)
 
 # ---------------------------------------------------------------------------
-# t0 wall-clock resolution — reuse the per-shuttle NTP offset data-engine.py
-# already maintains. Injected at startup to avoid a circular import.
+# Output wiring — injected at startup to avoid a circular import with data-engine.
 # ---------------------------------------------------------------------------
-
-# Callable (shuttle_id:int) -> int|None returning the per-shuttle NTP offset (ms),
-# or None if no offset has been anchored for that shuttle yet.
-_ntp_offset_lookup = None
 
 # Parquet output directory — same dir data-engine uses; injected at startup.
 _buffer_dir = "."
@@ -131,83 +126,12 @@ _buffer_dir = "."
 _summary_sink = None
 
 
-# Wire the NTP-offset accessor + output dir (+ optional Influx sink) from data-engine.
-def configure(ntp_offset_lookup, buffer_dir: str, summary_sink=None) -> None:
-    global _ntp_offset_lookup, _buffer_dir, _summary_sink
-    _ntp_offset_lookup = ntp_offset_lookup
+# Wire the output dir (+ optional Influx sink) from data-engine. Drain timestamps are
+# self-contained (tx_tick - t0_tick), so no NTP-offset accessor is needed any more.
+def configure(buffer_dir: str, summary_sink=None) -> None:
+    global _buffer_dir, _summary_sink
     _buffer_dir = buffer_dir
     _summary_sink = summary_sink
-
-
-# Lag from a MOVING mission's start tick to its BEGIN arrival, minus the mission
-# duration (derived per drain). A mission drains only after the FSM declares idle
-# (NO_MOVEMENT_TIMEOUT_MS, ~20 s) then powers WiFi on and blasts the ring.
-IDLE_EXIT_MS = int(os.getenv("DRAIN_IDLE_EXIT_MS", "20000"))   # NO_MOVEMENT_TIMEOUT_MS
-DRAIN_TX_MS  = int(os.getenv("DRAIN_TX_MS", "2000"))           # WiFi power-on + blast
-
-# Fallback lag for an idle snapshot that arrives before any MOVING mission has
-# anchored the clock — best-effort only, never stored as the offset.
-IDLE_FALLBACK_LAG_MS = int(os.getenv("DRAIN_IDLE_FALLBACK_LAG_MS", "1000"))
-
-# A MOVING mission whose freshly-computed offset disagrees with the stored one by more
-# than this is treated as a new boot session (HAL_GetTick() zeroed) and re-anchors.
-# Same-boot missions only differ by lag-estimate noise (seconds); a reboot differs by
-# the whole uptime (minutes–days), so the gap is unambiguous.
-REANCHOR_TOL_MS = int(os.getenv("DRAIN_REANCHOR_TOL_MS", "60000"))
-
-# Per-shuttle STM-boot offset: (offset_ms, last_anchor_tick_ms) where offset_ms is the
-# wall-clock time of HAL_GetTick()==0. wall = offset + t0_tick_ms then gives every drain
-# an exact absolute position AND exact inter-drain spacing straight from the STM
-# monotonic clock — so a burst of idle snapshots that piggyback one radio-on get spread
-# back across the minutes they were really captured, not collapsed onto arrival time.
-# Re-derived ONLY from MOVING missions (their lag is predictable) and dropped when the
-# tick regresses (HAL_GetTick() zeroes on STM32 reboot).
-_boot_offsets: dict[int, tuple[int, int]] = {}
-
-
-# Map a drain's start tick to wall clock via the per-shuttle boot offset. MOVING
-# missions (re)anchor the offset from their predictable lag; idle snapshots reuse the
-# stored offset (and so get back-dated, never forward-dated) unless that offset predates
-# an STM reboot. Result is clamped to the arrival time so a drain is never stamped in the
-# future.
-def _boot_anchored_wall_ms(shuttle_id: int, t0_tick_ms: int, begin_wall_ms: int,
-                           word_count: int, odr_a: float, odr_g: float,
-                           is_idle: bool) -> int:
-    anchor = _boot_offsets.get(shuttle_id)
-
-    # Only MOVING missions anchor: lag = mission_duration + idle-exit + transmit, all
-    # known here. Idle snapshots defer to the next radio-on (unbounded lag) so they must
-    # NOT anchor, and a slightly smaller idle tick is a normal earlier capture; only a
-    # large regression (handled below) means a reboot.
-    # Re-anchor when there is no anchor, this mission is newer (>= tick), or the offset
-    # disagrees beyond REANCHOR_TOL_MS (a reboot zeroed the tick — new timeline).
-    if not is_idle and odr_a > 0 and odr_g > 0:
-        dur_ms = word_count * 1000.0 / (odr_a + odr_g)
-        ref_wall = begin_wall_ms - dur_ms - IDLE_EXIT_MS - DRAIN_TX_MS
-        new_offset = int(ref_wall - t0_tick_ms)
-        if anchor is None or t0_tick_ms >= anchor[1] or abs(new_offset - anchor[0]) > REANCHOR_TOL_MS:
-            anchor = (new_offset, t0_tick_ms)
-            _boot_offsets[shuttle_id] = anchor
-
-    if anchor is not None and is_idle and t0_tick_ms < anchor[1] - REANCHOR_TOL_MS:
-        # Stale anchor from a previous STM boot: within one boot a fresh idle drain's
-        # tick is always >= the last mission's anchor tick (time only advances between
-        # radio-ons), so a large regression means the STM rebooted (tick zeroed) and the
-        # stored offset belongs to a dead timeline. Don't back-date to it — the idle
-        # snapshot was captured this boot, so treat it as a prompt drain. A MOVING
-        # mission in this same batch re-anchors the offset for everything that follows.
-        wall = begin_wall_ms - IDLE_FALLBACK_LAG_MS
-    elif anchor is not None:
-        wall = anchor[0] + t0_tick_ms
-    elif is_idle:
-        # No MOVING anchor yet — assume this idle snapshot drained promptly.
-        wall = begin_wall_ms - IDLE_FALLBACK_LAG_MS
-    else:
-        # MOVING with corrupt ODR (can't derive duration): arrival minus fixed lag.
-        wall = begin_wall_ms - IDLE_EXIT_MS - DRAIN_TX_MS
-
-    # Never stamp a drain in the future relative to its own arrival.
-    return min(int(wall), begin_wall_ms)
 
 
 # ---------------------------------------------------------------------------
@@ -242,7 +166,9 @@ class MissionReassembler:
         # FIFO word count — duration_ms = word_count*1000/(odr_a+odr_g); anchors t0 wall.
         self.word_count = begin["word_count"]
         self.t0_tick_ms = begin["t0_tick_ms"]
-        # Wall-clock time the BEGIN arrived — fallback t0 anchor if no NTP offset.
+        # Transmit-time STM tick: tx_tick - t0_tick is the exact age of this data at drain.
+        self.tx_tick_ms = begin["tx_tick_ms"]
+        # Wall-clock time the BEGIN arrived — the reference the capture age is subtracted from.
         self.begin_wall_ms = int(time.time() * 1000)
         # Gateway-assigned output id (unix ms). The firmware mission_id resets to
         # low values on every STM32 reset, so it is unsafe as a filename/dedup key
@@ -289,19 +215,14 @@ class MissionReassembler:
     def assemble(self) -> bytes:
         return b"".join(self.chunks[s] for s in sorted(self.chunks))
 
-    # Map mission-start t0_tick_ms to wall clock. Prefer the per-shuttle NTP offset
-    # data-engine maintains from the live :5683 stream; with ADR-021 the radio is off
-    # during MOVING so that offset is usually absent — fall back to the tick anchor,
-    # which keeps inter-mission spacing exact via the STM clock (idempotent per mission).
+    # Map capture-start to wall clock. tx_tick - t0_tick is the STM-measured age of the
+    # data at transmit (same boot, same HAL_GetTick — exact, includes idle-exit + WiFi
+    # power-on). Subtract from BEGIN arrival to recover the real capture wall time. Works
+    # identically for idle snapshots (unbounded PSRAM sit-time) and MOVING missions, with
+    # no boot anchor and no reboot ambiguity (volatile PSRAM ⇒ both ticks are same-boot).
     def t0_wall_ms(self) -> int:
-        if _ntp_offset_lookup is not None:
-            offset = _ntp_offset_lookup(self.shuttle_id)
-            if offset is not None:
-                return self.t0_tick_ms + offset
-        return _boot_anchored_wall_ms(
-            self.shuttle_id, self.t0_tick_ms, self.begin_wall_ms,
-            self.word_count, self.odr_accel_hz, self.odr_gyro_hz, self.is_idle_snapshot,
-        )
+        capture_age_ms = max(0, self.tx_tick_ms - self.t0_tick_ms)
+        return self.begin_wall_ms - capture_age_ms
 
 
 # ---------------------------------------------------------------------------
@@ -506,13 +427,14 @@ def _parse_packet(data: bytes):
         if len(data) < BEGIN_SIZE:
             return None
         (_, _, sid, mid, total, odr_a, odr_g, temp_x100, press_x10, is_idle, _pad,
-         byte_count, word_count, t0_tick) = struct.unpack_from(BEGIN_FMT, data, 0)
+         byte_count, word_count, t0_tick, tx_tick) = struct.unpack_from(BEGIN_FMT, data, 0)
         return (TYPE_BEGIN, {
             "shuttle_id": sid, "mission_id": mid, "total_chunks": total,
             "odr_accel_hz": odr_a, "odr_gyro_hz": odr_g,
             "temp_c_x100": temp_x100, "pressure_hpa_x10": press_x10,
             "is_idle_snapshot": is_idle,
-            "byte_count": byte_count, "word_count": word_count, "t0_tick_ms": t0_tick,
+            "byte_count": byte_count, "word_count": word_count,
+            "t0_tick_ms": t0_tick, "tx_tick_ms": tx_tick,
         })
 
     if ptype == TYPE_CHUNK:
@@ -620,7 +542,7 @@ class DrainProtocol(asyncio.DatagramProtocol):
             synth = {
                 "total_chunks": f["total_chunks"], "odr_accel_hz": 0, "odr_gyro_hz": 0,
                 "temp_c_x100": TEMP_INVALID_X100, "pressure_hpa_x10": 0, "is_idle_snapshot": 0,
-                "byte_count": 0, "word_count": 0, "t0_tick_ms": 0,
+                "byte_count": 0, "word_count": 0, "t0_tick_ms": 0, "tx_tick_ms": 0,
             }
             re = MissionReassembler(f["shuttle_id"], f["mission_id"], synth)
             self.missions[key] = re
@@ -676,8 +598,8 @@ async def _drain_watchdog(proto: DrainProtocol) -> None:
 # ---------------------------------------------------------------------------
 
 # Bind the drain UDP endpoint and start the quiet-timeout watchdog task.
-async def start_drain_receiver(ntp_offset_lookup, buffer_dir: str, summary_sink=None) -> None:
-    configure(ntp_offset_lookup, buffer_dir, summary_sink)
+async def start_drain_receiver(buffer_dir: str, summary_sink=None) -> None:
+    configure(buffer_dir, summary_sink)
     loop = asyncio.get_running_loop()
     proto = DrainProtocol()
     transport, _ = await loop.create_datagram_endpoint(

@@ -130,7 +130,7 @@ format without changing the on-wire layout of types 1–3.
 
 ### Packet types
 ```c
-/* type=1 DRAIN_BEGIN — control, sent x3 for robustness. 32 bytes. */
+/* type=1 DRAIN_BEGIN — control, sent x3 for robustness. 36 bytes. */
 typedef struct __attribute__((packed)) {
   uint32_t magic;        /* 0x52444C50                                   */
   uint8_t  type;         /* 1                                            */
@@ -146,8 +146,11 @@ typedef struct __attribute__((packed)) {
   uint8_t  _pad;
   uint32_t byte_count;   /* total payload bytes across all chunks        */
   uint32_t word_count;   /* FIFO words = byte_count / 7                   */
-  uint32_t t0_tick_ms;   /* capture-start HAL_GetTick(); gateway maps to  */
-                         /* wall time via its per-shuttle NTP offset      */
+  uint32_t t0_tick_ms;   /* capture-start HAL_GetTick()                   */
+  uint32_t tx_tick_ms;   /* drain-time HAL_GetTick(); capture_age =       */
+                         /* tx_tick - t0_tick. Gateway stamps capture     */
+                         /* wall = BEGIN_arrival - capture_age (exact,    */
+                         /* same-boot, no NTP offset needed)              */
 } DrainBegin_t;
 /* Idle snapshots (ADR-021 §1) run accel+gyro both at 12.5 Hz. The integer
  * odr_* fields can't carry .5, so when is_idle_snapshot=1 the gateway uses

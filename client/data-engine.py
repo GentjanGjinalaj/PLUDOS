@@ -516,15 +516,6 @@ def _unpack_telemetry(raw: bytes) -> dict:
     }
 
 
-# NTP-offset accessor for the drain receiver. Drain packets carry the 1-based
-# integer shuttle_id, but _ntp_offsets is keyed by name ("shuttle-{n}"); map
-# through SHUTTLE_NAMES like the telemetry path does. Returns None if no offset
-# has been anchored yet (shuttle never streamed on 5683 this session).
-def get_ntp_offset(shuttle_id: int) -> int | None:
-    name = SHUTTLE_NAMES.get(shuttle_id, f"shuttle-{shuttle_id}")
-    return _ntp_offsets.get(name)
-
-
 def _reset_shuttle_state(shuttle_id: str) -> None:
     """Wipe all per-shuttle dicts — called on mission-end and ghost-shuttle cleanup."""
     _telemetry_buf.pop(shuttle_id, None)
@@ -1095,8 +1086,8 @@ async def main() -> None:
     logger.info("Telemetry UDP listener bound on port %d", TELEMETRY_PORT)
 
     # High-rate capture drain receiver on UDP 5684 (ADR-020). Separate path from
-    # the 5683 live hot loop; reuses the per-shuttle NTP offset to anchor t0.
-    await drain_receiver.start_drain_receiver(get_ntp_offset, BUFFER_DIR, _write_drain_summary)
+    # the 5683 live hot loop; drain t0 is self-timed via the STM tx_tick - t0_tick age.
+    await drain_receiver.start_drain_receiver(BUFFER_DIR, _write_drain_summary)
 
     # Consolidate any mission files from days before today (handles Jetson restarts / downtime).
     _consolidate_stale()
