@@ -32,7 +32,7 @@ import socket
 import struct
 import time
 import zlib
-from datetime import datetime, timezone
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -439,11 +439,13 @@ def _finalise_mission(re: MissionReassembler, reason: str) -> None:
     received = len(re.chunks)
     lost = re.total_chunks - received
     loss_pct = (100.0 * lost / re.total_chunks) if re.total_chunks else 0.0
-    # Log capture wall-clock (t0_wall, UTC) not arrival time — the line is else
-    # misleading: a drain arrives now but the data was captured when the mission ran.
-    captured = datetime.fromtimestamp(t0_wall / 1000.0, tz=timezone.utc).strftime("%H:%M:%S")
+    # Log capture wall-clock (t0_wall) not arrival time — the line is else misleading:
+    # a drain arrives now but the data was captured when the mission ran. Rendered in
+    # local time to line up with the log line's own local timestamp (Influx/Parquet
+    # still store UTC; this is display-only).
+    captured = datetime.fromtimestamp(t0_wall / 1000.0).strftime("%H:%M:%S")
     logger.info(
-        "[DRAIN] finalised (%s) %s | captured %sZ | packets %d/%d recv (lost %d, %.1f%%) | "
+        "[DRAIN] finalised (%s) %s | captured %s | packets %d/%d recv (lost %d, %.1f%%) | "
         "accel=%d gyro=%d | all_received=%s%s | %s",
         reason, _tag(re.shuttle_id, re.mission_id, re.is_idle_snapshot), captured,
         received, re.total_chunks, lost, loss_pct,
