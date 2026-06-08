@@ -251,7 +251,11 @@ static uint32_t tx_window_start_tick = 0U;
 #define CAP_FIFO_WORD_BYTES   7U      /* 1 tag byte + 6 data bytes per FIFO word */
 #define CAP_FIFO_READ_WORDS   96U     /* max words per Service burst (~672 B ≈ 15 ms I²C @400 kHz) */
 #define CAP_MAX_BURSTS_PER_SVC 12U    /* 12×96=1152 > 1023 FIFO depth — drains full snapshot per call */
-#define CAP_MAX_MISSIONS      8U      /* mission-metadata ring (bookkeeping only; data in PSRAM) */
+#define CAP_MAX_MISSIONS      256U    /* mission-metadata ring depth (bookkeeping only; data in PSRAM).
+                                       * FIFO-reclaimed (see Capture_AllocSlot): drained slots are reused,
+                                       * so normal operation never exhausts it; the depth only bounds how
+                                       * many captures survive a long radio-dark idle (most-recent-N kept).
+                                       * 256 × sizeof(CaptureMission_t) ≈ 8 KB SRAM. */
 #define CAP_RING_WTM_BYTES    (PSRAM_SIZE_BYTES - (PSRAM_SIZE_BYTES / 4U)) /* 75% = 6 MB drain trigger */
 
 /* Per-mission bookkeeping; the sample bytes themselves live in the PSRAM ring. */
@@ -271,8 +275,9 @@ typedef struct
 } CaptureMission_t;
 
 static CaptureMission_t cap_missions[CAP_MAX_MISSIONS];
-static uint8_t  cap_mission_count = 0U;  /* missions opened so far */
-static int8_t   cap_active_idx    = -1;  /* index of in-progress mission, -1 = none */
+static uint16_t cap_mission_count = 0U;  /* slots populated so far (grows up to CAP_MAX_MISSIONS) */
+static int16_t  cap_active_idx    = -1;  /* index of in-progress mission, -1 = none */
+static uint16_t cap_slot_head     = 0U;  /* FIFO reuse pointer: oldest slot, advanced once the ring is full */
 static uint32_t cap_ring_wptr     = 0U;  /* next PSRAM write offset [0, PSRAM_SIZE_BYTES) */
 static uint16_t cap_next_id       = 1U;
 static uint8_t  cap_initialized   = 0U;
@@ -294,6 +299,7 @@ static uint8_t  cap_fifo_buf[CAP_FIFO_READ_WORDS * CAP_FIFO_WORD_BYTES]; /* SRAM
 #define DRAIN_TYPE_END         3U
 #define DRAIN_CHUNK_PAYLOAD    1400U         /* 200 FIFO words — never splits a word across chunks */
 #define DRAIN_CTRL_REPEAT      3U            /* resend BEGIN/END N times (control-loss tolerance) */
+#define DRAIN_CHUNK_PACE_EVERY 8U            /* yield 1 ms every N chunks so the EMW3080 MAC queue and the gateway UDP socket drain between bursts — mitigates bursty consecutive chunk loss */
 #define DRAIN_WARMUP_PACKETS   24U           /* sacrificial datagrams to absorb the post-power-on loss window (~16 pkts measured) */
 #define DRAIN_WARMUP_GAP_MS    8U            /* inter-packet pace so each junk pkt actually reaches air (advances ARP/MAC-learning) instead of piling into the SPI TX queue */
 #define DRAIN_ODR_ACCEL_HZ     3332U
@@ -354,13 +360,14 @@ static int8_t WIFI_PowerOn(void);
 static void WIFI_PowerOff(void);
 /* ADR-020 high-rate ISM330 FIFO capture engine (state-rated) */
 static int8_t   Capture_Init(void);
+static int16_t  Capture_AllocSlot(void);
 static void     Capture_EnterMoving(void);
 static void     Capture_EnterIdleSnapshot(void);
 static void     Capture_EnterIdle(void);
 static uint16_t Capture_Service(void);
 /* ADR-020/021 mission drain to the gateway (UDP 5684, blast-first) */
 static uint32_t Drain_CRC32(const uint8_t *data, uint32_t len);
-static void     Drain_Mission(int8_t idx);
+static void     Drain_Mission(int16_t idx);
 static void     Drain_AllPending(void);
 
 /* USER CODE END PFP */
@@ -978,11 +985,43 @@ static int8_t Capture_Init(void)
   }
   cap_ring_wptr     = 0U;
   cap_mission_count = 0U;
+  cap_slot_head     = 0U;
   cap_active_idx    = -1;
   cap_next_id       = 1U;
   cap_wtm_hit       = 0U;
   cap_initialized   = 1U;
   return 0;
+}
+
+/* Pick the metadata slot for a new capture. While the table has room we append; once
+ * full we reclaim in FIFO order (oldest slot first), advancing cap_slot_head. Because
+ * every mission is marked drained on the next radio-on, normal operation cycles through
+ * already-drained slots and never exhausts the table — only a long radio-dark idle, where
+ * snapshots accumulate undrained, can wrap, and then we keep the most recent
+ * CAP_MAX_MISSIONS captures and drop the oldest. Dropping a still-undrained slot returns
+ * its bytes to cap_undrained_bytes so the watermark trigger stays honest. */
+static int16_t Capture_AllocSlot(void)
+{
+  int16_t idx;
+  CaptureMission_t *old;
+
+  if (cap_mission_count < CAP_MAX_MISSIONS)
+  {
+    idx = (int16_t)cap_mission_count;
+    cap_mission_count++;
+    return idx;
+  }
+
+  idx = (int16_t)cap_slot_head;
+  cap_slot_head = (uint16_t)((cap_slot_head + 1U) % CAP_MAX_MISSIONS);
+
+  old = &cap_missions[idx];
+  if ((old->drained == 0U) && (old->byte_count != 0U))
+  {
+    cap_undrained_bytes = (cap_undrained_bytes >= old->byte_count)
+                          ? (cap_undrained_bytes - old->byte_count) : 0U;
+  }
+  return idx;
 }
 
 /* Switch the ISM330 to high-rate capture (accel 3332 Hz, gyro 416 Hz, FIFO stream)
@@ -1009,17 +1048,8 @@ static void Capture_EnterMoving(void)
   v = CAP_FIFO_MODE_BYPASS;  (void)HAL_I2C_Mem_Write(&hi2c2, ISM330_ADDR, ISM330_FIFO_CTRL4, 1, &v, 1, 100);
   v = CAP_FIFO_MODE_STREAM;  (void)HAL_I2C_Mem_Write(&hi2c2, ISM330_ADDR, ISM330_FIFO_CTRL4, 1, &v, 1, 100);
 
-  /* Open a mission record. The PSRAM ring keeps wrapping regardless; if the metadata
-   * table is full we reuse the last slot (bookkeeping degrades, data path does not). */
-  if (cap_mission_count < CAP_MAX_MISSIONS)
-  {
-    cap_active_idx = (int8_t)cap_mission_count;
-    cap_mission_count++;
-  }
-  else
-  {
-    cap_active_idx = (int8_t)(CAP_MAX_MISSIONS - 1U);
-  }
+  /* Open a mission record (FIFO metadata ring; the PSRAM data ring wraps independently). */
+  cap_active_idx = Capture_AllocSlot();
   m = &cap_missions[cap_active_idx];
   m->mission_id   = cap_next_id++;
   m->start_offset = cap_ring_wptr;
@@ -1062,15 +1092,7 @@ static void Capture_EnterIdleSnapshot(void)
   v = CAP_FIFO_MODE_BYPASS; (void)HAL_I2C_Mem_Write(&hi2c2, ISM330_ADDR, ISM330_FIFO_CTRL4, 1, &v, 1, 100);
   v = CAP_FIFO_MODE_STREAM; (void)HAL_I2C_Mem_Write(&hi2c2, ISM330_ADDR, ISM330_FIFO_CTRL4, 1, &v, 1, 100);
 
-  if (cap_mission_count < CAP_MAX_MISSIONS)
-  {
-    cap_active_idx = (int8_t)cap_mission_count;
-    cap_mission_count++;
-  }
-  else
-  {
-    cap_active_idx = (int8_t)(CAP_MAX_MISSIONS - 1U);
-  }
+  cap_active_idx = Capture_AllocSlot();
   m = &cap_missions[cap_active_idx];
   m->mission_id   = cap_next_id++;
   m->start_offset = cap_ring_wptr;
@@ -1250,7 +1272,7 @@ static uint32_t Drain_CRC32(const uint8_t *data, uint32_t len)
  * Sends BEGIN ×3, all CHUNKs once (raw 7-byte FIFO words, CRC per chunk), END ×3.
  * No back-channel yet — the gateway reassembles best-effort and flags gaps; the
  * NAK/ACK selective-repeat layer (sampling_strategy.md §9) builds on top later. */
-static void Drain_Mission(int8_t idx)
+static void Drain_Mission(int16_t idx)
 {
   CaptureMission_t *m;
   volatile uint8_t *ring;
@@ -1261,7 +1283,7 @@ static void Drain_Mission(int8_t idx)
   uint32_t total_chunks, chunk, off, remaining, crc_all = 0xFFFFFFFFUL;
   uint16_t payload_len, k;
 
-  if ((idx < 0) || (idx >= (int8_t)CAP_MAX_MISSIONS)) { return; }
+  if ((idx < 0) || (idx >= (int16_t)CAP_MAX_MISSIONS)) { return; }
   m = &cap_missions[idx];
   if ((m->sealed == 0U) || (m->byte_count == 0U)) { return; }
 
@@ -1332,6 +1354,13 @@ static void Drain_Mission(int8_t idx)
     (void)MX_WIFI_Socket_sendto(wifi_obj, socket_id, drain_buf,
                                 (int32_t)(sizeof(DrainChunkHdr_t) + payload_len),
                                 0, (struct mx_sockaddr *)&dest, sizeof(dest));
+
+    /* Breather every N chunks: lets the MAC TX queue + gateway socket flush so a
+     * sustained blast doesn't overrun either and drop a consecutive run of chunks. */
+    if (((chunk + 1U) % DRAIN_CHUNK_PACE_EVERY) == 0U)
+    {
+      HAL_Delay(1);
+    }
   }
   crc_all ^= 0xFFFFFFFFUL;
 
@@ -1407,7 +1436,7 @@ static void Drain_WarmupBurst(void)
 
 static void Drain_AllPending(void)
 {
-  uint8_t i;
+  uint16_t i;
   uint8_t any = 0U;
 
   for (i = 0U; i < cap_mission_count; i++)
@@ -1443,7 +1472,7 @@ static void Drain_AllPending(void)
     {
       if ((cap_missions[i].sealed != 0U) && (cap_missions[i].drained == 0U))
       {
-        Drain_Mission((int8_t)i);
+        Drain_Mission((int16_t)i);
       }
     }
   }
