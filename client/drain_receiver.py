@@ -28,6 +28,7 @@ time is derived, never per-sample stamped:
 import asyncio
 import logging
 import os
+import socket
 import struct
 import time
 import zlib
@@ -44,6 +45,9 @@ logger = logging.getLogger("data-engine")
 
 # Dedicated drain port (retired NC-UDP port, reused by ADR-015/020).
 DRAIN_PORT = int(os.getenv("DRAIN_PORT", "5684"))
+
+# Kernel RX buffer for the burst drain socket; capped by host net.core.rmem_max.
+DRAIN_RCVBUF_BYTES = int(os.getenv("DRAIN_RCVBUF_BYTES", str(4 * 1024 * 1024)))
 
 # Quiet-timeout watchdog: Phase 1 is blast-only with no guaranteed END, so a
 # mission that has seen no new chunk for this long is finalised regardless.
@@ -674,9 +678,19 @@ async def start_drain_receiver(ntp_offset_lookup, buffer_dir: str, summary_sink=
     configure(ntp_offset_lookup, buffer_dir, summary_sink)
     loop = asyncio.get_running_loop()
     proto = DrainProtocol()
-    await loop.create_datagram_endpoint(
+    transport, _ = await loop.create_datagram_endpoint(
         lambda: proto,
         local_addr=("0.0.0.0", DRAIN_PORT),
     )
+    # A drain is a multi-MB burst sent with no inter-chunk pacing; the default ~208 KB
+    # kernel RX buffer overflows mid-burst if the event loop stalls (e.g. a prior
+    # mission's Parquet write), dropping a consecutive run of chunks. Request 4 MB so
+    # a full mission fits even if the loop briefly can't service the socket. Capped by
+    # net.core.rmem_max — must be raised on the host (host netns) for this to take.
+    sock = transport.get_extra_info("socket")
+    if sock is not None:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, DRAIN_RCVBUF_BYTES)
+        actual = sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
+        logger.info("[DRAIN] SO_RCVBUF requested=%d granted=%d", DRAIN_RCVBUF_BYTES, actual)
     logger.info("[DRAIN] high-rate capture drain listener bound on port %d", DRAIN_PORT)
     asyncio.create_task(_drain_watchdog(proto))
