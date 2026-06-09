@@ -49,7 +49,6 @@ with deterministic shuttle-to-gateway assignment.
 - `fl_energy` InfluxDB stream at 10 Hz during model training
 
 ### Changed
-- `OPERATIONS.md` moved to local-only (credentials must not be committed)
 - Per-shuttle buffer limits: `SHUTTLE_SOFT_LIMIT=3000`, `SHUTTLE_HARD_LIMIT=4500`,
   `GATEWAY_HARD_LIMIT=100000` (scaled for 10 Hz TX rate)
 

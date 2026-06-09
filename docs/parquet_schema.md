@@ -38,8 +38,8 @@ the bug that caused one shuttle's file to overwrite the other's.
 |---|---|---|
 | Mission end | shuttle stays IDLE for ≥ 30 s after any MOVING run (`MISSION_END_IDLE_S`) | Yes |
 | Time cap | shuttle buffer open longer than `BUFFER_MAX_AGE_S` (default 300 s) wall-clock | Yes |
-| Soft limit | shuttle buffer reaches 3 000 packets (≈ 1 min at 50 Hz MOVING) | No — mission continues |
-| Hard limit | shuttle buffer reaches 4 500 packets (≈ 1.5 min at 50 Hz MOVING) | No — mission continues |
+| Soft limit | shuttle buffer reaches 3 000 packets | No — mission continues |
+| Hard limit | shuttle buffer reaches 4 500 packets | No — mission continues |
 | Gateway ceiling | all-shuttle total reaches 100 000 packets | No |
 | Shutdown | `podman stop` (SIGTERM) — **not** caught; in-flight buffer is lost | — |
 
@@ -55,7 +55,7 @@ mission in sequence order.
 
 | Column | Type | Unit | Description |
 |---|---|---|---|
-| `timestamp` | `pd.Timestamp` (UTC) | — | STM32 `HAL_GetTick()` anchored to gateway NTP wall clock. Per-shuttle offset = `receipt_time_ms − tick_ms`, refreshed every 100 packets to correct crystal drift. Sort by `seq`, not `timestamp` — NTP jitter can cause small out-of-order timestamps. |
+| `timestamp` | `pd.Timestamp` (UTC) | — | STM32 `HAL_GetTick()` anchored to gateway NTP wall clock. Per-shuttle offset = `receipt_time_ms − tick_ms`, refreshed every 100 packets to correct crystal drift. Sort by `seq`, not `timestamp` — NTP jitter can cause small out-of-order timestamps. (This NTP-offset scheme is the **live `:5683` stream only**. High-rate drain captures — the separate `cap_accel_*`/`cap_gyro_*` files — instead recover capture time as `BEGIN_arrival − (tx_tick − t0_tick)`; see `docs/wire_protocol.md §2`.) |
 | `shuttle_id` | int8 | — | 1-based integer. Set via `SHUTTLE_ID` in `wifi_credentials.h`. Maps to a human name via `SHUTTLE_NAMES` env var (default `shuttle-N`). |
 | `seq` | int32 | — | Monotonic packet counter. The uint16 wire value (wraps at 65 535) is unwrapped by the gateway into a globally unique sort key. Always use `seq` for ordering, not `timestamp`. |
 | `seq_gap` | int16 | packets | Packets lost **before** this row = `seq[i] − seq[i−1] − 1`. Zero means no loss; 1 means one packet was dropped. First row in each file is always 0. Non-zero values cluster at WiFi dead zones (metal shelving, elevator shaft entry) — this is a position-correlated ML feature. |
@@ -64,7 +64,7 @@ mission in sequence order.
 
 | Column | Type | Unit | Description |
 |---|---|---|---|
-| `state` | int8 | — | `0` = IDLE (shuttle stationary, 0.1 Hz TX), `1` = MOVING (shuttle in transit, 50 Hz TX). Derived from the STM32 FSM — see `docs/state_machine.md`. |
+| `state` | int8 | — | `0` = IDLE (shuttle stationary), `1` = MOVING (shuttle in transit). Derived from the STM32 FSM — see `docs/state_machine.md`. |
 
 ### Accelerometer (ISM330DHCX)
 
@@ -116,7 +116,7 @@ and XGBoost use them.
 |---|---|
 | `accel_mag` | √(accel_x² + accel_y² + accel_z²). Total acceleration magnitude; ≈ 1.0 g at rest. |
 | `gyro_mag` | √(gyro_x² + gyro_y² + gyro_z²). Aggregate rotation magnitude. |
-| `rolling_accel_std_10` | 10-packet rolling std of `accel_mag` (≈ 0.2 s at 50 Hz MOVING), `min_periods=2`, leading NaN filled 0. Sustained-vibration / bearing-wear proxy. |
+| `rolling_accel_std_10` | 10-packet rolling std of `accel_mag` (`min_periods=2`, leading NaN filled 0). Sustained-vibration / bearing-wear proxy. |
 
 ---
 

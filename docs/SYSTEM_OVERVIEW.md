@@ -234,8 +234,8 @@ present any as measured ground truth.
 10. **FL round trigger.** `fl-trigger` polls InfluxDB and launches `flwr run .`
     when ≥ `FL_MIN_FIT_CLIENTS` gateways are ready (`server/compose.yaml:95-121`).
 11. **Local training.** `ai-worker` (`client.py`) loads the most recent
-    `MAX_PARQUET_FILES` (default 20), labels anomalies (IsolationForest or
-    1D-CNN-AE), trains XGBoost; `AlumetProfiler` writes 10 Hz `fl_energy` and
+    `MAX_PARQUET_FILES` (default 20), labels anomalies (1D-CNN autoencoder by
+    default, IsolationForest as fallback), trains XGBoost; `AlumetProfiler` writes 10 Hz `fl_energy` and
     per-phase `fl_phases` during the fit (`docs/architecture.md` §Energy profiling).
 12. **Aggregation.** Server `XGBoostStrategy.aggregate_fit` (`server.py:209-268`)
     decodes booster bytes, merges via `_merge_boosters` tree-set union
@@ -312,7 +312,7 @@ Grafana (Flux queries, docs/ANALYTICS.md §4)   +   server.py reads fl_phases �
 | Choice | Why (rationale, not math) |
 |---|---|
 | **XGBoost** | Vibration features are tabular and small per gateway; XGBoost is interpretable, fast, GPU-capable, and cheap to train — fits the energy-aware goal far better than a deep net (ADR-005). Uses all numeric Parquet columns as features (`docs/parquet_schema.md` is stale on this — see audit). |
-| **1D-CNN autoencoder** | Optional anomaly labeller for MOVING windows (`anomaly_cnn.py`). Bearing/ride faults are local frequency content, not long-range sequences, so a small conv autoencoder (~6 K params) beats the retired LSTM on Jetson CPU (`anomaly_cnn.py:1-13`). Falls back to IsolationForest below `CNN_MIN_MOVING_SAMPLES=200`. |
+| **1D-CNN autoencoder** | **Default** anomaly labeller for MOVING windows (`anomaly_cnn.py`, `ANOMALY_MODEL=cnn_autoencoder`). Bearing/ride faults are local frequency content, not long-range sequences, so a small conv autoencoder (~6 K params) beats the retired LSTM on Jetson CPU (`anomaly_cnn.py:1-13`). Falls back to IsolationForest below `CNN_MIN_MOVING_SAMPLES=200` or if torch is unavailable. |
 | **Welford freeze** | Per-batch normalization leaks across FL rounds and biases reconstruction error. Welford running stats are persisted (`cnn_feature_stats.npz`), updated until `CNN_FEATURE_STATS_FREEZE=10000` window-samples, then frozen so the threshold stays comparable across rounds (`anomaly_cnn.py:159-175`). |
 | **IDLE-baseline threshold** | Anomaly cut = `mean(idle_loss) + ANOMALY_K·std(idle_loss)` (`anomaly_cnn.py:257`), `K=3.0`. Using IDLE (known-good, stopped) windows as the baseline avoids the self-fulfilling "label the top X% anomalous" trap. |
 | **Tree-set union** | ADR-010 Option A: concatenate every client's trees, re-sequence IDs, validate, broadcast (`server.py:163-199`). Simple, lossless, no server-side labelled data needed. Single-gateway rounds pass through unchanged; multi-gateway end-to-end test pending. |

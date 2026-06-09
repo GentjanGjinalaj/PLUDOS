@@ -192,14 +192,13 @@ compose first, then point `INFLUXDB_URL` in `client/.env` at
 
 ## 6. Known caveats
 
-- WiFi capacity. 3 Jetsons × 2 STMs × 50 Hz MOVING = 300 packets/s on one
-  2.4 GHz channel. Not stressed yet — first stress observation lives at
-  P2-14 in `current_problems.md`.
+- WiFi capacity. Under ADR-021 the radio is off except to drain, so traffic is
+  bursty drain transfers rather than a continuous per-shuttle stream. Concurrent
+  drains from multiple shuttles on one 2.4 GHz channel are the contention case;
+  the pre-TX jitter (1–15 s) decorrelates shuttles that exit MOVING together.
+  Not stress-measured yet.
 - `client/Containerfile` still uses CPU-only `python:3.10-slim`. The
   ai-worker XGBoost fit runs on CPU until a JetPack 6 CUDA image is wired.
 - No shuttle-side energy figure. The `POWER_*_MW` gateway estimate was
   removed in the schema-v4 raw-only cull; only Jetson/server energy (Alumet)
   is instrument-grade. Add an STM32 INA219 before claiming shuttle energy.
-- `client/CLAUDE.md` and several other docs still reference the pre-ADR-015
-  CoAP architecture. They are local-only (gitignored) and need a separate
-  pass.

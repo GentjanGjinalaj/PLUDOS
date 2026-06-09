@@ -8,6 +8,15 @@ float32 sensor fields with int16 scaled integers to halve per-field wire
 cost (28 → 24 bytes despite adding 3 gyro axes). The previous CoAP CON +
 NC-UDP split was removed by ADR-015.
 
+> **ADR-021 note — no continuous stream.** The radio is now off except to
+> drain finished captures, so there is **no fixed-Hz live TX**. The
+> `PludosTelemetry` byte layout below is still current, but it is sent in
+> bursts during a drain window, not at 50 Hz / 0.1 Hz. MOVING signal itself
+> is captured into PSRAM at **accel 3332 Hz / gyro 416 Hz (≈8:1)** and
+> arrives in the separate `cap_*` drain files (see ADR-020/021 and
+> `docs/sampling_strategy.md`). `SAMPLE_PERIOD_MOVING_MS=20` (50 Hz) is the
+> internal FSM motion-poll cadence only.
+
 ---
 
 ## 1. PludosTelemetry (STM32 → Jetson, UDP 5683)
@@ -55,17 +64,15 @@ val / 10.0   # humidity (%RH)
 
 ### Sample rates
 
-| State | Sampling rate (internal) | Transmit rate (over UDP) |
+| State | Internal FSM poll | Captured data rate (to PSRAM, drained later) |
 |---|---|---|
-| `STATE_IDLE` (state=0) | 10 Hz | **0.1 Hz** (every 100th sample, `TX_PERIOD_IDLE_MS=10000`) |
-| `STATE_MOVING` (state=1) | 50 Hz target | **50 Hz target** (every sample, `SAMPLE_PERIOD_MOVING_MS=20`) |
+| `STATE_IDLE` (state=0) | 10 Hz (`SAMPLE_PERIOD_IDLE_MS=100`) | 12.5 Hz snapshot, 10 s every 10 min |
+| `STATE_MOVING` (state=1) | 50 Hz (`SAMPLE_PERIOD_MOVING_MS=20`) | accel 3332 Hz / gyro 416 Hz (≈8:1) |
 
-> **Note:** MOVING TX rate raised to 50 Hz (`SAMPLE_PERIOD_MOVING_MS=20`). Each
-> `sendto` is synchronous, so the loop self-throttles to the WiFi ceiling if the
-> radio can't sustain 50 Hz — the actual rate is whatever the link allows up to
-> 50 Hz. At 50 Hz, bandwidth per shuttle is 50 × 24 B = 1200 B/s. The on-chip
-> ISM330 LPF2 (cutoff ODR/10 ≈ 10.4 Hz) band-limits the signal below the 25 Hz
-> Nyquist of the 50 Hz stream — alias-free over the 0–10 Hz motion band.
+> **Note:** `SAMPLE_PERIOD_MOVING_MS=20` (50 Hz) is the internal motion-detection
+> poll only — **not** a TX or data rate. MOVING signal is captured into the ISM330
+> FIFO → PSRAM at accel 3332 Hz / gyro 416 Hz and drained after the run (ADR-021);
+> IDLE produces a 12.5 Hz snapshot. The radio is off except to drain.
 
 ### Field notes
 
@@ -78,10 +85,10 @@ val / 10.0   # humidity (%RH)
   packets (default 100). Converted to UTC `pd.Timestamp` at flush.
 - `state` — `0` (IDLE) or `1` (MOVING). Triggers mission-end Parquet flush
   after 30 s of IDLE following any MOVING run.
-- `accel_x/y/z` — ISM330DHCX accelerometer, ±2 g FS, ODR 104 Hz with on-chip
-  LPF2 (cutoff ODR/10 ≈ 10.4 Hz). AC content captures shuttle motion in the
-  0–10 Hz band, alias-free at the 50 Hz read rate (25 Hz Nyquist).
-  FSM uses magnitude deviation > 0.05 g² for movement detection.
+- `accel_x/y/z` — ISM330DHCX accelerometer, ±2 g FS. In the live/FSM read
+  the ODR is 104 Hz with on-chip LPF2 (cutoff ODR/10 ≈ 10.4 Hz), alias-free
+  over the 0–10 Hz motion band. (High-rate MOVING capture uses ODR 3332 Hz;
+  see ADR-021.) FSM uses magnitude deviation > 0.05 g² for movement detection.
 - `gyro_x/y/z` — ISM330DHCX gyroscope, ±250 dps FS, 8.75 mdps/LSB
   (DS13281 Table 3). `gyro_z` = yaw rate (turns/curves); `gyro_x/y` =
   torsional vibration from motor/bearing faults.

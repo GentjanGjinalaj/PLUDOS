@@ -2,7 +2,23 @@
 
 > Orientation for the whole repo. This explains the loose top-level files and
 > how the folders fit the three-tier system. Each major folder has its own
-> `OVERVIEW.md` with file-by-file detail. For agent rules, see `CLAUDE.md`.
+> `OVERVIEW.md` with file-by-file detail.
+
+## What PLUDOS is (the whole system in one paragraph)
+
+PLUDOS is a three-tier, energy-aware federated-learning system for
+predictive-maintenance monitoring of Savoye XTPS warehouse shuttles. Each
+shuttle carries an **STM32U585 board (Tier 1)** that reads its IMU, decides
+**IDLE vs MOVING** with a small state machine, and streams compact 24-byte
+telemetry over 2.4 GHz Wi-Fi — while during motion it also captures
+high-rate vibration into on-board PSRAM and drains those bursts to the
+gateway afterwards. A **Jetson Orin Nano gateway (Tier 2)** ingests that data
+over UDP, buffers it to Parquet, labels anomalies, and trains a local XGBoost
+model. A **central server (Tier 3)** runs Flower to merge every gateway's
+model into one shared model — raw data never leaves the edge — while
+InfluxDB + Grafana track energy and health. Data flows **sensor → gateway
+Parquet → local model → federated global model**, and the project measures
+the energy cost at every hop.
 
 ## The three tiers (where the real code lives)
 
@@ -34,7 +50,7 @@ Quick links to the per-folder guides:
 
 | File | Responsibility | Weight |
 |------|----------------|--------|
-| `build_pludos_dashboard.py` | **Grafana dashboard generator.** Builds the "PLUDOS System Monitor" panel layout in Python, POSTs it to Grafana's API, and writes the JSON into `server/grafana/dashboards/`. This is the **source of truth** for that dashboard — edit it, don't hand-edit the generated JSON. | Helper (run on the laptop) |
+| `build_pludos_dashboard.py` | **Grafana dashboard generator.** Builds the "PLUDOS System Monitor" panel layout in Python, POSTs it to Grafana's API, and writes the JSON into `server/grafana/dashboards/`. **Note (2026-06):** the committed JSON has since been hand-tuned and diverged from this script, so the JSON is now authoritative — re-running this would overwrite those fixes. See `server/grafana/OVERVIEW.md`. | Helper (run on the laptop) |
 
 ### Project / build config
 
@@ -47,14 +63,10 @@ Quick links to the per-folder guides:
 
 ### Human-facing docs (root)
 
-| File | What it is | Tracked in git? |
-|------|-----------|-----------------|
-| `README.md` | Project landing page: architecture, energy stack, quickstart, tech stack. | **Yes** |
-| `CHANGELOG.md` | Reverse-chronological change log, each entry mapped to an ADR or backlog item. | **Yes** |
-| `OPERATIONS.md` | Day-to-day hardware cheatsheet (SSH into Jetson, container commands). | No (local) |
-| `QUICKSTART.md` | Step-by-step simulation walkthrough for laptop-only runs. | No (local) |
-| `CLAUDE.md` | Agent instructions for this repo (the root one + per-tier copies). | No (local) |
-| `GEMINI.md` | **Parallel agent-context file for the Gemini CLI** — duplicates much of `CLAUDE.md`'s project context for a different AI tool. Likely stale relative to `CLAUDE.md`; reconcile or remove if you don't use Gemini. | No (local) |
+| File | What it is |
+|------|-----------|
+| `README.md` | Project landing page: architecture, energy stack, quickstart, tech stack. |
+| `CHANGELOG.md` | Reverse-chronological change log, each entry mapped to an ADR or backlog item. |
 
 ## Runtime directories (gitignored — data, not source)
 

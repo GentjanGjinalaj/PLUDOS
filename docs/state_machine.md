@@ -6,6 +6,13 @@ transmission rate on the STM32U585 edge node.
 **Version:** v2 (ADR-015). The previous CoAP buffer-and-flush model is
 replaced by a continuous unified UDP stream. There is no buffer.
 
+> **ADR-021 update — no continuous stream.** The radio is off during IDLE and
+> MOVING and powers on only to drain finished captures. The internal FSM poll
+> rates below (10 Hz IDLE, 50 Hz MOVING) are still current, but there is **no
+> per-sample TX**: MOVING is captured to PSRAM at accel 3332 Hz / gyro 416 Hz
+> (≈8:1) and drained after the run; IDLE drains a 12.5 Hz snapshot (10 s every
+> 10 min). See ADR-020/021.
+
 ---
 
 ## States
@@ -14,30 +21,30 @@ replaced by a continuous unified UDP stream. There is no buffer.
 
 - **Internal sampling rate:** 10 Hz (every 100 ms, `SAMPLE_PERIOD_IDLE_MS=100`) —
   needed so the FSM can detect a movement dwell at all
-- **Telemetry transmit rate:** 0.1 Hz (`TX_PERIOD_IDLE_MS=10000`) — one
-  `PludosTelemetry` UDP packet every 10 s carries accel, gyro, temp, and humidity.
-  `pressure_hpa` and `power_mw` are no longer on the wire (ADR-015 v2); shuttle
-  power/energy is not estimated on the gateway either (the `POWER_*_MW` placeholder
-  was removed in the schema-v4 raw-only cull).
+- **Telemetry:** no continuous TX. An IDLE snapshot (12.5 Hz, 10 s every 10 min)
+  is captured to PSRAM and drained to the gateway later (ADR-021). `pressure_hpa`
+  and `power_mw` are not on the wire (ADR-015 v2); shuttle power/energy is not
+  estimated on the gateway either (the `POWER_*_MW` placeholder was removed in the
+  schema-v4 raw-only cull).
 - **Entry condition:** no above-threshold accelerometer sample for **20 s**
 - **Actions on entry:** none beyond logging the transition; the next loop
-  iteration starts streaming at 0.1 Hz with `state = 0`
+  iteration continues with `state = 0`
 
 ### STATE_MOVING
 
-- **Internal sampling rate:** 50 Hz target (every 20 ms, `SAMPLE_PERIOD_MOVING_MS=20`)
-- **Telemetry transmit rate:** 50 Hz target — every sample is sent immediately;
-  the synchronous UDP `sendto` self-throttles to the WiFi ceiling if the radio
-  can't sustain 50 Hz
+- **Internal FSM poll:** 50 Hz (every 20 ms, `SAMPLE_PERIOD_MOVING_MS=20`) —
+  motion-detection cadence only, not a data or TX rate
+- **Telemetry:** no continuous TX. MOVING signal is captured into the ISM330
+  FIFO → PSRAM at accel 3332 Hz / gyro 416 Hz (≈8:1) and drained after the run
+  (ADR-021)
 - **Entry condition:** accelerometer deviation `> 0.05 g²` continuously
   for **500 ms** (with a 300 ms debounce tolerance — see below)
 - **Actions on entry:** none beyond logging the transition; the next loop
-  iteration starts streaming at 50 Hz with `state = 1`
+  iteration continues with `state = 1`
 
-> **Rate note:** MOVING runs at 50 Hz (`SAMPLE_PERIOD_MOVING_MS=20`). The ISM330
-> ODR was raised to 104 Hz with its on-chip LPF2 (cutoff ODR/10 ≈ 10.4 Hz) so the
-> 50 Hz stream is alias-free below the 25 Hz Nyquist. Whether 50 Hz is sustained
-> end-to-end depends on the (unmeasured) WiFi throughput ceiling.
+> **Rate note:** the 50 Hz `SAMPLE_PERIOD_MOVING_MS` poll only drives the FSM. The
+> data PLUDOS keeps is the high-rate PSRAM capture (accel 3332 Hz / gyro 416 Hz),
+> drained over UDP after the run — see ADR-020/021 and `docs/sampling_strategy.md`.
 
 ---
 
@@ -152,8 +159,8 @@ longer on the wire (ADR-015 v2).
 | `MOVEMENT_DEBOUNCE_MS` | `300U` | `main.c` | Tolerance for sub-threshold dips during dwell |
 | `NO_MOVEMENT_TIMEOUT_MS` | `20000U` | `main.c` | No-above-threshold duration to exit MOVING |
 | `SAMPLE_PERIOD_IDLE_MS` | `100U` | `main.c` | 10 Hz internal sampling in IDLE |
-| `SAMPLE_PERIOD_MOVING_MS` | `20U` | `main.c` | 50 Hz sampling + transmit in MOVING |
-| `TX_PERIOD_IDLE_MS` | `10000U` | `main.c` | 0.1 Hz transmit rate in IDLE |
+| `SAMPLE_PERIOD_MOVING_MS` | `20U` | `main.c` | 50 Hz FSM motion-poll in MOVING (not a TX rate) |
+| `TX_PERIOD_IDLE_MS` | `10000U` | `main.c` | legacy IDLE TX cadence — only applies while the radio is on during a drain (ADR-021) |
 | `ENV_READ_PERIOD_MS` | `500U` | `main.c` | 2 Hz env-sensor cache refresh |
 | `TELEMETRY_PORT` | `5683U` | `main.c` | Single unified UDP port |
 

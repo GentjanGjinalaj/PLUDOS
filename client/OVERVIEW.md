@@ -1,7 +1,6 @@
 # OVERVIEW — client/ (Jetson gateway)
 
-> Newcomer's map of the gateway folder. For agent rules (async discipline,
-> buffer policy, Jetson SSH workflow) see `CLAUDE.md` in this directory.
+> Newcomer's map of the gateway folder.
 
 ## Why this folder exists
 
@@ -24,17 +23,20 @@ Everything here runs in **Podman containers** defined by `compose.yaml`.
 
 | File | Responsibility | Weight |
 |------|----------------|--------|
-| `data-engine.py` | **The ingest service (~1120 lines).** An `asyncio` UDP listener on `:5683`. Unpacks each `PludosTelemetry` packet, keeps a per-shuttle in-memory buffer, computes derived columns (magnitudes, rolling vibration stats, ZUPT distance, mission/phase segmentation), and **flushes one Parquet file per shuttle** on mission-end (30 s idle after a moving run) or buffer pressure. Also broadcasts the `PLUDOS-GW:<ip>` discovery **beacon** on `:5000` so shuttles know where to send, and writes mission summaries to InfluxDB. | **Core / critical** — nothing works without this |
+| `data-engine.py` | **The ingest service (~1120 lines).** An `asyncio` UDP listener on `:5683`. Unpacks each `PludosTelemetry` packet and keeps a per-shuttle in-memory buffer. It is a **raw-only collector** — Parquet holds only non-recomputable signal (raw accel/gyro/temp/humidity, the state flag, a UTC timestamp and a packet-loss counter); all feature engineering (magnitudes, jerk, tilt, rolling windows, distance, mission segmentation) is deferred to train-time in `anomaly.py`. **Flushes one Parquet file per shuttle** on mission-end (30 s idle after a moving run) or buffer pressure. Also broadcasts the `PLUDOS-GW:<ip>` discovery **beacon** on `:5000`, runs the high-rate **drain receiver on `:5684`** (ADR-020/021 — reassembles PSRAM captures into `cap_accel_*`/`cap_gyro_*` Parquet), and writes mission summaries to InfluxDB. | **Core / critical** — nothing works without this |
 | `client.py` | **The Flower FL client (~750 lines).** Loads recent Parquet files, calls the anomaly module to get labels, trains XGBoost, and sends the booster bytes to the server each round. Contains `AlumetProfiler` (samples power during `fit()`), a gateway-readiness **heartbeat** writer, and a **standalone retrain loop** for when no central server is reachable. | **Core / critical** — this is the "AI worker" |
-| `anomaly.py` | **Anomaly label generator (IsolationForest path).** Loads Parquet, builds a 5-feature vibration view (`accel_mag`, rolling accel std, `gyro_x`, `gyro_mag`, `accel_z`), and produces the pseudo-labels XGBoost trains on. Has **no Flower dependency** — importable standalone. Backend is selected by the `ANOMALY_MODEL` env var. | Core (feeds training labels) |
-| `anomaly_cnn.py` | **Alternative anomaly labeller: a 1D-CNN autoencoder** (~6 K params, replaced an earlier LSTM). Uses 6 raw axes, **Welford running stats persisted across FL rounds**, and an IDLE-baseline reconstruction-error threshold. Selected via `ANOMALY_MODEL` instead of IsolationForest. | Core (alternative labeller) |
+| `anomaly_cnn.py` | **The default anomaly labeller: a 1D-CNN autoencoder** (~6 K params, replaced an earlier LSTM). Uses 6 raw axes, **Welford running stats persisted across FL rounds**, and an IDLE-baseline reconstruction-error threshold. This is the `ANOMALY_MODEL=cnn_autoencoder` default; it falls back to IsolationForest if torch is missing or there are too few MOVING samples. | **Core** (default labeller) |
+| `anomaly.py` | **Fallback / alternative labeller (IsolationForest path).** Loads Parquet, builds a 5-feature vibration view (`accel_mag`, rolling accel std, `gyro_x`, `gyro_mag`, `accel_z`), and produces the pseudo-labels XGBoost trains on. Also hosts `_make_anomaly_labels()`, the dispatcher that selects the active backend via `ANOMALY_MODEL`. Has **no Flower dependency** — importable standalone. | Core (feeds training labels) |
 | `__init__.py` | Marks `client/` as a Python package. | Scaffolding |
 
 > **Why two anomaly modules?** They are two interchangeable ways to generate
-> the same thing — anomaly pseudo-labels for XGBoost. `anomaly.py` is the
-> statistical IsolationForest approach; `anomaly_cnn.py` is the deep
-> reconstruction approach. The `ANOMALY_MODEL` env var picks one at runtime;
-> neither is dead code. `client.py` calls into whichever is active.
+> the same thing — anomaly pseudo-labels for the federated XGBoost classifier.
+> `anomaly_cnn.py` is the deep reconstruction approach and the **current default**;
+> `anomaly.py` is the statistical IsolationForest approach, used as the fallback
+> and a lightweight alternative. The `ANOMALY_MODEL` env var picks one at runtime;
+> neither is dead code. `client.py` calls into whichever is active. Note the
+> **federated model itself is always XGBoost** (ADR-010 tree-set union) — the CNN
+> labels its training data, it does not replace it.
 
 ## Container & dependency files
 
@@ -71,6 +73,7 @@ Subfolder with its own explainer:
 
 ```
 shuttles ──UDP :5683──► data-engine.py ──► ram_buffer/*.parquet
+        ──drain :5684──►                          (live + cap_* drain files)
         ◄─beacon :5000──┘                        │
                                                  ▼
                           anomaly.py / anomaly_cnn.py  (labels)

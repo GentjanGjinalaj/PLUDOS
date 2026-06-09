@@ -7,12 +7,12 @@ Domain terms used throughout the PLUDOS codebase and documentation.
 | Term | Definition |
 |---|---|
 | **Shuttle** | A warehouse autonomous shuttle vehicle. Each shuttle carries one STM32U585 edge node. |
-| **Edge node** | The STM32U585 board (B-U585I-IOT02A) mounted on a shuttle. Samples the ISM330DHCX IMU (104 Hz ODR, polled 50 Hz in MOVING / 10 Hz in IDLE), runs the IDLE/MOVING state machine, and streams 24-byte `PludosTelemetry` UDP packets to the gateway at 50 Hz (MOVING) or 0.1 Hz (IDLE). |
+| **Edge node** | The STM32U585 board (B-U585I-IOT02A) mounted on a shuttle. Runs the IDLE/MOVING state machine (motion poll at `SAMPLE_PERIOD_MOVING_MS=20`, i.e. 50 Hz) and **captures** the ISM330DHCX IMU into on-board PSRAM during MOVING (accel 3332 Hz / gyro 416 Hz, ≈8:1), draining each finished mission to the gateway over UDP after the run. There is no continuous live telemetry stream — the radio is off except to drain (ADR-021). |
 | **Gateway** | A Jetson Orin Nano Super Developer Kit installed in a warehouse. Receives telemetry from multiple shuttles, buffers per-shuttle, flushes to Parquet on mission end, runs Flower FL client. One gateway per warehouse; designed to handle ≥ 100 shuttles. |
 | **Central server** | Laptop (development) or dedicated server (production). Runs Flower ServerApp, InfluxDB, and Grafana. Aggregates FL models from all gateways. |
 | **Mission** | One shuttle movement cycle: from the first STATE_MOVING packet until the gateway detects ≥ 30 s of STATE_IDLE after any MOVING run (`MISSION_END_IDLE_S`). A single Parquet file is written per completed mission. |
-| **STATE_IDLE** | STM32 operating mode. Internal sampling: 10 Hz (for FSM responsiveness). Telemetry TX rate: **0.1 Hz** (one packet every 10 s). Shuttle is stationary. |
-| **STATE_MOVING** | STM32 operating mode. Internal sampling and TX rate: **10 Hz** (every sample sent immediately). Shuttle is in motion. |
+| **STATE_IDLE** | STM32 operating mode — shuttle stationary. The radio is off; the node takes a **12.5 Hz IMU snapshot** (10 s every 10 min) into PSRAM and drains it to the gateway (ADR-021). No continuous live TX. |
+| **STATE_MOVING** | STM32 operating mode — shuttle in motion. IMU is captured into PSRAM at **accel 3332 Hz / gyro 416 Hz (≈8:1)** and drained after the run; the radio stays off during motion (ADR-021). `SAMPLE_PERIOD_MOVING_MS=20` (50 Hz) is the internal FSM motion-poll cadence, not a data rate. |
 | **PludosTelemetry** | The 24-byte packed binary struct sent as raw UDP from STM32 to gateway (port 5683). Contains shuttle_id, sequence_id, tick_ms, state, accel xyz, gyro xyz, temp_c, humidity_pct. See `wire_protocol.md §1`. Protocol version v3 (ADR-016). |
 | **FL round** | One Flower federated learning round: server signals all clients to train locally, clients return model updates, server aggregates. PLUDOS currently runs 3 rounds. |
 | **AlumetProfiler** | Python class in `client.py` that measures energy consumption during FL training. Phase 1 done: reads `tegrastats` for real Jetson power rails. Phase 2 scaffolded: INA3221 via Alumet relay sidecar. See ADR-011. |

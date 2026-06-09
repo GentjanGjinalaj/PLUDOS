@@ -1,7 +1,6 @@
 # OVERVIEW — STM_Shuttles/PLUDOS_Edge_Node (STM32 firmware)
 
-> Newcomer's map of the firmware folder. For agent rules (CubeMX boundaries,
-> commenting, build) see `CLAUDE.md` in this directory. For byte layouts see
+> Newcomer's map of the firmware folder. For byte layouts see
 > `docs/wire_protocol.md`; for the motion FSM see `docs/state_machine.md`.
 
 ## Why this folder exists
@@ -16,6 +15,10 @@ each Savoye XTPS shuttle. The firmware:
 3. packs each reading into a fixed 24-byte telemetry packet, and
 4. streams those packets over 2.4 GHz Wi-Fi (raw UDP) to the Jetson gateway
    that "adopted" it via a discovery beacon.
+5. during a MOVING run, additionally **captures high-rate IMU into on-board
+   PSRAM** (accel 3332 Hz + gyro 416 Hz batched in the ISM330 FIFO) and
+   **drains** each sealed mission, plus periodic 10-min IDLE snapshots, to the
+   gateway over a separate UDP port once the run ends (ADR-020/021).
 
 It is a CubeMX-generated **STM32CubeIDE** project for the B-U585I-IOT02A
 (STM32U585, Cortex-M33, bare-metal C, HAL drivers, no RTOS). Most of the tree
@@ -27,16 +30,15 @@ These are hand-written (or hand-extended) — this is where the project lives.
 
 | File | Responsibility | Weight |
 |------|----------------|--------|
-| `Core/Src/main.c` | **The whole application.** ~1860 lines. Holds the IDLE/MOVING state machine, the ISM330DHCX IMU read path (accel + gyro), the 24-byte `PludosTelemetry_t` packer, the boot-time **beacon discovery** that finds the gateway's IP, the UDP transmit loop, and sequence/timestamp bookkeeping. PLUDOS code lives inside the `USER CODE BEGIN/END` guards; everything between them is ours, everything outside is CubeMX's. | **Core / critical** — this is the firmware |
+| `Core/Src/main.c` | **The whole application.** ~1900 lines. Holds the IDLE/MOVING state machine, the ISM330DHCX IMU read path (accel + gyro), the 24-byte `PludosTelemetry_t` packer, the boot-time **beacon discovery** that finds the gateway's IP, the live UDP transmit loop, and sequence/timestamp bookkeeping. Also the **high-rate capture/drain path** (ADR-020/021): batches MOVING IMU into the ISM330 FIFO → PSRAM, then drains sealed missions and 10-min IDLE snapshots over UDP, stamping each `DrainBegin` with `t0_tick` and `tx_tick` so the gateway can recover capture time. A boot **reset-cause report** (`[BOOT] reset cause: …`) logs why the MCU last reset, and a **pre-TX jitter** (random 1–15 s before powering the radio for a drain) decorrelates shuttles that exit MOVING together so they don't collide on the shared 2.4 GHz channel. PLUDOS code lives inside the `USER CODE BEGIN/END` guards. | **Core / critical** — this is the firmware |
 | `Core/Src/sensors.c` | Hand-written I²C drivers for **HTS221** (temperature + humidity) and **LPS22HH** (pressure). Probes the chip, reads factory calibration, returns engineering units. Called from `main.c` to fill the environmental fields of the telemetry packet. | Core (secondary sensors) |
 | `Core/Inc/sensors.h` | Public prototypes for the `sensors.c` drivers. | Helper (header) |
 | `Core/Src/cJSON.c`, `Core/Inc/cJSON.h` | Vendored JSON library. **Grandfathered** for dev/debug paths only (it uses `malloc`, which the project otherwise bans). Not on the hot telemetry path — that path is the binary 24-byte struct, not JSON. | Helper / legacy |
 
-> **Surprise worth knowing:** the folder `CLAUDE.md` says "ISM330 currently
-> used" and lists the other sensors as unused. That is now out of date —
-> `sensors.c` actively drives the **HTS221 and LPS22HH** as well, and `main.c`
-> caches their readings into the telemetry packet. If you extend the doc set,
-> reconcile this.
+> **Worth knowing:** three sensors are live, not just the IMU — `sensors.c`
+> actively drives the **HTS221** (temp + humidity) and **LPS22HH** (pressure)
+> alongside the **ISM330DHCX**, and `main.c` caches their readings into the
+> telemetry packet.
 
 ## Configuration headers (`Core/Inc/`)
 
@@ -96,11 +98,10 @@ directly will be overwritten on the next regeneration.
 sensors.c (HTS221, LPS22HH)  ─┐
 ISM330 read path (in main.c) ─┼─► main.c FSM (IDLE/MOVING)
                               │      │
-                              │      ▼
-                              │   PludosTelemetry_t (24 B, packed)
+                              │      ├─► PludosTelemetry_t (24 B) ─► UDP :5683 ─► Jetson
                               │      │
-                              └──────┴─► UDP :5683 ──► Jetson gateway (client/)
-boot: BEACON_Run() listens :5000 for "PLUDOS-GW:<ip>" to learn where to send ──┘
+                              └──────┴─► PSRAM capture FIFO ─► drain ─► UDP :5684 ─► Jetson
+boot: BEACON_Run() listens :5000 for "PLUDOS-GW:<ip>" to learn where to send
 ```
 
 The 24-byte packet layout is the contract with `client/data-engine.py` on the

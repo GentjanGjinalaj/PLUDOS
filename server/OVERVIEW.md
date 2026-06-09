@@ -1,7 +1,6 @@
 # OVERVIEW — server/ (central server)
 
-> Newcomer's map of the central-server folder. For agent rules (FL aggregation,
-> credentials, run commands) see `CLAUDE.md` in this directory. ADR-010
+> Newcomer's map of the central-server folder. ADR-010
 > (aggregation) and ADR-011 (energy) in `docs/decisions.md` give the "why".
 
 ## Why this folder exists
@@ -33,7 +32,7 @@ Four containers, started with `podman-compose up` from this folder:
 
 | Service | Image | Role |
 |---------|-------|------|
-| `influxdb` | InfluxDB 2.7 (`:8086`) | Time-series store for `fl_energy`, `fl_phases`, `stm_mission`, `gw_status`. Its healthcheck gates the others so they don't start before the bucket exists. |
+| `influxdb` | InfluxDB 2.7 (`:8086`) | Time-series store for `fl_energy`, `fl_phases`, `fl_train_metrics`, `stm_mission`, `stm_idle_wave`, `gw_status`, and the Jetson power streams (`input_current`, `input_voltage`). Its healthcheck gates the others so they don't start before the bucket exists. |
 | `grafana` | Grafana 10 (`:3000`) | Dashboards over InfluxDB. Provisioned as code from `grafana/` (anonymous viewer access on by default). |
 | `alumet` | built from `alumet/` | Server-side energy profiler — RAPL for the server's own CPU, plus a gRPC relay-server that receives Jetson power streams (ADR-011). |
 | `fl-trigger` | built from `trigger/` | Watches InfluxDB and launches `flwr run .` automatically when enough gateways are ready — no manual operator step. |

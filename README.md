@@ -15,7 +15,7 @@ PLUDOS (**P**ower-aware **L**ightweight **U**DP **D**ata **O**rchestration **S**
 
 - **Computational Frugality:** Minimizing the energy footprint of the monitoring system itself, so the act of monitoring is as close to "free" as possible.
 - **Modular Scalability:** Rapid deployment across diverse industrial hardware, from ultra-low-power microcontrollers to edge AI accelerators.
-- **High-Granularity Telemetry:** Real-time vibration and power analysis using lightweight, event-driven transport (raw UDP, with CoAP reserved for critical messages).
+- **High-Granularity Telemetry:** High-rate vibration capture (accel 3332 Hz / gyro 416 Hz) buffered on-shuttle, then drained over raw UDP when a run ends — the radio stays off during motion to save energy (ADR-021).
 
 ---
 
@@ -51,16 +51,16 @@ PLUDOS (**P**ower-aware **L**ightweight **U**DP **D**ata **O**rchestration **S**
 - **Hardware:** STM32U585AII6Q on B-U585I-IOT02A (Cortex-M33 @ 160 MHz, TrustZone non-secure)
 - **Runtime:** bare-metal C, HAL drivers, **no RTOS**
 - **Sensor pipeline:** ISM330DHCX 6-axis IMU (accel + gyro), HTS221 temperature/humidity, LPS22HH pressure
-- **State machine:** IDLE (0.1 Hz TX / 10 Hz internal sampling) / MOVING (50 Hz TX) FSM, entered on a vibration threshold
-- **Transport:** 24-byte `PludosTelemetry` raw UDP to port 5683, fire-and-forget (ADR-015 / ADR-016)
+- **State machine:** IDLE / MOVING FSM, entered on a vibration threshold. A 50 Hz internal poll only *detects* motion; it is not a data rate.
+- **Capture-and-drain (ADR-021):** during a run the IMU streams into a PSRAM ring buffer (accel 3332 Hz / gyro 416 Hz ≈ 8:1); IDLE takes a short 12.5 Hz snapshot every 10 min. The radio is **off** during motion and powers on only to drain the finished capture over UDP to port 5684. A 1–15 s pre-TX jitter decorrelates shuttles that stop together.
 - **Zero-touch provisioning:** auto-discovers the gateway IP via a UDP beacon on port 5000
 
 ### Layer 2 — Edge Gateway (Jetson Orin Nano)
 
-- **`data-engine`:** asyncio UDP server — receives, NTP-anchors timestamps, buffers per-shuttle, computes derived columns (vibration stats, ZUPT distance, mission/phase segmentation), and flushes to Parquet on mission-end or buffer pressure
-- **`ai-worker`:** Flower client — loads Parquet, generates anomaly labels (IsolationForest or 1D-CNN autoencoder, selectable), trains XGBoost (**CPU by default**; auto-detects GPU and falls back to CPU), streams per-phase energy to InfluxDB
+- **`data-engine`:** asyncio UDP server — receives the live stream and the high-rate drain (port 5684), anchors timestamps, buffers per-shuttle, and flushes to Parquet on mission-end or buffer pressure. It is a **raw-only collector**: Parquet holds only non-recomputable signal (raw accel/gyro/temp/humidity, the state flag, a UTC timestamp, a packet-loss counter). All feature engineering (magnitudes, jerk, tilt, rolling windows, segmentation) is deferred to train-time in the anomaly module
+- **`ai-worker`:** Flower client — loads Parquet, generates anomaly labels (**1D-CNN autoencoder by default**, falls back to IsolationForest when torch is missing or there are too few MOVING samples), trains XGBoost (**CPU by default**; auto-detects GPU and falls back to CPU), streams per-phase energy to InfluxDB
 - **`alumet-relay`:** sidecar container — reads INA3221 hardware power rails via Alumet (ADR-011 Phase 2); runs in all profiles, with a healthcheck that gates `ai-worker`
-- **Buffer policy:** per-shuttle 1000-packet soft limit / 1500-packet hard limit, 50 000-packet gateway ceiling (multi-shuttle aware)
+- **Buffer policy:** per-shuttle 3000-packet soft limit / 4500-packet hard limit, 100 000-packet gateway ceiling (multi-shuttle aware)
 - **Deployment profiles** (`PLUDOS_MODE`): `federated` (joins the central server over Tailscale), `standalone` (local InfluxDB + Grafana, no server), `headless` (ingest only)
 - **Storage:** host bind-mount `ram_buffer/` for low-wear Parquet buffering; PyArrow columnar serialization
 
@@ -82,9 +82,14 @@ PLUDOS instruments energy at several levels:
 
 | Measurement | Source | Granularity |
 |---|---|---|
-| `stm_mission` | Gateway-derived (state × `POWER_IDLE/MOVING_MW` × elapsed_s) | Per shuttle, per mission |
 | `fl_energy` | Jetson INA3221 via Alumet relay (tegrastats fallback) | ~10 Hz during FL rounds |
 | `fl_phases` | Derived from `fl_energy` (load / train / round_total) | Per FL phase |
+| `stm_mission` | Gateway activity summary (packet count + duration) | Per shuttle, per mission |
+
+> **Note:** instrument-grade energy is measured only on the Jetson/server (Alumet).
+> The shuttle-side `POWER_*_MW` estimate was removed in the schema-v4 raw-only cull;
+> `stm_mission` now records activity metadata (packets, duration), not energy. Add an
+> STM32 INA219 before claiming shuttle-side energy figures.
 
 ---
 
@@ -126,14 +131,66 @@ and the federation notes in `pyproject.toml`.
 
 ---
 
+## 🧩 Modularity & Deployment Modes
+
+PLUDOS is built so each tier can run **independently**. You do **not** need a
+central server to collect data or detect anomalies — a single Jetson is a
+complete monitoring node on its own. One `compose.yaml` serves all three modes
+via the `PLUDOS_MODE` env var:
+
+| Mode | Server needed? | What runs | Use it when |
+|---|---|---|---|
+| `headless` | No | `data-engine` + `alumet-relay` only | You just want to **collect** raw Parquet — no AI, no dashboards |
+| `standalone` | **No** | adds `ai-worker` + **local** InfluxDB + Grafana | One self-contained Jetson: ingests, retrains XGBoost locally every `STANDALONE_RETRAIN_INTERVAL_S`, and shows its own Grafana — fully offline |
+| `federated` | Yes | adds Tailscale + joins the central Flower server | Multiple gateways pool their models via federated learning |
+
+**Run a single Jetson with no server (standalone):**
+
+```bash
+cd client
+cp .env.example .env          # set JETSON_HOSTNAME + SHUTTLE_GROUP
+PLUDOS_MODE=standalone podman-compose --profile standalone up -d
+# Grafana → http://<jetson-ip>:3000   (local InfluxDB, no central server)
+```
+
+In standalone mode `ai-worker` writes the latest model to
+`client/ram_buffer/model/latest.ubj`. Switching a node to `federated` later is a
+profile change only — the data already on disk is reused. Each tier talks to the
+next **only through files / UDP**, never direct calls, so any tier can be
+swapped, restarted, or run alone without breaking the others.
+
+---
+
+## 🩹 Troubleshooting (if X → do Y)
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| STM UART shows no `[BEACON] Gateway found` | `data-engine` not running, or STM not on the gateway's WiFi subnet | Start `data-engine` (`podman-compose up -d data-engine`); confirm both on the same 2.4 GHz network |
+| STM logs `Ignored beacon (different group)` | The STM's `SHUTTLE_ID` is not in that Jetson's `SHUTTLE_GROUP` | Expected in multi-Jetson rigs — only the paired Jetson should bond. Fix `SHUTTLE_GROUP` in `.env` if pairing is wrong |
+| No Parquet files in `ram_buffer/` | No mission completed yet (needs ≥ 30 s IDLE after a MOVING run), or wrong `TEST_MODE` | Wait for a full mission cycle; set `TEST_MODE=1` for local `./ram_buffer`, `0` inside the container |
+| Grafana shows "No data" | Stale container missing provisioning bind-mounts, or wrong `INFLUXDB_URL` | Recreate the stack (`podman compose down && up -d`); verify `INFLUXDB_URL`/`INFLUXDB_TOKEN` match between `client/.env` and `server/.env` |
+| FL round never starts | Server waiting for `FL_MIN_FIT_CLIENTS` gateways to connect | Lower `FL_MIN_FIT_CLIENTS`, or bring the missing Jetsons online (`--profile vpn`) |
+| `ai-worker` falls back to IsolationForest | torch missing, or fewer than `CNN_MIN_MOVING_SAMPLES` (200) MOVING samples | Expected fallback — collect more MOVING data, or confirm torch is in the image |
+| CNN feature stats reset on restart | `/app/state` not persisted (Welford running stats lost) | Bind-mount or named-volume `STATE_DIR=/app/state` so stats survive container restarts |
+| InfluxDB write errors in simulation | No server running locally | Harmless — writes fail gracefully in sim mode; ignore, or start `server/` compose |
+
+**Common deploy loop (Jetson):**
+
+```bash
+ssh <jetson> "cd ~/PLUDOS && git pull && cd client && podman-compose up --build -d data-engine"
+ssh <jetson> "podman logs -f pludos-data-engine | head -20"
+```
+
+---
+
 ## 🛠️ Tech Stack
 
 | Component | Technology |
 |---|---|
 | Firmware | C / STM32CubeIDE / HAL, bare-metal (no RTOS) |
-| Transport | raw UDP (telemetry), CoAP RFC 7252 (`aiocoap`, critical messages) |
+| Transport | raw UDP — live stream (:5683) + high-rate capture drain (:5684), fire-and-forget (ADR-015 / ADR-021) |
 | Edge runtime | Python async/await, Podman containers |
-| AI/ML | Flower (federated learning), XGBoost, IsolationForest / 1D-CNN autoencoder |
+| AI/ML | Flower (federated learning), XGBoost (federated model), 1D-CNN autoencoder labeller (default) / IsolationForest (fallback) |
 | Energy monitoring | Alumet (UGA/LIG), INA3221 / RAPL / tegrastats, Prometheus |
 | Storage | Apache Parquet (PyArrow), InfluxDB 2.7, Grafana |
 | Networking | Tailscale VPN overlay (gateway ↔ server) |

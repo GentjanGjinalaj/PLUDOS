@@ -895,8 +895,8 @@ Rebuild and reflash after changes:
 Gateway runtime tuning — takes effect on container restart, no image rebuild:
 
 ```bash
-# Per-shuttle buffer pressure (in packets). At 50 Hz MOVING: SOFT=3000 ≈ 1 min,
-# HARD=4500 ≈ 1.5 min. Gateway-wide ceiling is a safety valve across all shuttles.
+# Per-shuttle buffer pressure (in packets). SOFT=3000 / HARD=4500 packets trigger
+# an intermediate flush; the gateway-wide ceiling is a safety valve across all shuttles.
 SHUTTLE_SOFT_LIMIT=3000
 SHUTTLE_HARD_LIMIT=4500
 GATEWAY_HARD_LIMIT=100000

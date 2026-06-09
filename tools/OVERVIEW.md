@@ -45,11 +45,13 @@ mock_stm32.py  (TELEMETRY_FMT = "<BHIBhhhhhhhh", 24 B — this file)
 data-engine.py (_unpack_telemetry)
 ```
 
-The script even `assert`s the packet is 24 bytes and mirrors the firmware's TX
-cadence (50 Hz MOVING, 0.1 Hz IDLE) and int16 scaling. If you change the packet
-in `main.c`, you must update this mock too, or your laptop tests will silently
-diverge from real hardware. `docs/wire_protocol.md §1` is the spec all three
-follow.
+The script even `assert`s the packet is 24 bytes and emits a continuous live
+stream (50 Hz MOVING, 0.1 Hz IDLE) to exercise the gateway's `:5683` path on a
+laptop. Note this is a **test-harness convenience**: real firmware no longer
+streams continuously (ADR-021 capture-and-drain). The 24-byte `PludosTelemetry`
+layout and int16 scaling still match — if you change the packet in `main.c`, you
+must update this mock too, or your laptop tests will silently diverge from real
+hardware. `docs/wire_protocol.md §1` is the spec all three follow.
 
 > Note: a second small listener, `STM_Shuttles/PLUDOS_Edge_Node/tools/coap_udp_monitor.py`,
 > lives in the firmware tree — that one *receives* and prints packets, whereas

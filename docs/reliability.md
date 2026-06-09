@@ -4,11 +4,18 @@ Quantifies expected packet loss at each tier of the PLUDOS telemetry path and
 defines the per-shuttle SLO. Numbers marked **estimated** lack hardware measurement;
 those marked **design** follow from the protocol choice.
 
+> **ADR-021 note.** This budget was written for the continuous live UDP stream,
+> which is now **removed** — the radio is off except to drain finished captures.
+> The per-hop *loss mechanisms* below still apply, but the packet rates and the
+> "× 50 Hz" wall-time figures describe the superseded stream. Drain-path loss
+> (bursty UDP on `:5684`, no ARQ yet) is not yet quantified — treat the numbers
+> here as the legacy-stream model until the drain budget is measured.
+
 ---
 
 ## 1 — Loss points (by hop)
 
-### 1.1 STM32 → Jetson (UDP, 50 Hz MOVING)
+### 1.1 STM32 → Jetson (UDP)
 
 | Source | Loss mode | Expected rate |
 |--------|-----------|---------------|

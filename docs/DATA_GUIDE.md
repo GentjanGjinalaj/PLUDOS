@@ -17,36 +17,43 @@ collector and lets the modelling side decide what features it wants.
 ## 1. How data flows into Parquet
 
 ```
-STM32 firmware (50 Hz MOVING / 0.1 Hz IDLE)
-  │  24-byte UDP packet
+STM32 firmware  (radio off except to drain — ADR-021)
+  │  24-byte UDP packets, sent in bursts during a drain window
   ▼
 data-engine.py  (Jetson)
   ├── in-memory per-shuttle buffer
-  ├── on mission-end (30 s IDLE after MOVING): flush → Parquet
+  ├── on mission-end (30 s IDLE after MOVING): flush → mission_*.parquet
   ├── on time cap (BUFFER_MAX_AGE_S, default 300 s): force-flush
   └── on buffer pressure (soft/hard limit): intermediate flush
 ```
+
+> **ADR-021:** the high-rate MOVING vibration (accel 3332 Hz / gyro 416 Hz, ≈8:1)
+> and the 12.5 Hz IDLE snapshots are drained separately and land in `cap_accel_*`
+> / `cap_gyro_*` files, **not** the `mission_*.parquet` described here. This guide
+> documents the `PludosTelemetry` (`mission_*`) schema; for the drain capture see
+> ADR-020/021 and `docs/sampling_strategy.md`.
 
 One Parquet file = one flush for one shuttle.
 Files are named `mission_s{id}_{unix_ms}.parquet`.
 
 A single physical mission can produce multiple files if the buffer fills
-mid-mission (soft limit 3 000 packets ≈ 5 min at 10 Hz). Always sort files
-by the timestamp in the filename and concatenate before analysis.
+mid-mission (soft limit 3 000 packets). Always sort files by the timestamp in
+the filename and concatenate before analysis.
 
 ---
 
 ## 2. Sampling rates
 
-| State    | STM32 sensor loop | TX rate to Jetson   |
-|----------|-------------------|---------------------|
-| IDLE     | 10 Hz             | **0.1 Hz** (1 pkt/10 s) |
-| MOVING   | 50 Hz             | **50 Hz** (every sample, WiFi-capped) |
+| State    | Internal FSM poll | Captured data rate (to PSRAM, drained later) |
+|----------|-------------------|----------------------------------------------|
+| IDLE     | 10 Hz (`SAMPLE_PERIOD_IDLE_MS`)   | 12.5 Hz snapshot, 10 s every 10 min |
+| MOVING   | 50 Hz (`SAMPLE_PERIOD_MOVING_MS`) | accel 3332 Hz / gyro 416 Hz (≈8:1) |
 
-The firmware samples at 10 Hz internally in IDLE and 50 Hz in MOVING. Movement
-detection uses a 500 ms dwell window (5 consecutive above-threshold samples at
-the 10 Hz IDLE rate). The shuttle transitions to MOVING within 500 ms regardless
-of the 0.1 Hz IDLE TX rate.
+The firmware polls the IMU at 10 Hz in IDLE / 50 Hz in MOVING purely to run the
+motion FSM (entry uses a 500 ms dwell = 5 consecutive above-threshold samples at
+the 10 Hz IDLE poll). Those poll rates are **not** data or TX rates: the signal
+PLUDOS keeps is the high-rate PSRAM capture, drained over UDP after each run
+(ADR-021).
 
 ---
 
@@ -64,7 +71,7 @@ that fits.
 | `shuttle_id` | int8 | — | 1-based integer. Set at firmware build time via `SHUTTLE_ID` in `wifi_credentials.h`. Maps to a human label via the `SHUTTLE_NAMES` env var (default: `shuttle-N`). |
 | `seq` | int32 | — | Monotonic packet counter. The wire value is uint16 (wraps at 65 535); the gateway unwraps it into a globally unique sort key. **Always use `seq` for ordering**, never `timestamp`. |
 | `seq_gap` | int16 | packets | `seq[i] − seq[i−1] − 1`. Zero means no loss. Non-zero values cluster at WiFi dead zones (metal shelving, elevator shaft entry). Position-correlated signal — useful ML feature for identifying where on the route a failure occurred. First row in each file is always 0. |
-| `state` | int8 | — | `0` = IDLE (stopped, 0.1 Hz TX). `1` = MOVING (in transit, 50 Hz TX). Derived from the STM32 FSM — see `docs/state_machine.md`. |
+| `state` | int8 | — | `0` = IDLE (stopped). `1` = MOVING (in transit). Derived from the STM32 FSM — see `docs/state_machine.md`. |
 
 ### 3.2 Accelerometer (ISM330DHCX, ±2 g full scale)
 
@@ -117,7 +124,7 @@ use them.
 |---|---|---|
 | `accel_mag` | √(accel_x² + accel_y² + accel_z²) | Total acceleration magnitude; ≈ 1.0 g at rest. Deviations > 1.05 g indicate dynamic motion. |
 | `gyro_mag` | √(gyro_x² + gyro_y² + gyro_z²) | Aggregate rotation rate magnitude. |
-| `rolling_accel_std_10` | 10-packet rolling std of `accel_mag` (`min_periods=2`, leading NaN → 0) | 0.2 s window at 50 Hz MOVING. Primary surface-roughness / bearing-wear proxy — high std = high vibration variance. |
+| `rolling_accel_std_10` | 10-packet rolling std of `accel_mag` (`min_periods=2`, leading NaN → 0) | 10-packet window. Primary surface-roughness / bearing-wear proxy — high std = high vibration variance. |
 
 Other features that earlier schema versions stored (`accel_jerk`,
 `horizontal_accel`, `tilt_angle_deg`, `gyro_jerk`, `rolling_accel_mean_10`)
@@ -187,8 +194,8 @@ print(moving[["seq", "accel_mag", "accel_z", "seq_gap"]].describe())
 
 ```
 seq_gap > 0             → packet dropped here (WiFi dead zone at this route position)
-state = 0               → shuttle stopped; expect 0.1 Hz data rate
-state = 1               → shuttle moving; expect 50 Hz data rate
+state = 0               → shuttle stopped (IDLE)
+state = 1               → shuttle moving (MOVING)
 accel_z ≈ 1.0           → upright on flat surface (normal)
 accel_z ≠ 1.0           → tilt or vertical shock
 gyro_x/y AC noise       → bearing or motor fault vibration

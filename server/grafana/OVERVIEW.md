@@ -19,15 +19,17 @@ The `grafana` service in `server/compose.yaml` mounts this folder read-only.
 |------|----------------|--------|
 | `provisioning/datasources/influxdb.yaml` | Tells Grafana, on boot, to wire up the **InfluxDB datasource** (Flux query language, org `pludos`, bucket `alumet_energy`, token from `.env`). Fixed `uid` so dashboards can reference it. | Core (without it, panels have no data source) |
 | `provisioning/dashboards/pludos.yaml` | A **file provider** that tells Grafana to load every dashboard JSON it finds under `/dashboards` and re-scan every 30 s. | Core (loader) |
-| `dashboards/pludos_system_monitor.json` | The actual **"PLUDOS System Monitor" dashboard** (~1480 lines of generated JSON): energy, mission, and phase panels. | Core artifact — but **generated, don't hand-edit** (see below) |
+| `dashboards/pludos_system_monitor.json` | The actual **"PLUDOS System Monitor" dashboard** (~680 lines, recently rewritten): live-status KPIs, environment, drain quality/packet-loss, vibration, idle waveforms, Jetson power, federated-learning, and mission-history panels. | Core artifact — now **hand-tuned and authoritative** (see the 2026-06 note below) |
 
-## Important: who generates the dashboard JSON
+## Who generates the dashboard JSON (history + current state)
 
-`dashboards/pludos_system_monitor.json` is **not meant to be edited by hand.**
-It is produced by the repo-root script **`build_pludos_dashboard.py`**, which
-builds the panel layout in Python, POSTs it live to Grafana's API, *and* writes
-the JSON back into this folder. The provisioning loader then serves that file
-on the next container start.
+`dashboards/pludos_system_monitor.json` was **originally** produced by the
+repo-root script **`build_pludos_dashboard.py`**, which builds the panel
+layout in Python, POSTs it live to Grafana's API, *and* writes the JSON back
+into this folder. The provisioning loader then serves that file on the next
+container start. **As of 2026-06 the committed JSON has diverged from the
+script and is now the authoritative copy** — see the note at the end of this
+file before re-running the generator.
 
 ```
 build_pludos_dashboard.py  (source of truth, run on the laptop)
@@ -39,10 +41,10 @@ server/grafana/dashboards/pludos_system_monitor.json
 provisioning/dashboards/pludos.yaml  ──► Grafana panels
 ```
 
-**To change a panel:** edit `build_pludos_dashboard.py` and re-run it, or edit
-in the Grafana UI and re-export through the script. Editing the JSON directly
-works until the next regeneration overwrites it — so treat the script as
-authoritative.
+**To change a panel (current reality):** edit the committed JSON directly (or
+export from the Grafana UI), since it now carries fixes the script lacks.
+Re-running `build_pludos_dashboard.py` would overwrite those fixes with the
+older panel set — only do that after porting the changes back into the script.
 
 ## Dashboard rows at a glance (slide caption)
 

@@ -35,7 +35,9 @@ BUFFER_DIR = os.getenv("BUFFER_DIR", "./ram_buffer" if TEST_MODE else "/app/ram_
 MAX_PARQUET_FILES = int(os.getenv("MAX_PARQUET_FILES", "20"))
 
 # Anomaly model selector — controls pseudo-label generation for XGBoost training.
-ANOMALY_MODEL = os.getenv("ANOMALY_MODEL", "isolation_forest_xgb")
+# Default is the 1D-CNN autoencoder; it falls back to IsolationForest when torch
+# is unavailable or there are too few MOVING samples (see _make_anomaly_labels).
+ANOMALY_MODEL = os.getenv("ANOMALY_MODEL", "cnn_autoencoder")
 
 # Faults on these shuttles are rare — keep the assumed anomaly fraction low so
 # IsolationForest does not over-flag normal MOVING vibration. Tune via env.
@@ -155,8 +157,8 @@ def _make_anomaly_labels(df_clean: pd.DataFrame) -> tuple[np.ndarray, str]:
     """
     Dispatch to the active anomaly labelling backend (ANOMALY_MODEL env var).
 
-    cnn_autoencoder      — 1D-CNN reconstruction error (T3.3); falls back to IF
-    isolation_forest_xgb — per-sample IsolationForest (default)
+    cnn_autoencoder      — 1D-CNN reconstruction error (T3.3, default); falls back to IF
+    isolation_forest_xgb — per-sample IsolationForest
     threshold            — legacy accel_z > ANOMALY_THRESHOLD_G rule
     """
     if ANOMALY_MODEL == "cnn_autoencoder":
