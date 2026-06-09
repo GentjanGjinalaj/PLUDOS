@@ -132,7 +132,7 @@ def make_anomaly_labels_cnn(
         import torch
         import torch.nn as nn
     except ImportError:
-        logger.error("[CNN] torch not installed — falling back to IsolationForest")
+        logger.warning("[CNN] torch not installed — falling back to IsolationForest")
         return if_fallback_fn(df_clean)
 
     moving_mask = df_clean["state"].astype(int) == 1

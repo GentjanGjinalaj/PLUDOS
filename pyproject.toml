@@ -15,6 +15,14 @@ dependencies = [
     "influxdb-client",
 ]
 
+# Optional: the CNN-autoencoder labeller (default ANOMALY_MODEL) needs torch.
+# The server only aggregates XGBoost trees and never runs the CNN, so torch is
+# kept out of the base install. Install with `pip install -e ".[cnn]"` to
+# exercise the CNN default in local simulation; otherwise sim falls back to
+# IsolationForest. The Jetson image already bundles torch (client/requirements.txt).
+[project.optional-dependencies]
+cnn = ["torch>=2.0"]
+
 [tool.flwr.app]
 publisher = "ggjinalaj"
 

@@ -105,7 +105,8 @@ git clone <repo-url>
 cd PLUDOS
 python -m venv pludos_venv
 source pludos_venv/bin/activate   # Windows: pludos_venv\Scripts\activate
-pip install -e .
+pip install -e .          # add ".[cnn]" to run the CNN-autoencoder default in sim
+                          # (needs torch; otherwise sim falls back to IsolationForest)
 
 # 2. Generate test data — emits 24-byte UDP PludosTelemetry to a local data-engine
 python tools/mock_stm32.py        # MOCK_SHUTTLES=6 for a multi-shuttle run
