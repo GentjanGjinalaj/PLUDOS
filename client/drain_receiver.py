@@ -56,6 +56,14 @@ DRAIN_QUIET_TIMEOUT_S = float(os.getenv("DRAIN_QUIET_TIMEOUT_S", "3.0"))
 # Watchdog poll period — how often we scan reassemblers for quiet timeout.
 _WATCHDOG_PERIOD_S = 1.0
 
+# Idle-snapshot settling trim: the ISM330 LPF2 resets on ODR change, so the first
+# samples after the sensor is enabled clip at the ±2g rail before the filter settles.
+# At the idle 12.5 Hz ODR this lasts ~1 s (~12 samples); at the mission 3332 Hz ODR it
+# is gone by sample 0, so the trim is applied to IDLE snapshots ONLY — a mission's
+# onset transient is real signal we must keep. Drop this many ms off the head and shift
+# t0_wall forward by the same amount so timestamps stay honest. Set 0 to disable.
+IDLE_TRIM_MS = float(os.getenv("IDLE_TRIM_MS", "1000"))
+
 # Recently-finalised dedup window. Late duplicate packets of a just-finalised
 # drain arrive within ~seconds; a firmware reset re-using the same mission_id
 # comes tens of seconds later (re-init WiFi + run + drain). This TTL tells them
@@ -265,6 +273,19 @@ def _write_stream_parquet(
     # Derived time: t_ms = t0 + index * 1000 / odr (per stream, its own ODR).
     # Guard odr==0 (corrupt BEGIN) by leaving t_ms at t0 for all samples.
     step_ms = (1000.0 / odr_hz) if odr_hz > 0 else 0.0
+
+    # Idle-only settling trim: drop the LPF2-reset clipping at the head and advance
+    # t0 by the trimmed duration. Mission streams keep their onset transient (signal).
+    trimmed = 0
+    if re.is_idle_snapshot and IDLE_TRIM_MS > 0 and step_ms > 0:
+        trim_n = int(IDLE_TRIM_MS / step_ms)
+        # Never trim away the whole snapshot — keep at least one sample.
+        trim_n = min(trim_n, max(0, len(samples) - 1))
+        if trim_n > 0:
+            samples = samples[trim_n:]
+            t0 = t0 + int(round(trim_n * step_ms))
+            trimmed = trim_n
+
     n = len(samples)
 
     df = pd.DataFrame(
@@ -316,6 +337,16 @@ def _write_stream_parquet(
     df.to_parquet(tmp_path, engine="pyarrow", index=False,
                   compression="zstd", compression_level=3)
     os.replace(tmp_path, file_path)  # atomic rename: crash-safe on Linux
+    # Local-storage write log — Parquet (SD card) and the InfluxDB summary are two
+    # independent per-drain writes; this line makes the SD write visible alongside
+    # the [INFLUXDB] summary line so it's clear both fired.
+    logger.info(
+        "[STORAGE] wrote %s | %s | %d %s samples%s | %d KB",
+        os.path.basename(file_path), _tag(re.shuttle_id, re.gw_mission_id, re.is_idle_snapshot),
+        n, sensor,
+        f" (trimmed {trimmed} settling)" if trimmed else "",
+        os.path.getsize(file_path) // 1024,
+    )
     return file_path
 
 

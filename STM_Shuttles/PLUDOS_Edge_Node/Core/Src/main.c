@@ -239,6 +239,15 @@ static uint32_t tx_window_start_tick = 0U;
 #define CAP_FIFO_CTRL3_IDLE   0x11U   /* BDR_GY=12.5Hz (1), BDR_XL=12.5Hz (1) */
 #define CAP_IDLE_SNAP_PERIOD_MS  600000U  /* idle snapshot every 10 min (sit-time is exact via tx_tick) */
 #define CAP_IDLE_SNAP_DUR_MS      10000U  /* each idle snapshot lasts 10 s */
+/* Pre-drain transmit jitter: before powering the radio for a drain, wait a random
+ * 1.0–15.0 s (0.1 s granularity) so two shuttles exiting MOVING near-simultaneously
+ * don't blast the shared 2.4 GHz channel at once. Decorrelates the short (~1–4 s)
+ * drain bursts; timestamp-safe because tx_tick_ms is sampled at BEGIN, after this
+ * wait. Stopgap until Phase-2 NAK ARQ — jitter lowers collision odds, it can't
+ * recover a lost packet. */
+#define DRAIN_JITTER_MIN_MS    1000U
+#define DRAIN_JITTER_MAX_MS   15000U
+#define DRAIN_JITTER_STEP_MS    100U  /* 0.1 s granularity */
 /* Gyro LPF1 (CTRL4_C=0x02, CTRL6_C=0x07 FTYPE=111) left at boot setting: FTYPE=111 is
  * the narrowest LPF1, so its corner is the lowest of all FTYPE codes and stays below
  * the 208 Hz Nyquist at 416 Hz ODR. Exact corner: AN5192/AN5398 Table 14. */
@@ -1439,6 +1448,35 @@ static void Drain_WarmupBurst(void)
   HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
 }
 
+/* Wait a pseudo-random 1.0–15.0 s before powering the radio so concurrent shuttles
+ * don't contend the 2.4 GHz channel at the same instant. Seeded once from the 96-bit
+ * device UID (unique per board) XOR HAL_GetTick, so each shuttle draws a different
+ * xorshift32 sequence. The wait uses the IWDG-kicked delay — safe up to 15 s. */
+static void Drain_JitterDelay(void)
+{
+  static uint32_t rng_state = 0U;
+
+  if (rng_state == 0U)
+  {
+    const uint32_t *uid = (const uint32_t *)UID_BASE;  /* CMSIS: 96-bit unique device ID */
+    rng_state = uid[0] ^ uid[1] ^ uid[2] ^ HAL_GetTick();
+    if (rng_state == 0U) { rng_state = 0xA5A5A5A5U; }   /* xorshift can't start at 0 */
+  }
+
+  rng_state ^= rng_state << 13;
+  rng_state ^= rng_state >> 17;
+  rng_state ^= rng_state << 5;
+
+  uint32_t steps   = (DRAIN_JITTER_MAX_MS - DRAIN_JITTER_MIN_MS) / DRAIN_JITTER_STEP_MS; /* 140 */
+  uint32_t wait_ms = DRAIN_JITTER_MIN_MS + (rng_state % (steps + 1U)) * DRAIN_JITTER_STEP_MS;
+
+  sprintf(uart_buf, "[DRAIN] pre-TX jitter %lu.%lu s\r\n",
+          (unsigned long)(wait_ms / 1000U), (unsigned long)((wait_ms % 1000U) / 100U));
+  HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+
+  WIFI_DelayWithYield(wait_ms);
+}
+
 static void Drain_AllPending(void)
 {
   uint16_t i;
@@ -1457,6 +1495,8 @@ static void Drain_AllPending(void)
   {
     return; /* nothing pending — keep the radio dark */
   }
+
+  Drain_JitterDelay();  /* decorrelate concurrent shuttles before the radio comes up */
 
   /* One bounded retry: a soft bring-up failure (transient connect / no DHCP) shouldn't
    * strand a whole batch of sealed missions until the next MOVING run. PowerOff fully
@@ -1535,6 +1575,26 @@ int main(void)
   MX_UCPD1_Init();
   MX_USB_OTG_FS_PCD_Init();
   /* USER CODE BEGIN 2 */
+
+  // -----------------------------------------------------------------
+  // BOOT RESET-CAUSE REPORT — diagnose the unexpected reboots that reset the
+  // mission counter and drop any undrained PSRAM. Read the RCC reset flags once,
+  // then clear them so the next boot reports its own cause. PINRST is checked last
+  // because the internal reset pulse also asserts NRST on most reset sources.
+  // -----------------------------------------------------------------
+  {
+    const char *cause;
+    if      (__HAL_RCC_GET_FLAG(RCC_FLAG_IWDGRST)) { cause = "IWDG watchdog"; }
+    else if (__HAL_RCC_GET_FLAG(RCC_FLAG_WWDGRST)) { cause = "WWDG watchdog"; }
+    else if (__HAL_RCC_GET_FLAG(RCC_FLAG_BORRST))  { cause = "BOR brownout"; }
+    else if (__HAL_RCC_GET_FLAG(RCC_FLAG_LPWRRST)) { cause = "low-power"; }
+    else if (__HAL_RCC_GET_FLAG(RCC_FLAG_SFTRST))  { cause = "software"; }
+    else if (__HAL_RCC_GET_FLAG(RCC_FLAG_PINRST))  { cause = "NRST pin"; }
+    else                                           { cause = "unknown"; }
+    sprintf(uart_buf, "[BOOT] reset cause: %s\r\n", cause);
+    HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+    __HAL_RCC_CLEAR_RESET_FLAGS();
+  }
 
   // -----------------------------------------------------------------
   // PSRAM BRING-UP (APS6408 on OCTOSPI1) — ADR-020 capture buffer
