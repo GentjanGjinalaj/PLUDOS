@@ -44,6 +44,30 @@ in the Grafana UI and re-export through the script. Editing the JSON directly
 works until the next regeneration overwrites it — so treat the script as
 authoritative.
 
+## Dashboard rows at a glance (slide caption)
+
+**The PLUDOS System Monitor reads top-to-bottom as the data's journey from
+shuttle to model.** **◉ Live Status** gives four at-a-glance KPIs — drains
+received in the last 24 h, the most recent drain's packet-loss and accel peak,
+and live Jetson board power. **🌡 Environment** plots on-board temperature and
+pressure per shuttle. **📦 Drain Quality & Volume** shows per-drain packet loss
+(the Phase-1 reliability metric) and how many accelerometer samples each
+idle/mission drain delivered. **📈 Vibration Intensity** charts per-drain accel
+RMS/peak and gyro peak for each shuttle — the headline health signal for
+predictive maintenance. **〰 Idle Waveforms** drills into the raw per-sample idle
+snapshots. **🖥 Jetson Power** breaks out INA3221 board power, current and
+voltage from the energy profiler. **⚡ Federated Learning** reports energy per FL
+round, per-phase durations, and training quality (logloss + anomaly rate).
+**📋 Mission History** is the audit table of every drain in the last 24 h. The
+rows are ordered to mirror the pipeline: capture → transport quality → derived
+signal → device energy → learning → record.
+
+> Note (2026-06): the live dashboard JSON was hand-tuned against the real
+> InfluxDB schema (single-value stat panels, repaired INA power join, dead-field
+> panels removed). It has **diverged from `build_pludos_dashboard.py`** — that
+> script still emits the older panel set, so re-running it would overwrite these
+> fixes. Until the script is updated, treat the committed JSON as authoritative.
+
 ## Relationships
 
 This folder only draws pictures of data that other tiers produce. The numbers
