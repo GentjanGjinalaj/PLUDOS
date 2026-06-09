@@ -126,7 +126,7 @@ static uint32_t fsm_settle_until_tick = 0U; /* suppress motion trigger until thi
 #define ACCEL_SETTLE_MS         1000U    /* blank the motion trigger this long after any CTRL1_XL ODR change. Switching ODR (e.g. 104Hz↔12.5Hz at idle-snapshot entry/exit) resets the LPF2 digital filter; OUTX reads mid-reset return ~0g, so |mag²-1g²|≈1.0 and a phantom MOVING dwell completes. 1s covers the slow 12.5Hz settle while leaving 9s of real detection in a 10s snapshot. Empirical — TUNE from UART. */
 
 #define SAMPLE_PERIOD_IDLE_MS   100U     /* 10 Hz internal sampling in IDLE (FSM responsiveness) */
-#define SAMPLE_PERIOD_MOVING_MS 20U      /* 50 Hz sampling + transmit in MOVING (UDP send self-throttles if WiFi can't keep up) */
+#define SAMPLE_PERIOD_MOVING_MS 20U      /* 50 Hz MOVING main-loop poll period (FSM motion cadence only — NOT a data or TX rate). Under ADR-021 the radio is off during MOVING; high-rate IMU is captured to PSRAM via FIFO and drained over UDP after the run, not transmitted live. */
 #define TX_PERIOD_IDLE_MS       10000U   /* 0.1 Hz UDP transmit in IDLE — every 100th sample */
 #define ENV_READ_PERIOD_MS      500U     /* 2 Hz HTS221 refresh; cached for every TX */
 

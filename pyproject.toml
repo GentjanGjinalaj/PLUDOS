@@ -10,7 +10,6 @@ dependencies = [
    "flwr[simulation]>=1.9.0",
     "xgboost",
     "numpy",
-    "aiocoap",
     "pandas",
     "pyarrow",
     "influxdb-client",
