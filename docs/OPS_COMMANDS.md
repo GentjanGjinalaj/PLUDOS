@@ -320,13 +320,47 @@ curl -s http://localhost:3000/api/health | python3 -m json.tool
 
 ## 8. Update the Jetson code
 
-```bash
-# Pull latest code on Jetson and rebuild + restart data-engine:
-ssh warehouse1@$JETSON_IP \
-  "cd ~/PLUDOS && git pull && cd client && podman-compose up --build -d data-engine"
+Deploy is **git-pull only** — never scp or edit code on the Jetson. Commit and
+push from the laptop, then pull + rebuild on the Jetson.
 
-# Pull only (no rebuild — for config/script changes):
+```bash
+# Pull only (config/env/script change that the running container re-reads):
 ssh warehouse1@$JETSON_IP "cd ~/PLUDOS && git pull"
+```
+
+### 8.1 Rebuild after a Python code change (the reliable recipe)
+
+`podman-compose up --build -d data-engine` alone is **not** reliable on the
+Jetson: (a) `data-engine` has dependent containers (`ai-worker` depends_on it),
+so podman refuses to recreate it while `ai-worker` exists — you get
+`container has dependent containers`; (b) podman 3.4.4 can reuse a stale image
+layer and silently run old code. The recipe below works around both.
+
+```bash
+ssh warehouse1@$JETSON_IP bash -lc '
+  cd ~/PLUDOS && git pull --ff-only
+  cd client
+  # Remove dependents FIRST (ai-worker before data-engine) so the recreate is not blocked.
+  podman rm -f pludos-ai-worker pludos-data-engine
+  # --profile standalone = data-engine + ai-worker without the VPN/Tailscale sidecars.
+  ~/.local/bin/podman-compose --profile standalone up --build -d data-engine ai-worker
+  podman ps --format "{{.Names}} {{.Status}}"
+'
+```
+
+Notes:
+- The Jetson has no `podman compose` plugin — use `~/.local/bin/podman-compose`
+  (python), and run it under `bash -lc` so `$PATH` is set from the login shell.
+- The `Containerfile` has a `CODE_VERSION` build-arg COPY layer that cache-busts
+  the code copy, so `--build` always re-runs the application-code layer even when
+  `pip` layers are cached (fast rebuild, fresh code).
+- For long builds over SSH, detach so a dropped session can't kill it:
+  `setsid bash -lc "<build cmd> > /tmp/pludos_build.log 2>&1" < /dev/null &`
+  then tail `/tmp/pludos_build.log`.
+
+```bash
+# Verify the new code is live (e.g. a log line you just added):
+ssh warehouse1@$JETSON_IP "podman logs --tail 30 pludos-data-engine"
 ```
 
 ---
