@@ -421,7 +421,9 @@ def _write_idle_waveform(write_api, sid: str, summary: dict) -> None:
 # is off (ADR-021). High-rate waveforms stay in Parquet; only this summary goes to Influx.
 def _write_drain_summary(summary: dict) -> None:
     # headless mode: collect to Parquet only, skip InfluxDB (mirrors _write_mission_summary).
-    if PLUDOS_MODE == "headless":
+    # Also skip when no token is configured — avoids a guaranteed auth failure and a noisy
+    # warning when InfluxDB credentials aren't set (mirrors the status-log path).
+    if PLUDOS_MODE == "headless" or not _INFLUXDB_TOKEN:
         return
     sid = str(summary["shuttle_id"])
 

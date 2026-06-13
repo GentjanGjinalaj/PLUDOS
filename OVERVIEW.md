@@ -46,12 +46,6 @@ Quick links to the per-folder guides:
 
 ## Loose top-level files
 
-### Code
-
-| File | Responsibility | Weight |
-|------|----------------|--------|
-| `build_pludos_dashboard.py` | **Grafana dashboard generator.** Builds the "PLUDOS System Monitor" panel layout in Python, POSTs it to Grafana's API, and writes the JSON into `server/grafana/dashboards/`. **Note (2026-06):** the committed JSON has since been hand-tuned and diverged from this script, so the JSON is now authoritative — re-running this would overwrite those fixes. See `server/grafana/OVERVIEW.md`. | Helper (run on the laptop) |
-
 ### Project / build config
 
 | File | Responsibility |

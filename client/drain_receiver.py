@@ -265,6 +265,7 @@ def _write_stream_parquet(
     complete: bool,
     missing: str,
     t0: int,
+    trimmed: int = 0,
 ) -> str | None:
     if not samples:
         # No samples of this sensor in the stream — skip the file entirely.
@@ -274,18 +275,9 @@ def _write_stream_parquet(
     # Guard odr==0 (corrupt BEGIN) by leaving t_ms at t0 for all samples.
     step_ms = (1000.0 / odr_hz) if odr_hz > 0 else 0.0
 
-    # Idle-only settling trim: drop the LPF2-reset clipping at the head and advance
-    # t0 by the trimmed duration. Mission streams keep their onset transient (signal).
-    trimmed = 0
-    if re.is_idle_snapshot and IDLE_TRIM_MS > 0 and step_ms > 0:
-        trim_n = int(IDLE_TRIM_MS / step_ms)
-        # Never trim away the whole snapshot — keep at least one sample.
-        trim_n = min(trim_n, max(0, len(samples) - 1))
-        if trim_n > 0:
-            samples = samples[trim_n:]
-            t0 = t0 + int(round(trim_n * step_ms))
-            trimmed = trim_n
-
+    # Idle settling trim is applied once in _finalise_mission before this call, so
+    # `samples`/`t0` arrive already trimmed; `trimmed` is the dropped-sample count
+    # carried through only for the [STORAGE] log line below.
     n = len(samples)
 
     df = pd.DataFrame(
@@ -366,6 +358,23 @@ def _mag_stats(samples: list[tuple[int, int, int]], unit_per_lsb: float) -> tupl
     return (float(np.sqrt((mag * mag).mean())), float(mag.max()))
 
 
+# Drop IDLE_TRIM_MS of LPF2 rail-clip settling off the head of an idle-snapshot stream.
+# Returns (trimmed_samples, dropped_n); never empties the stream. Applied once per drain
+# so Parquet, the InfluxDB summary, and the vibration stats all share the same trim.
+def _trim_idle_settling(
+    samples: list[tuple[int, int, int]], odr_hz: float
+) -> tuple[list[tuple[int, int, int]], int]:
+    if not samples or IDLE_TRIM_MS <= 0 or odr_hz <= 0:
+        return samples, 0
+    step_ms = 1000.0 / odr_hz
+    trim_n = int(IDLE_TRIM_MS / step_ms)
+    # Never trim away the whole snapshot — keep at least one sample.
+    trim_n = min(trim_n, max(0, len(samples) - 1))
+    if trim_n <= 0:
+        return samples, 0
+    return samples[trim_n:], trim_n
+
+
 # Finalise one capture: assemble bytes, demux, write accel + gyro Parquet files.
 def _finalise_mission(re: MissionReassembler, reason: str) -> None:
     if re.finalised:
@@ -380,9 +389,21 @@ def _finalise_mission(re: MissionReassembler, reason: str) -> None:
     # Anchor once; idempotent, so both parquet writers + the summary share one mission t0.
     t0_wall = re.t0_wall_ms()
 
+    # Idle-only settling trim, applied ONCE here so Parquet, the InfluxDB summary, and the
+    # vibration stats (_mag_stats below) all use identical trimmed samples and t0. MOVING
+    # missions keep their onset transient (real signal). Both idle axes run at
+    # IDLE_SNAP_ODR_HZ, so the accel/gyro trim counts match and the shared t0 advance is
+    # unambiguous and keeps the per-sample waveform's accel[i]/gyro[i] pairing aligned.
+    accel_trim = gyro_trim = 0
+    if re.is_idle_snapshot:
+        accel, accel_trim = _trim_idle_settling(accel, re.odr_accel_hz)
+        gyro,  gyro_trim  = _trim_idle_settling(gyro,  re.odr_gyro_hz)
+        if accel_trim > 0 and re.odr_accel_hz > 0:
+            t0_wall += int(round(accel_trim * 1000.0 / re.odr_accel_hz))
+
     paths = []
-    a_path = _write_stream_parquet("accel", accel, re.odr_accel_hz, re, complete, missing, t0_wall)
-    g_path = _write_stream_parquet("gyro", gyro, re.odr_gyro_hz, re, complete, missing, t0_wall)
+    a_path = _write_stream_parquet("accel", accel, re.odr_accel_hz, re, complete, missing, t0_wall, accel_trim)
+    g_path = _write_stream_parquet("gyro", gyro, re.odr_gyro_hz, re, complete, missing, t0_wall, gyro_trim)
     if a_path:
         paths.append(os.path.basename(a_path))
     if g_path:
@@ -431,8 +452,9 @@ def _finalise_mission(re: MissionReassembler, reason: str) -> None:
                 "accel_rms_g":      accel_rms,
                 "accel_peak_g":     accel_peak,
                 "gyro_peak_dps":    gyro_peak,
-                # Idle snapshots are small (~12.5 Hz) — carry raw samples so data-engine
-                # can write a per-sample waveform to Influx; None for high-rate missions.
+                # Idle snapshots are small (~12.5 Hz) — carry the trimmed samples so
+                # data-engine can write a per-sample waveform to Influx that matches the
+                # Parquet file; None for high-rate missions.
                 "odr_hz":           re.odr_accel_hz,
                 "accel_xyz":        accel if re.is_idle_snapshot else None,
                 "gyro_xyz":         gyro  if re.is_idle_snapshot else None,

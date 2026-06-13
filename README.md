@@ -225,7 +225,6 @@ PLUDOS/
 ├── scripts/                         # calibration tools (constants from real data)
 │   └── experiments/                 #   thesis-validation analysers (T8 series)
 ├── tools/mock_stm32.py              # fake shuttle fleet (no-hardware testing)
-├── build_pludos_dashboard.py        # Grafana dashboard generator
 ├── docs/                            # architecture, ADRs, wire protocol, guides
 └── pyproject.toml                   # Flower app + dependencies
 ```

@@ -19,32 +19,30 @@ The `grafana` service in `server/compose.yaml` mounts this folder read-only.
 |------|----------------|--------|
 | `provisioning/datasources/influxdb.yaml` | Tells Grafana, on boot, to wire up the **InfluxDB datasource** (Flux query language, org `pludos`, bucket `alumet_energy`, token from `.env`). Fixed `uid` so dashboards can reference it. | Core (without it, panels have no data source) |
 | `provisioning/dashboards/pludos.yaml` | A **file provider** that tells Grafana to load every dashboard JSON it finds under `/dashboards` and re-scan every 30 s. | Core (loader) |
-| `dashboards/pludos_system_monitor.json` | The actual **"PLUDOS System Monitor" dashboard** (~680 lines, recently rewritten): live-status KPIs, environment, drain quality/packet-loss, vibration, idle waveforms, Jetson power, federated-learning, and mission-history panels. | Core artifact — now **hand-tuned and authoritative** (see the 2026-06 note below) |
+| `dashboards/pludos_system_monitor.json` | The actual **"PLUDOS System Monitor" dashboard** (~680 lines): live-status KPIs, environment, drain quality/packet-loss, vibration, idle waveforms, Jetson power, federated-learning, and mission-history panels. | Core artifact — the **single hand-maintained source of truth** |
 
-## Who generates the dashboard JSON (history + current state)
+## How the dashboard is maintained
 
-`dashboards/pludos_system_monitor.json` was **originally** produced by the
-repo-root script **`build_pludos_dashboard.py`**, which builds the panel
-layout in Python, POSTs it live to Grafana's API, *and* writes the JSON back
-into this folder. The provisioning loader then serves that file on the next
-container start. **As of 2026-06 the committed JSON has diverged from the
-script and is now the authoritative copy** — see the note at the end of this
-file before re-running the generator.
+`dashboards/pludos_system_monitor.json` is the **single source of truth** and is
+edited by hand (or exported from the Grafana UI). Every panel query targets the
+measurements actually written today (ADR-021 drain path): `stm_mission`
+(`source == "drain"`), `stm_idle_wave`, `input_current` / `input_voltage`,
+`fl_phases`, and `fl_train_metrics`.
 
 ```
-build_pludos_dashboard.py  (source of truth, run on the laptop)
-        │  writes
-        ▼
-server/grafana/dashboards/pludos_system_monitor.json
+server/grafana/dashboards/pludos_system_monitor.json   (source of truth, edit by hand)
         │  loaded by
         ▼
 provisioning/dashboards/pludos.yaml  ──► Grafana panels
 ```
 
-**To change a panel (current reality):** edit the committed JSON directly (or
-export from the Grafana UI), since it now carries fixes the script lacks.
-Re-running `build_pludos_dashboard.py` would overwrite those fixes with the
-older panel set — only do that after porting the changes back into the script.
+**To change a panel:** edit the committed JSON directly, or export from the
+Grafana UI and overwrite the file, then commit. The provisioning loader
+re-scans every 30 s, so a container restart is not required.
+
+> A Python generator (`build_pludos_dashboard.py`) once produced this JSON, but
+> it diverged from the hand-tuned file and queried dead pre-ADR-021 measurements,
+> so it was deleted (2026-06). The JSON is now maintained directly.
 
 ## Dashboard rows at a glance (slide caption)
 
@@ -63,12 +61,6 @@ round, per-phase durations, and training quality (logloss + anomaly rate).
 **📋 Mission History** is the audit table of every drain in the last 24 h. The
 rows are ordered to mirror the pipeline: capture → transport quality → derived
 signal → device energy → learning → record.
-
-> Note (2026-06): the live dashboard JSON was hand-tuned against the real
-> InfluxDB schema (single-value stat panels, repaired INA power join, dead-field
-> panels removed). It has **diverged from `build_pludos_dashboard.py`** — that
-> script still emits the older panel set, so re-running it would overwrite these
-> fixes. Until the script is updated, treat the committed JSON as authoritative.
 
 ## Relationships
 
