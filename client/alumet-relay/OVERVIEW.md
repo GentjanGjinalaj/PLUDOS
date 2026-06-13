@@ -59,15 +59,18 @@ The CSV and the per-restart `.log` files live on the Jetson eMMC under
 built-in rotation**, so `entrypoint.sh` handles it externally — no `logrotate`,
 no new image dependency, no change to the energy-measurement logic.
 
-- **CSV rotation (copytruncate).** The existing watchdog loop also checks the
-  live CSV size each cycle. Past `ALUMET_CSV_MAX_MB` (default 200 MB, ≈ 2 days
-  at 1 Hz) it snapshots the file to `alumet_readings_<timestamp>.csv`, truncates
-  the live file in place, and restores the header row. The csv plugin keeps the
-  same `O_APPEND` fd, so the next write resumes at offset 0 (no sparse file) and
-  `force_flush=true` is preserved. The newest `ALUMET_CSV_KEEP` (default 3)
-  archives are retained; older ones are deleted. *Caveat:* copytruncate has a
-  ~1-reading race in the copy→truncate window (≈ once every 2 days) — acceptable
-  for housekeeping.
+- **CSV rotation (archive + agent restart).** The existing watchdog loop also
+  checks the live CSV size each cycle. Past `ALUMET_CSV_MAX_MB` (default 200 MB,
+  ≈ 2 days at 1 Hz) it snapshots the file to `alumet_readings_<timestamp>.csv`,
+  then kills the agent so Podman restarts the container. The csv plugin
+  **truncates `output_path` on open** (verified on hardware: the live file
+  resets to ~0 on every agent start — it is *not* append-mode), so the restart
+  reopens a fresh, empty CSV. An in-place truncate is deliberately avoided: it
+  would leave a sparse file because the plugin holds its own write offset. The
+  newest `ALUMET_CSV_KEEP` (default 3) archives are retained; older ones are
+  deleted. *Caveat:* at most ~1 reading in the cp→restart window is lost
+  (≈ once every 2 days); the restart also briefly drops `:9095`, so an FL round
+  scraping at that exact moment falls back to DEGRADED.
 - **Per-restart `.log` pruning.** Each container start writes a new
   `alumet-<timestamp>.log` (via `tee`). On startup the entrypoint keeps the
   newest `ALUMET_LOG_KEEP` (default 5, including the current run) and deletes the

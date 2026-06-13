@@ -13,12 +13,12 @@ order. Each entry maps to one or more ADRs or resolved backlog items
 change.
 
 ### Added
-- `entrypoint.sh` rotates the live CSV via copytruncate once it passes
-  `ALUMET_CSV_MAX_MB` (default 200 MB, ≈2 days at 1 Hz): snapshot to
-  `alumet_readings_<ts>.csv`, truncate in place, restore header. The csv
-  plugin's `O_APPEND` fd resumes at offset 0; `force_flush=true` preserved.
-  Check runs in the existing watchdog loop. Newest `ALUMET_CSV_KEEP` (3)
-  archives retained.
+- `entrypoint.sh` rotates the live CSV once it passes `ALUMET_CSV_MAX_MB`
+  (default 200 MB, ≈2 days at 1 Hz): snapshot to `alumet_readings_<ts>.csv`,
+  then restart the agent. The alumet csv plugin truncates `output_path` on open
+  (verified on hardware — not append-mode), so the restart reopens an empty CSV;
+  an in-place truncate is avoided as it would leave a sparse file. Check runs in
+  the existing watchdog loop. Newest `ALUMET_CSV_KEEP` (3) archives retained.
 - Startup prune of per-restart `alumet-*.log` files, keeping newest
   `ALUMET_LOG_KEEP` (5, incl. current run).
 - Three env knobs wired through `compose.yaml` + documented in `.env.example`

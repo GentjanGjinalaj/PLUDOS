@@ -135,23 +135,24 @@ ZERO_THRESHOLD="${ALUMET_ZERO_THRESHOLD:-5}"
             kill "${TEED_PID}" 2>/dev/null
         fi
 
-        # CSV size cap (copytruncate): when the live CSV passes CSV_MAX_BYTES,
-        # snapshot it to a timestamped archive then truncate it in place. The
-        # csv plugin keeps the same O_APPEND fd, so the next 1 Hz write resumes
-        # at offset 0 (no sparse file); force_flush stays on. The original
-        # header line is restored so the live CSV remains self-describing.
+        # CSV size cap (archive + agent restart): the alumet csv plugin truncates
+        # output_path on open (verified: file resets to ~0 on every agent start),
+        # so it is NOT append-mode — an in-place truncate would leave a sparse
+        # file. Instead, when the live CSV passes CSV_MAX_BYTES, snapshot it to a
+        # timestamped archive and kill the agent: Podman restarts the container
+        # and the plugin reopens output_path fresh (truncated to 0). force_flush
+        # stays on; at most ~1 reading in the cp→restart window is lost (≈2-day
+        # cadence at 200 MB / 1 Hz).
         csv="${LOG_DIR}/alumet_readings.csv"
         csv_bytes=$(stat -c%s "${csv}" 2>/dev/null || echo 0)
         if [ "${csv_bytes}" -ge "${CSV_MAX_BYTES}" ]; then
             ts=$(date '+%Y%m%d_%H%M%S')
-            hdr=$(head -1 "${csv}")
             cp "${csv}" "${LOG_DIR}/alumet_readings_${ts}.csv"
-            : > "${csv}"
-            printf '%s\n' "${hdr}" > "${csv}"
-            echo "[ALUMET-RELAY][ROTATE] CSV ${csv_bytes}B ≥ ${CSV_MAX_BYTES}B — archived to alumet_readings_${ts}.csv" >&2
+            echo "[ALUMET-RELAY][ROTATE] CSV ${csv_bytes}B ≥ ${CSV_MAX_BYTES}B — archived to alumet_readings_${ts}.csv, restarting agent" >&2
             # Retain newest CSV_KEEP archives; the glob excludes the live file.
             find "${LOG_DIR}" -maxdepth 1 -name 'alumet_readings_*.csv' -type f -printf '%T@ %p\n' \
                 | sort -rn | tail -n +$((CSV_KEEP + 1)) | cut -d' ' -f2- | xargs -r rm -f
+            kill "${TEED_PID}" 2>/dev/null  # → container restart → plugin truncates live CSV
         fi
     done
 ) &
