@@ -6,6 +6,26 @@ order. Each entry maps to one or more ADRs or resolved backlog items
 
 ---
 
+## [Unreleased] — Alumet Relay Log Housekeeping (ADR-011 Phase 2)
+
+**Goal:** Bound unbounded growth of the alumet-relay logs on the Jetson eMMC
+(the CSV had reached ~330 MB). Housekeeping only — no energy-measurement logic
+change.
+
+### Added
+- `entrypoint.sh` rotates the live CSV via copytruncate once it passes
+  `ALUMET_CSV_MAX_MB` (default 200 MB, ≈2 days at 1 Hz): snapshot to
+  `alumet_readings_<ts>.csv`, truncate in place, restore header. The csv
+  plugin's `O_APPEND` fd resumes at offset 0; `force_flush=true` preserved.
+  Check runs in the existing watchdog loop. Newest `ALUMET_CSV_KEEP` (3)
+  archives retained.
+- Startup prune of per-restart `alumet-*.log` files, keeping newest
+  `ALUMET_LOG_KEEP` (5, incl. current run).
+- Three env knobs wired through `compose.yaml` + documented in `.env.example`
+  and `client/alumet-relay/OVERVIEW.md`. No new image dependency (no logrotate).
+
+---
+
 ## [Unreleased] — Idle-Waveform Trim Fix + Dashboard Drift Cleanup (ADR-021)
 
 **Goal:** Make the Grafana idle waveform show real rest vibration (not the LPF2

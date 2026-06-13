@@ -98,6 +98,10 @@ services:
     environment:
       - ALUMET_SERVER_ADDR=${ALUMET_SERVER_ADDR:-}
       - ALUMET_PROMETHEUS_PORT=${ALUMET_PROMETHEUS_PORT:-9095}
+      # Housekeeping — bound log growth on the Jetson eMMC (entrypoint.sh).
+      - ALUMET_CSV_MAX_MB=${ALUMET_CSV_MAX_MB:-200}
+      - ALUMET_CSV_KEEP=${ALUMET_CSV_KEEP:-3}
+      - ALUMET_LOG_KEEP=${ALUMET_LOG_KEEP:-5}
     privileged: true
     volumes:
       # Full sysfs access required for INA3221 and RAPL reads.

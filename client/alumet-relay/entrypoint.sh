@@ -23,6 +23,19 @@ LOG_DIR="${ALUMET_LOG_DIR:-/app/logs}"
 mkdir -p "${LOG_DIR}"
 LOG_FILE="${LOG_DIR}/alumet-$(date '+%Y%m%d_%H%M%S').log"
 
+# --- Housekeeping limits (bound unbounded growth on the Jetson eMMC) ---------
+# CSV is written by alumet's csv plugin (no built-in rotation in v0.9.4), so it
+# is rotated externally inside the watchdog loop below. Per-restart .log files
+# accumulate one per container restart and are pruned here at startup.
+CSV_MAX_BYTES=$(( ${ALUMET_CSV_MAX_MB:-200} * 1024 * 1024 ))  # rotate live CSV past this size
+CSV_KEEP="${ALUMET_CSV_KEEP:-3}"                              # rotated alumet_readings_*.csv to retain
+LOG_KEEP="${ALUMET_LOG_KEEP:-5}"                              # per-restart .log files to retain (incl. current)
+
+# Prune old per-restart logs: keep the newest (LOG_KEEP - 1) so that, once the
+# current run's LOG_FILE is created below, at most LOG_KEEP files remain.
+find "${LOG_DIR}" -maxdepth 1 -name 'alumet-*.log' -type f -printf '%T@ %p\n' \
+    | sort -rn | tail -n +"${LOG_KEEP}" | cut -d' ' -f2- | xargs -r rm -f
+
 # Build TOML config from confirmed canonical schema (alumet-agent config regen).
 # All sections are always written; which plugins activate is controlled via --plugins.
 cat > "${CONFIG}" <<TOML
@@ -120,6 +133,25 @@ ZERO_THRESHOLD="${ALUMET_ZERO_THRESHOLD:-5}"
         if [ "${zeros}" -ge "${ZERO_THRESHOLD}" ]; then
             echo "[ALUMET-RELAY][WATCHDOG] ${zeros} consecutive zero power readings — restarting container" >&2
             kill "${TEED_PID}" 2>/dev/null
+        fi
+
+        # CSV size cap (copytruncate): when the live CSV passes CSV_MAX_BYTES,
+        # snapshot it to a timestamped archive then truncate it in place. The
+        # csv plugin keeps the same O_APPEND fd, so the next 1 Hz write resumes
+        # at offset 0 (no sparse file); force_flush stays on. The original
+        # header line is restored so the live CSV remains self-describing.
+        csv="${LOG_DIR}/alumet_readings.csv"
+        csv_bytes=$(stat -c%s "${csv}" 2>/dev/null || echo 0)
+        if [ "${csv_bytes}" -ge "${CSV_MAX_BYTES}" ]; then
+            ts=$(date '+%Y%m%d_%H%M%S')
+            hdr=$(head -1 "${csv}")
+            cp "${csv}" "${LOG_DIR}/alumet_readings_${ts}.csv"
+            : > "${csv}"
+            printf '%s\n' "${hdr}" > "${csv}"
+            echo "[ALUMET-RELAY][ROTATE] CSV ${csv_bytes}B ≥ ${CSV_MAX_BYTES}B — archived to alumet_readings_${ts}.csv" >&2
+            # Retain newest CSV_KEEP archives; the glob excludes the live file.
+            find "${LOG_DIR}" -maxdepth 1 -name 'alumet_readings_*.csv' -type f -printf '%T@ %p\n' \
+                | sort -rn | tail -n +$((CSV_KEEP + 1)) | cut -d' ' -f2- | xargs -r rm -f
         fi
     done
 ) &
