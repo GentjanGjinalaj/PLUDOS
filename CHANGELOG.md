@@ -6,6 +6,39 @@ order. Each entry maps to one or more ADRs or resolved backlog items
 
 ---
 
+## [Unreleased] — Idle-Waveform Trim Fix + Dashboard Drift Cleanup (ADR-021)
+
+**Goal:** Make the Grafana idle waveform show real rest vibration (not the LPF2
+rail-clip artifact) and remove the dashboard generator that had diverged from
+the committed, provisioned dashboard.
+
+### Fixed
+- Idle-snapshot settling trim is now applied **once** in
+  `drain_receiver.py:_finalise_mission` (new `_trim_idle_settling` helper),
+  *before* the Parquet write, the vibration stats, and the InfluxDB summary.
+  Previously the trim lived inside `_write_stream_parquet`, so the
+  `stm_idle_wave` InfluxDB waveform got the **raw, untrimmed** samples and the
+  pre-trim `t0` — Grafana showed a fake ±2 g rail-clip at the start of every
+  idle snapshot. Parquet and InfluxDB now use identical trimmed data and t0.
+- Side effect of the same fix: `accel_peak_g` (vibration panel) no longer
+  includes the rail-clip spike, since `_mag_stats` now runs on trimmed samples.
+
+### Changed
+- `_write_drain_summary` (`data-engine.py`) now also skips the InfluxDB write
+  when `INFLUXDB_TOKEN` is empty (mirrors the `gw_status` path) — avoids a
+  guaranteed auth failure + noisy warning on token-less gateways.
+
+### Removed
+- `build_pludos_dashboard.py` — the Python dashboard generator. It had diverged
+  from the hand-tuned, provisioned `server/grafana/dashboards/pludos_system_monitor.json`
+  and queried dead pre-ADR-021 measurements (`stm_telemetry`, `tx_rate_hz`,
+  old `stm_mission` fields). A single run clobbered both the live Grafana
+  dashboard and the committed JSON. The committed JSON is now the single
+  hand-maintained source of truth. Docs updated (`server/grafana/OVERVIEW.md`,
+  root `OVERVIEW.md`, `README.md`).
+
+---
+
 ## [0.5.0] — Wire Protocol v3 + Gyroscope (ADR-016)
 
 **Goal:** Add ISM330DHCX gyroscope data to the telemetry stream while
