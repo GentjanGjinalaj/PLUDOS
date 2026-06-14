@@ -6,11 +6,72 @@ order. Each entry maps to one or more ADRs or resolved backlog items
 
 ---
 
+## [Unreleased] — Drain Delivery-Evidence + Retry Back-off (ADR-021 Phase 1)
+
+**Goal:** Close three silent drain-integrity failure modes that don't bite on a
+clean LAN (drains are 0 % loss today) but cause silent data loss or a radio
+duty-cycle blowout over a multi-week run. Scope: STM32 firmware + drain receiver,
+one coherent change set. Still blast-over-UDP — no ARQ. See
+`docs/current_problems.md` P1-7/P1-8/P1-9.
+
+### Added
+- **BEGIN liveness echo (`DRAIN_ACK`, wire type 6, 8 B).** The gateway
+  (`drain_receiver.py`) replies an 8-byte ack on **every** received `DRAIN_BEGIN`
+  (×3, so up to three chances even if one is lost in the post-power-on window).
+  This is delivery evidence — "the Jetson is listening" — **not** retransmission;
+  types 4/5 stay reserved for the planned Phase-2 NAK/ACK_COMPLETE ARQ.
+
+### Fixed
+- **P1-7 · `drained=1` set without delivery evidence.** `Drain_Mission` previously
+  marked a mission drained unconditionally after the UDP blast — every `sendto`
+  return was `(void)`-cast, so a Jetson reboot / container restart mid-drain
+  discarded the mission from accounting while PSRAM still held it. Now the firmware
+  sends `DRAIN_BEGIN` ×3, waits a bounded window (`Drain_WaitForAck`, ~750 ms cap)
+  for the echo, and **only** marks `drained=1` if it arrives. No echo ⇒ the chunk
+  blast is skipped entirely (radio stays dark) and the whole mission retries on the
+  next wake. The re-drain is idempotent — the gateway dedups on
+  `(shuttle_id, mission_id, sample_index)`.
+- **P1-8 · Stale `jetson_ip` never refreshed.** `jetson_ip` was resolved once at
+  boot; both in-loop re-check paths (PHASE 3 / 3b) are dead under the ADR-021 duty
+  cycle (gated on `wifi_driver_initialized`, which is 0 whenever the main loop runs
+  — the radio is only up inside a blocking drain). A changed gateway DHCP lease
+  meant every drain blasted the old address forever. Now a missing echo triggers a
+  one-shot `BEACON_Run` **inside the drain window** (radio already up) to refresh
+  `jetson_ip`; later missions in the same wake and the next wake self-heal.
+- **P1-9 · Watermark safety-flush retry storm.** PHASE 2d fired `Drain_AllPending`
+  every loop iteration while `cap_wtm_hit && IDLE`; `cap_wtm_hit` is only cleared by
+  a successful drain, so a gateway-down night spun jitter + 2× `WIFI_PowerOn`
+  continuously — radio at max duty, the opposite of ADR-021's intent. Added a
+  `CAP_WTM_COOLDOWN_MS` (10 min) back-off after a failed safety-flush drain.
+
+### Known limitation (not fixed)
+- PSRAM ring overwrite: `cap_ring_wptr` wraps with no live-mission collision check
+  and `m->byte_count` is uncapped (`main.c` ring-write site). Unreachable in normal
+  ops (missions ~1.3 MB ≪ 8 MB ring); only bites after repeated drain failures.
+  Documented with an in-code `DEFER` comment and tracked as P2-16.
+
+### Docs
+- `wire_protocol.md §2` documents the type-6 `DrainAck` and the Phase-1
+  blast+BEGIN-ack flow. `sampling_strategy.md` corrected — the "nothing is freed
+  until `ACK_COMPLETE`" claim was false for Phase 1 (no ARQ exists); a mission is
+  freed on the BEGIN-ack liveness check, with full `ACK_COMPLETE` deferred to
+  Phase 2. (A stale copy of the same claim remains in `decisions.md:787` — tracked,
+  out of this change set's file scope.)
+
+### Hardware verification pending
+- `Drain_WaitForAck` does `recvfrom` on the existing **send** socket (ephemeral
+  local port); the gateway replies to the BEGIN's source address. Standard
+  BSD/LwIP semantics, but `BEACON_Run` uses a separate **bound** socket, so this
+  exact recv-on-sendto-socket path is unverified on the MXCHIP EMW3080. Confirm on
+  the first flashed run. Fallback if it fails: `bind` the drain socket to a fixed
+  local port at creation.
+
+---
+
 ## [Unreleased] — Alumet Relay Log Housekeeping (ADR-011 Phase 2)
 
-**Goal:** Bound unbounded growth of the alumet-relay logs on the Jetson eMMC
-(the CSV had reached ~330 MB). Housekeeping only — no energy-measurement logic
-change.
+**Goal:** Bound unbounded alumet-relay log growth on the Jetson eMMC (CSV had
+reached ~330 MB). Housekeeping only — no energy-measurement logic change.
 
 ### Added
 - `entrypoint.sh` rotates the live CSV once it passes `ALUMET_CSV_MAX_MB`
@@ -23,7 +84,6 @@ change.
   `ALUMET_LOG_KEEP` (5, incl. current run).
 - Three env knobs wired through `compose.yaml` + documented in `.env.example`
   and `client/alumet-relay/OVERVIEW.md`. No new image dependency (no logrotate).
-
 ---
 
 ## [Unreleased] — Idle-Waveform Trim Fix + Dashboard Drift Cleanup (ADR-021)

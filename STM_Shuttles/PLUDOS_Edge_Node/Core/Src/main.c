@@ -266,6 +266,7 @@ static uint32_t tx_window_start_tick = 0U;
                                        * many captures survive a long radio-dark idle (most-recent-N kept).
                                        * 256 × sizeof(CaptureMission_t) ≈ 8 KB SRAM. */
 #define CAP_RING_WTM_BYTES    (PSRAM_SIZE_BYTES - (PSRAM_SIZE_BYTES / 4U)) /* 75% = 6 MB drain trigger */
+#define CAP_WTM_COOLDOWN_MS   600000U /* 10 min back-off after a failed watermark safety-flush drain (gateway down) — stops the radio spinning at max duty overnight (opposite of ADR-021 intent) */
 
 /* Per-mission bookkeeping; the sample bytes themselves live in the PSRAM ring. */
 typedef struct
@@ -306,8 +307,11 @@ static uint8_t  cap_fifo_buf[CAP_FIFO_READ_WORDS * CAP_FIFO_WORD_BYTES]; /* SRAM
 #define DRAIN_TYPE_BEGIN       1U
 #define DRAIN_TYPE_CHUNK       2U
 #define DRAIN_TYPE_END         3U
+#define DRAIN_TYPE_ACK         6U            /* gateway→shuttle BEGIN liveness echo (delivery evidence, NOT ARQ; types 4/5 reserved for future NAK/ACK_COMPLETE) */
 #define DRAIN_CHUNK_PAYLOAD    1400U         /* 200 FIFO words — never splits a word across chunks */
 #define DRAIN_CTRL_REPEAT      3U            /* resend BEGIN/END N times (control-loss tolerance) */
+#define DRAIN_ACK_WAIT_MS      150           /* per-attempt SO_RCVTIMEO while waiting for the BEGIN echo */
+#define DRAIN_ACK_ATTEMPTS     5U            /* echo-wait attempts; >3 so leftover echoes from the prior mission (gateway replies per BEGIN ×3) can be skipped before this mission's fresh ack. Only the silent (gateway-down) case pays the full ~750 ms; queued packets return immediately */
 #define DRAIN_CHUNK_PACE_EVERY 8U            /* yield 1 ms every N chunks so the EMW3080 MAC queue and the gateway UDP socket drain between bursts — mitigates bursty consecutive chunk loss */
 #define DRAIN_WARMUP_PACKETS   24U           /* sacrificial datagrams to absorb the post-power-on loss window (~16 pkts measured) */
 #define DRAIN_WARMUP_GAP_MS    8U            /* inter-packet pace so each junk pkt actually reaches air (advances ARP/MAC-learning) instead of piling into the SPI TX queue */
@@ -337,6 +341,11 @@ typedef struct __attribute__((packed))
   uint32_t magic; uint8_t type; uint8_t shuttle_id; uint16_t mission_id;
   uint16_t total_chunks; uint16_t _pad; uint32_t crc32_all;
 } DrainEnd_t;
+
+typedef struct __attribute__((packed))
+{
+  uint32_t magic; uint8_t type; uint8_t shuttle_id; uint16_t mission_id;
+} DrainAck_t;  /* 8 bytes — gateway BEGIN-liveness echo (type 6); proves the Jetson received our BEGIN */
 
 static uint8_t drain_buf[sizeof(DrainChunkHdr_t) + DRAIN_CHUNK_PAYLOAD]; /* one chunk datagram staging */
 
@@ -1179,6 +1188,10 @@ static uint16_t Capture_Service(void)
      * Tags are preserved so the gateway demuxes accel (0x02) vs gyro (0x01) and rebuilds
      * each stream's timeline as t0 + index/ODR (sampling_strategy.md §12). */
     bytes = (uint32_t)n * CAP_FIFO_WORD_BYTES;
+    /* DEFER (known limitation): cap_ring_wptr wraps with no live-mission collision check
+     * and m->byte_count is uncapped, so a wrap during repeated drain failures can overwrite
+     * still-undrained data. Unreachable in normal ops (missions ~1.3 MB << 8 MB ring); only
+     * bites after many consecutive failed drains. Not fixed here — tracked separately. */
     for (i = 0U; i < bytes; i++)
     {
       ring[cap_ring_wptr] = cap_fifo_buf[i];
@@ -1278,6 +1291,40 @@ static uint32_t Drain_CRC32(const uint8_t *data, uint32_t len)
   return Drain_CRC32_Update(0xFFFFFFFFUL, data, len) ^ 0xFFFFFFFFUL;
 }
 
+/* Bounded wait for the gateway's DRAIN_BEGIN liveness echo (DrainAck, type 6).
+ * sendto() returning OK only proves the packet left the radio, not that the Jetson
+ * received it; this echo is the delivery evidence. recvfrom() runs on the send socket
+ * itself (ephemeral local port), so the gateway's reply to the BEGIN's source address
+ * lands here. SO_RCVTIMEO bounds each attempt. Returns 1 on a matching
+ * (shuttle_id, mission_id) ack, 0 if none arrives within DRAIN_ACK_ATTEMPTS. */
+static uint8_t Drain_WaitForAck(uint16_t mid)
+{
+  struct mx_sockaddr_in from = {0};
+  uint32_t   fromlen;
+  DrainAck_t ack;                       /* stack-local: drain_buf is a shared global, must not reuse it here */
+  int32_t    timeout_ms = DRAIN_ACK_WAIT_MS;
+  int32_t    n;
+  uint8_t    attempt;
+
+  (void)MX_WIFI_Socket_setsockopt(wifi_obj, socket_id, MX_SOL_SOCKET, MX_SO_RCVTIMEO,
+                                  &timeout_ms, sizeof(timeout_ms));
+
+  for (attempt = 0U; attempt < DRAIN_ACK_ATTEMPTS; attempt++)
+  {
+    fromlen = sizeof(from);
+    n = MX_WIFI_Socket_recvfrom(wifi_obj, socket_id, (uint8_t *)&ack, (int32_t)sizeof(ack),
+                                0, (struct mx_sockaddr *)&from, &fromlen);
+    if ((n == (int32_t)sizeof(ack)) && (ack.magic == DRAIN_MAGIC) &&
+        (ack.type == DRAIN_TYPE_ACK) && (ack.shuttle_id == (uint8_t)SHUTTLE_ID) &&
+        (ack.mission_id == mid))
+    {
+      return 1U;
+    }
+    /* A stray/unmatched datagram costs one attempt; loop until the budget is spent. */
+  }
+  return 0U;
+}
+
 /* Blast a sealed PSRAM mission to the gateway on UDP 5684 (ADR-020/021, Phase 1).
  * Sends BEGIN ×3, all CHUNKs once (raw 7-byte FIFO words, CRC per chunk), END ×3.
  * No back-channel yet — the gateway reassembles best-effort and flags gaps; the
@@ -1337,6 +1384,20 @@ static void Drain_Mission(int16_t idx)
   {
     (void)MX_WIFI_Socket_sendto(wifi_obj, socket_id, (uint8_t *)&beg, sizeof(beg),
                                 0, (struct mx_sockaddr *)&dest, sizeof(dest));
+  }
+
+  /* Delivery evidence (gap 1): wait for the gateway's BEGIN echo before committing to
+   * the multi-MB chunk blast. No echo ⇒ gateway unreachable or down — skip the blast to
+   * keep the radio dark (ADR-021 intent) and leave drained=0 so this mission retries on
+   * the next wake. The re-drain is idempotent: the gateway dedups on
+   * (shuttle_id, mission_id, sample_index). cap_undrained_bytes / cap_wtm_hit are left
+   * untouched so the watermark accounting still reflects the un-delivered data. */
+  if (Drain_WaitForAck(m->mission_id) == 0U)
+  {
+    sprintf(uart_buf, "[DRAIN] mission %u: no gateway ack — skipping blast, retry next wake\r\n",
+            (unsigned)m->mission_id);
+    HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+    return;
   }
 
   /* CHUNKs — copy each window out of the PSRAM ring (byte-wise wrap), CRC it, send. */
@@ -1512,12 +1573,23 @@ static void Drain_AllPending(void)
 
   if (powered == 0)
   {
+    uint8_t ip_refreshed = 0U;
     Drain_WarmupBurst();  /* absorb the post-power-on loss window before real data */
     for (i = 0U; i < cap_mission_count; i++)
     {
       if ((cap_missions[i].sealed != 0U) && (cap_missions[i].drained == 0U))
       {
         Drain_Mission((int16_t)i);
+        /* Stale-IP self-heal (gap 2): a mission still undrained after Drain_Mission means
+         * no gateway echo — the cached jetson_ip may be stale (gateway DHCP lease changed).
+         * The radio is already up here, so refresh the IP once per wake via a quick beacon;
+         * later missions in this batch use the new address, and the failed one retries next
+         * wake. On a beacon miss BEACON_Run keeps the existing IP, so this is safe. */
+        if ((cap_missions[i].drained == 0U) && (ip_refreshed == 0U))
+        {
+          (void)BEACON_Run(1U, BEACON_RETRY_TIMEOUT_MS);
+          ip_refreshed = 1U;
+        }
       }
     }
   }
@@ -1970,18 +2042,32 @@ int main(void)
      * PHASE 2d: ADR-021 safety flush — total un-drained ring crossed 75%.
      * Force a drain without a mission boundary (overnight idle-park guard).
      * --------------------------------------------------------------- */
-    if ((cap_wtm_hit != 0U) && (current_state == STATE_IDLE))
     {
-      if (cap_snapshot_active != 0U)
+      /* Retry back-off (gap 3): cap_wtm_hit is only cleared by a successful drain, so a
+       * gateway-down night would otherwise re-fire this every loop iteration — jitter +
+       * 2× WIFI_PowerOn continuously, radio at max duty (opposite of ADR-021's intent).
+       * After a failed safety-flush drain, hold off CAP_WTM_COOLDOWN_MS before retrying.
+       * Signed tick diff is wrap-safe over the 10 min window. */
+      static uint32_t cap_wtm_retry_after_tick = 0U;
+      if ((cap_wtm_hit != 0U) && (current_state == STATE_IDLE) &&
+          ((int32_t)(HAL_GetTick() - cap_wtm_retry_after_tick) >= 0))
       {
-        Capture_EnterIdle();          /* seal the in-flight snapshot first */
-        cap_snapshot_active    = 0U;
-        cap_last_snapshot_tick = HAL_GetTick();
+        if (cap_snapshot_active != 0U)
+        {
+          Capture_EnterIdle();          /* seal the in-flight snapshot first */
+          cap_snapshot_active    = 0U;
+          cap_last_snapshot_tick = HAL_GetTick();
+        }
+        sprintf(uart_buf, "[DRAIN] safety flush — undrained %luB >= 75%%\r\n",
+                (unsigned long)cap_undrained_bytes);
+        HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+        Drain_AllPending();
+        /* Still hot ⇒ the drain failed to relieve pressure (gateway down). Back off. */
+        if (cap_wtm_hit != 0U)
+        {
+          cap_wtm_retry_after_tick = HAL_GetTick() + CAP_WTM_COOLDOWN_MS;
+        }
       }
-      sprintf(uart_buf, "[DRAIN] safety flush — undrained %luB >= 75%%\r\n",
-              (unsigned long)cap_undrained_bytes);
-      HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
-      Drain_AllPending();
     }
 
     /* -----------------------------------------------------------------

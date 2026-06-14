@@ -488,7 +488,8 @@ back-channel to the shuttle (for NAK/ACK). Keep the two concerns separate:
 ~4.49/6 ≈ 0.75 Mbps → a 675 KB mission drains in ~7 s instead of ~1.2 s, plus
 ARQ rounds. Still inside a typical IDLE gap **if drains are staggered**. If they
 aren't, either stagger (§12 scheduler) or drain across multiple IDLE windows
-(the PSRAM holds the mission until `ACK_COMPLETE`).
+(in Phase 1 the PSRAM holds the mission until the gateway echoes a `DRAIN_ACK`
+for its `DRAIN_BEGIN`; the full `ACK_COMPLETE` per-chunk guarantee is Phase 2).
 
 **Upgrade path** (only with evidence): fault content above ~800 Hz → accel
 6667 Hz + LPF2 ODR/4 (1666 Hz band) + I²C **FM+ 1 MHz**. Energy too high →
@@ -539,8 +540,13 @@ always-on stream and ADR-020's "live stream unaffected" framing.
 Between triggers the radio is fully off. Re-power costs ~4 s (DHCP-dominated,
 hardware-measured) — paid during IDLE where latency is free. `jetson_ip` is cached
 across cycles so re-draining skips the beacon. If a drain cannot complete (Jetson
-unreachable, ARQ round cap hit), the data **stays in PSRAM** and is retried on the
-next trigger — nothing is freed until `ACK_COMPLETE`.
+unreachable), the data **stays in PSRAM** and is retried on the next trigger. In
+Phase 1 a mission is freed (`drained=1`) once the gateway echoes a `DRAIN_ACK` for
+its `DRAIN_BEGIN` — a liveness check, not a per-chunk guarantee; the full
+`ACK_COMPLETE` selective-repeat guarantee is Phase 2 (§9). If the echo is missing
+the shuttle skips the chunk blast entirely (keeps the radio dark) and retries the
+whole mission next wake; the gateway's `(shuttle_id, mission_id, sample_index)`
+dedup makes the re-drain idempotent.
 
 ### Implemented vs pending
 

@@ -119,14 +119,20 @@ datagrams on port **5684** (the legacy `NonCriticalPayload` use of this port was
 removed by ADR-015; the port is now reused for the drain). The live 24-byte
 `PludosTelemetry` path on 5683 (§1) is untouched.
 
-**Phase 1 (current): blast-only.** STM sends `DRAIN_BEGIN` (×3), then all chunks
-back-to-back, then `DRAIN_END` (×3). No back-channel. The gateway reassembles by
-`chunk_seq`, validates each chunk's CRC32, and writes one Parquet per
-`(shuttle_id, mission_id)` on `DRAIN_END` (or a quiet timeout), marking
-`complete=false` and recording gap ranges if any chunk is missing.
+**Phase 1 (current): blast + BEGIN-ack.** STM sends `DRAIN_BEGIN` (×3), then all
+chunks back-to-back, then `DRAIN_END` (×3). The only back-channel is an 8-byte
+`DRAIN_ACK` (type 6) the gateway echoes on **each** received `DRAIN_BEGIN`: it is
+delivery evidence ("the Jetson is listening"), **not** retransmission. The shuttle
+waits a bounded window for it and only marks the mission drained if it arrives;
+otherwise it skips the chunk blast and retries the whole mission on the next wake
+(re-drain is idempotent — the gateway dedups on `(shuttle_id, mission_id,
+sample_index)`). The gateway reassembles by `chunk_seq`, validates each chunk's
+CRC32, and writes one Parquet per `(shuttle_id, mission_id)` on `DRAIN_END` (or a
+quiet timeout), marking `complete=false` and recording gap ranges if any chunk is
+missing.
 **Phase 2 (planned): NAK selective-repeat ARQ** (`sampling_strategy.md §9`) layers
 `NAK`/`ACK_COMPLETE` back-channel packets (types 4/5) on top of this same frame
-format without changing the on-wire layout of types 1–3.
+format without changing the on-wire layout of types 1–3 or the type-6 ack.
 
 ### Common framing
 - All multi-byte fields **little-endian** (both ends are LE; structs are packed).
@@ -188,6 +194,17 @@ typedef struct __attribute__((packed)) {
   uint16_t _pad;
   uint32_t crc32_all;    /* CRC32 of the full concatenated payload, 0 = unused */
 } DrainEnd_t;
+
+/* type=6 DRAIN_ACK — gateway → shuttle BEGIN liveness echo. 8 bytes.
+ * Replied on every received DRAIN_BEGIN so the shuttle knows the drain landed
+ * (ADR-021 delivery evidence). NOT ARQ; types 4/5 stay reserved for Phase-2
+ * NAK/ACK_COMPLETE. The shuttle matches it on (magic, type, shuttle_id, mission_id). */
+typedef struct __attribute__((packed)) {
+  uint32_t magic;        /* 0x52444C50                                   */
+  uint8_t  type;         /* 6                                            */
+  uint8_t  shuttle_id;
+  uint16_t mission_id;
+} DrainAck_t;
 ```
 
 ### Payload semantics

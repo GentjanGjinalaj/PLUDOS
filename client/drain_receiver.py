@@ -10,11 +10,14 @@ all CHUNK packets back-to-back, then DRAIN_END (×3). See `docs/wire_protocol.md
 §2` for the authoritative byte layout and `docs/sampling_strategy.md §12` for
 the design intent.
 
-PHASE 1 = BLAST-ONLY: no NAK/ACK back-channel yet. The receiver reassembles by
-`chunk_seq`, validates each chunk's CRC32, and writes one (or two) Parquet
-file(s) per `(shuttle_id, mission_id)` on DRAIN_END or a quiet-timeout watchdog.
-If chunks are missing it still writes with `all_packets_received=false` and
-records the gap ranges plus per-mission packet counts. The code is structured (a `MissionReassembler` class, clear functions)
+PHASE 1 = BLAST + BEGIN-ACK: the only back-channel is an 8-byte liveness echo
+(`DrainAck`, type 6) replied on each DRAIN_BEGIN so the shuttle knows the drain
+landed (ADR-021 delivery evidence) — this is NOT selective-repeat ARQ. The
+receiver reassembles by `chunk_seq`, validates each chunk's CRC32, and writes
+one (or two) Parquet file(s) per `(shuttle_id, mission_id)` on DRAIN_END or a
+quiet-timeout watchdog. If chunks are missing it still writes with
+`all_packets_received=false` and records the gap ranges plus per-mission packet
+counts. The code is structured (a `MissionReassembler` class, clear functions)
 so the Phase-2 NAK selective-repeat ARQ (`sampling_strategy.md §9`) can be
 layered on without reworking the frame parsing.
 
@@ -83,6 +86,10 @@ DRAIN_MAGIC = 0x52444C50
 TYPE_BEGIN = 1
 TYPE_CHUNK = 2
 TYPE_END   = 3
+# BEGIN liveness echo sent back to the shuttle so it knows the drain landed (ADR-021
+# delivery evidence). NOT selective-repeat ARQ — just "someone is listening". Types
+# 4/5 stay reserved for the future NAK/ACK_COMPLETE back-channel.
+TYPE_ACK   = 6
 
 # DrainBegin_t: magic(4) type(1) sid(1) mid(2) total_chunks(2) odr_a(2) odr_g(2)
 #               temp_c_x100(2,int16) pressure_hpa_x10(2) is_idle_snapshot(1) _pad(1)
@@ -107,6 +114,11 @@ assert CHUNK_HDR_SIZE == 18, f"DrainChunk header must be 18 bytes, got {CHUNK_HD
 END_FMT  = "<IBBHHHI"
 END_SIZE = struct.calcsize(END_FMT)
 assert END_SIZE == 16, f"DrainEnd must be 16 bytes, got {END_SIZE}"
+
+# DrainAck_t: magic(4) type(1) sid(1) mid(2) = 8 B. Echoed to the sender on each BEGIN.
+ACK_FMT  = "<IBBH"
+ACK_SIZE = struct.calcsize(ACK_FMT)
+assert ACK_SIZE == 8, f"DrainAck must be 8 bytes, got {ACK_SIZE}"
 
 # FIFO word layout — 7 bytes per word: [tag, Xl, Xh, Yl, Yh, Zl, Zh].
 FIFO_WORD_SIZE = 7
@@ -530,6 +542,22 @@ class DrainProtocol(asyncio.DatagramProtocol):
         # time. TTL-expired (DEDUP_TTL_S) so a firmware reset re-using a low
         # mission_id is accepted as a new drain, not dropped as a late duplicate.
         self.recent_done: dict[tuple[int, int], float] = {}
+        # Set in connection_made; used to echo the BEGIN liveness ack to the sender.
+        self.transport: asyncio.DatagramTransport | None = None
+
+    # Capture the transport so we can reply to the sender (BEGIN liveness echo).
+    def connection_made(self, transport) -> None:
+        self.transport = transport
+
+    # Echo an 8-byte DrainAck to the shuttle so it knows this BEGIN was received
+    # (ADR-021 delivery evidence). Best-effort: a failed send must never break ingest.
+    def _send_ack(self, sid: int, mid: int, addr) -> None:
+        if self.transport is None:
+            return
+        try:
+            self.transport.sendto(struct.pack(ACK_FMT, DRAIN_MAGIC, TYPE_ACK, sid, mid), addr)
+        except Exception as exc:
+            logger.debug("[DRAIN] ack send failed %s: %s", _tag(sid, mid), exc)
 
     # True if key was finalised within DEDUP_TTL_S — a late duplicate of a still-
     # fresh drain. Expired entries are pruned so the id is re-usable after a reset.
@@ -560,6 +588,10 @@ class DrainProtocol(asyncio.DatagramProtocol):
 
     # DRAIN_BEGIN: create the reassembler (idempotent — sent ×3 for robustness).
     def _on_begin(self, key, f, addr) -> None:
+        # Echo on every BEGIN copy (×3) so the shuttle gets up to three chances to see
+        # the liveness ack even if one is lost in the post-power-on window. Sent before
+        # the dedup/duplicate returns precisely so duplicates still echo.
+        self._send_ack(f["shuttle_id"], f["mission_id"], addr)
         if self._recently_done(key):
             return  # late re-announce of a just-finalised drain; ignore.
         if key in self.missions:
