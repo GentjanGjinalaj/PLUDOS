@@ -16,6 +16,7 @@ Federated use (client.py):
 
 import logging
 import os
+import re
 from pathlib import Path
 
 import numpy as np
@@ -96,6 +97,26 @@ def _derive_features(df: pd.DataFrame) -> pd.DataFrame:
 # Data loading
 # ---------------------------------------------------------------------------
 
+# Daily-consolidated rollups are named YYYY-MM-DD.parquet (data-engine
+# _consolidate_day) — skip so a row is never double-counted (once in its live
+# mission_s* file, again in the day rollup).
+_DAILY_CONSOLIDATED_RE = re.compile(r"^\d{4}-\d{2}-\d{2}\.parquet$")
+
+
+# Keep only live mission telemetry Parquet; drop schema-incompatible files.
+# cap_* drain captures (ADR-021) carry the raw drain schema (sample_index, t_ms,
+# x, y, z, is_idle_snapshot, temp_c) — only temp_c overlaps the training feature
+# set, so loading them yields all-NaN rows that dropna() silently discards,
+# leaving a 0-sample frame and a garbage model. Prefix must match
+# drain_receiver.CAP_PREFIX ("cap").
+def _is_trainable_parquet(name: str) -> bool:
+    if name.startswith("cap_"):
+        return False
+    if _DAILY_CONSOLIDATED_RE.match(name):
+        return False
+    return True
+
+
 def load_buffered_data() -> tuple[np.ndarray, np.ndarray, str]:
     """
     Load and concatenate recent mission Parquet files from the RAM buffer.
@@ -108,12 +129,15 @@ def load_buffered_data() -> tuple[np.ndarray, np.ndarray, str]:
         raise FileNotFoundError(f"CRITICAL: Buffer directory {BUFFER_DIR} not found.")
 
     files = sorted(
-        [f for f in os.listdir(BUFFER_DIR) if f.endswith(".parquet")],
+        [f for f in os.listdir(BUFFER_DIR)
+         if f.endswith(".parquet") and _is_trainable_parquet(f)],
         key=lambda f: os.path.getmtime(os.path.join(BUFFER_DIR, f)),
     )
     if not files:
         raise FileNotFoundError(
-            "CRITICAL: No Parquet files found in buffer. "
+            "CRITICAL: No trainable mission Parquet files in buffer "
+            "(cap_* drain captures and daily-consolidated rollups are skipped — "
+            "their schema is incompatible with the training feature set). "
             "Ensure at least one shuttle mission has completed before triggering an FL round."
         )
 
@@ -141,6 +165,17 @@ def load_buffered_data() -> tuple[np.ndarray, np.ndarray, str]:
     # reads the raw axes directly; IsolationForest/XGBoost use the derived columns.
     feature_cols = _RAW_FEATURES + ["accel_mag", "gyro_mag", "rolling_accel_std_10"]
     df_clean = df[feature_cols].dropna()
+
+    # Guard: fail loudly rather than train XGBoost on an empty frame and save a
+    # garbage 0-sample model. Triggers if the loaded files lack the live
+    # telemetry schema (raw accel/gyro axes) and every row drops out at dropna().
+    if df_clean.empty:
+        raise ValueError(
+            "CRITICAL: 0 trainable samples after dropping rows missing raw features. "
+            "Loaded Parquet files lack the live telemetry schema (accel/gyro axes). "
+            "FL training skipped — no valid mission data available."
+        )
+
     X_train  = df_clean.values
 
     # T3.4: decide labeller once per round; log it explicitly.

@@ -6,6 +6,39 @@ order. Each entry maps to one or more ADRs or resolved backlog items
 
 ---
 
+## [Unreleased] — Correctness & Consistency Fixes + FL Drain-Disconnect Guard
+
+**Goal:** Small correctness/consistency batch — no FL redesign, no firmware logic
+change. Sync two stale comments/docs to the code, and add one guard so the FL
+worker fails loudly instead of training on an empty frame. See
+`docs/current_problems.md` FL-P0.
+
+### Fixed
+- **FL worker trained on 0 samples (FL-P0).** `anomaly.py::load_buffered_data`
+  globbed all `*.parquet`. Under ADR-021 the only files written are `cap_*` drain
+  captures whose raw schema shares only `temp_c` with the training feature set, so
+  `dropna()` emptied every row and `ai-worker` silently retrained on 0 samples and
+  saved a garbage model (observed every cycle for 3 days on the live Jetson). Added
+  a guard: the loader now skips `cap_*` and daily-consolidated (`YYYY-MM-DD.parquet`)
+  files and raises a clear error on an empty frame instead of training. Guard only —
+  the real FL↔cap-schema reconnect stays deferred to the FL phase.
+
+### Docs / comments
+- `state_machine.md`: MOVING entry threshold corrected `0.05` → `0.06 g²` to match
+  `MOVEMENT_THRESHOLD_G2 = 0.06f` (all 7 references, incl. the derived
+  `√(1 + 0.06) − 1 ≈ 0.0296 g`).
+- `main.c`: PHASE 2c comment "every 5 min" → "every 10 min" (matches
+  `CAP_IDLE_SNAP_PERIOD_MS = 600000`); threshold inline comment "0.05 is a guess" →
+  "0.06".
+
+### Backlog (recorded in the gitignored `current_problems.md`, not fixed)
+- FL-P0 (guard added here, real reconnect deferred), FL-P1 (ADR-010 tree-set union
+  duplicates the shared prefix G× per round under T3.6 warm-start with >1 gateway),
+  P2-17 (daily-consolidation dedup key collides across STM reboots — dead path,
+  recorded only).
+
+---
+
 ## [Unreleased] — Drain Delivery-Evidence + Retry Back-off (ADR-021 Phase 1)
 
 **Goal:** Close three silent drain-integrity failure modes that don't bite on a

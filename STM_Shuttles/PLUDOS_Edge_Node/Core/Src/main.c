@@ -118,7 +118,7 @@ static uint32_t continuous_movement_start_tick = 0U; /* tick when the current dw
 static uint32_t fsm_settle_until_tick = 0U; /* suppress motion trigger until this tick: OUTX is filter-settling after a CTRL1_XL ODR change */
 
 /* UNCALIBRATED — set threshold = mean(idle_mag²) + 5σ after recording
-   5 min IDLE + 5 min motion on the actual fixture. Current 0.05 is a guess. */
+   5 min IDLE + 5 min motion on the actual fixture. Current 0.06 is a guess. */
 #define MOVEMENT_THRESHOLD_G2   0.06f    /* |mag² - 1g²| trigger — tilt-immune (magnitude stays 1g at any orientation) and captures horizontal travel (deviation ~= a_horiz²). TUNE from UART rest-floor capture. */
 #define MOVEMENT_DWELL_MS       500U     /* continuous-above duration to enter STATE_MOVING (0.5s: reliable real-world trigger without qualifying transient shakes) */
 #define MOVEMENT_DEBOUNCE_MS    300U     /* sub-threshold tolerance inside a dwell — survives motion microbreaks */
@@ -2011,7 +2011,7 @@ int main(void)
     }
 
     /* -----------------------------------------------------------------
-     * PHASE 2c: low-rate IDLE snapshot (ADR-021 §1) — 10 s every 5 min,
+     * PHASE 2c: low-rate IDLE snapshot (ADR-021 §1) — 10 s every 10 min,
      * accel+gyro at 12.5 Hz, stamped with temp/pressure at seal, drained on
      * the next MOVING→IDLE WiFi wake. Skipped entirely while MOVING.
      * --------------------------------------------------------------- */

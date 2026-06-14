@@ -37,7 +37,7 @@ replaced by a continuous unified UDP stream. There is no buffer.
 - **Telemetry:** no continuous TX. MOVING signal is captured into the ISM330
   FIFO → PSRAM at accel 3332 Hz / gyro 416 Hz (≈8:1) and drained after the run
   (ADR-021)
-- **Entry condition:** accelerometer deviation `> 0.05 g²` continuously
+- **Entry condition:** accelerometer deviation `> 0.06 g²` continuously
   for **500 ms** (with a 300 ms debounce tolerance — see below)
 - **Actions on entry:** none beyond logging the transition; the next loop
   iteration continues with `state = 1`
@@ -68,12 +68,12 @@ replaced by a continuous unified UDP stream. There is no buffer.
 
 The naïve "reset dwell on any below-threshold sample" approach fails for
 real-world motion: at 10 Hz IDLE sampling rate, a normal linear push
-produces accelerometer samples that briefly dip below 0.05 g² between
+produces accelerometer samples that briefly dip below 0.06 g² between
 peaks. The dwell counter never reaches 500 ms unless the user shakes
 hard.
 
 The firmware tracks `last_above_threshold_tick` — the most recent sample
-where `deviation > 0.05 g²`. The dwell counter is only reset when
+where `deviation > 0.06 g²`. The dwell counter is only reset when
 `HAL_GetTick() - last_above_threshold_tick > MOVEMENT_DEBOUNCE_MS`
 (default **300 ms**).
 
@@ -114,9 +114,9 @@ within 10 s anyway.
 
 - **Sensor:** ISM330DHCX, 6-axis IMU on I2C2 at address 0x6B (SA0=VDD on
   IOT02A), left-shifted to 0xD6 in firmware.
-- **Threshold:** `0.05 g²` — squared-magnitude comparison. The firmware
+- **Threshold:** `0.06 g²` — squared-magnitude comparison. The firmware
   computes `ax² + ay² + az²` in g² and compares directly, equivalent to a
-  resultant magnitude of `√(1 + 0.05) − 1 ≈ 0.0247 g` deviation from
+  resultant magnitude of `√(1 + 0.06) − 1 ≈ 0.0296 g` deviation from
   gravity. No square root computed (avoids floating-point cost on M33).
 - **Dwell to enter MOVING:** 500 ms continuous above threshold, with
   300 ms debounce.
@@ -154,7 +154,7 @@ longer on the wire (ADR-015 v2).
 
 | Constant | Value | Location | Purpose |
 |---|---|---|---|
-| `MOVEMENT_THRESHOLD_G2` | `0.05f` | `main.c` | Above this, sample counts toward dwell |
+| `MOVEMENT_THRESHOLD_G2` | `0.06f` | `main.c` | Above this, sample counts toward dwell |
 | `MOVEMENT_DWELL_MS` | `500U` | `main.c` | Continuous-above duration to enter MOVING |
 | `MOVEMENT_DEBOUNCE_MS` | `300U` | `main.c` | Tolerance for sub-threshold dips during dwell |
 | `NO_MOVEMENT_TIMEOUT_MS` | `20000U` | `main.c` | No-above-threshold duration to exit MOVING |
@@ -180,7 +180,7 @@ longer on the wire (ADR-015 v2).
   gateway-side `POWER_*_MW` estimate was also removed in the schema-v4
   raw-only cull, so there is no shuttle power/energy figure at all. Real
   INA3221/Alumet measurement on the Jetson side is tracked in ADR-011.
-- **Threshold tuning:** `MOVEMENT_THRESHOLD_G2 = 0.05f` is conservative.
+- **Threshold tuning:** `MOVEMENT_THRESHOLD_G2 = 0.06f` is conservative.
   If false-trigger rate or missed-mission rate becomes an issue with real
   shuttle motion, retune against logged data — the squared-magnitude axis
   in the Parquet files makes this an offline analysis.
