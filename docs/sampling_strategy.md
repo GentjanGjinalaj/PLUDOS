@@ -3,17 +3,22 @@
 Why each PLUDOS sensor channel is sampled at the rate it is. This is the
 rationale companion to:
 
-- `state_machine.md` — the IDLE/MOVING FSM that gates the *live* stream rates
-  (ADR-015 v2, currently flashed).
-- `decisions.md` ADR-020 — the *planned* high-rate capture + PSRAM buffer +
-  burst-drain architecture that the kHz accelerometer rate is for.
+- `state_machine.md` — the IDLE/MOVING FSM whose poll rates gate state
+  transitions (ADR-015 v2 FSM, currently flashed).
+- `decisions.md` ADR-020/021 — the high-rate capture + PSRAM buffer +
+  burst-drain architecture that the kHz accelerometer rate is for. This is
+  the **implemented** data path (Phase 1 flashed 2026-06-03).
 
-Two regimes coexist, and they sample for **different reasons**:
+There are two distinct sample-rate roles. Only the second produces stored
+data — the live stream was superseded by the capture-and-drain path (ADR-021):
 
-| Regime | Purpose | Where defined |
+| Role | Purpose | Where defined |
 |---|---|---|
-| **Live stream** (ADR-015, now) | Real-time health + FSM motion gating | `state_machine.md` |
-| **High-rate capture** (ADR-020, planned) | Offline vibration / predictive-maintenance dataset | this doc + ADR-020 |
+| **FSM poll** (10 Hz IDLE / 50 Hz MOVING) | Motion gating only — never transmitted, never stored | `state_machine.md` |
+| **High-rate capture** (accel 3332 Hz / gyro 416 Hz; 12.5 Hz idle snapshot) | The actual vibration / predictive-maintenance dataset, drained to the gateway | this doc + ADR-020/021 |
+
+> The old continuous live stream (ADR-015) is gone: the radio is off except
+> during a drain window, so the FSM poll no longer corresponds to any TX rate.
 
 ---
 

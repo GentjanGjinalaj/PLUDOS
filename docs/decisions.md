@@ -166,7 +166,7 @@ without touching any other part of `server.py`.
 ---
 
 ## ADR-011 — Real Alumet energy integration
-**Status:** OPEN — Phase 2 operational (INA3221 live, Prometheus + InfluxDB + CSV outputs confirmed); relay-client architecture decision pending (see below)
+**Status:** CLOSED (2026-05-26) — Phase 1 + Phase 2 operational (INA3221 live, Prometheus + InfluxDB + CSV outputs confirmed); relay-client architecture decided and implemented (see below)
 
 **Architecture:**
 ```
@@ -178,7 +178,7 @@ Jetson Orin Nano                         Central Server (laptop)
 │  server InfluxDB (Phase 1) │  (direct) │  streams (Phase 2 / gRPC)    │
 │                            │           │  writes fl_energy, device=   │
 │ Alumet relay sidecar       │──gRPC──►  │  server to InfluxDB          │
-│  (Phase 2 — open)          │ Tailscale │                              │
+│  (Phase 2 — closed)        │ Tailscale │                              │
 └────────────────────────────┘           └──────────────────────────────┘
 ```
 

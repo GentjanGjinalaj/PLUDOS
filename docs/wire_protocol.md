@@ -24,7 +24,10 @@ NC-UDP split was removed by ADR-015.
 Single 24-byte payload sent as raw UDP datagram. All sensor values are
 `int16_t` scaled integers — halves wire cost vs float32 while delivering
 2 decimal places of precision, sufficient for ±2 g accel and ±250 dps
-gyro. `power_mw` is not transmitted; gateway derives it from `state`.
+gyro. `power_mw` is not transmitted and is no longer derived on the gateway
+(the `power_mw × elapsed` estimate was dropped in the schema-v4 raw-only cull,
+ADR-017). Real shuttle-side power is a future INA3221/Alumet path (ADR-011);
+the Jetson's own board power is measured by the alumet-relay sidecar today.
 
 ### Sentinel
 
@@ -88,23 +91,30 @@ val / 10.0   # humidity (%RH)
 - `accel_x/y/z` — ISM330DHCX accelerometer, ±2 g FS. In the live/FSM read
   the ODR is 104 Hz with on-chip LPF2 (cutoff ODR/10 ≈ 10.4 Hz), alias-free
   over the 0–10 Hz motion band. (High-rate MOVING capture uses ODR 3332 Hz;
-  see ADR-021.) FSM uses magnitude deviation > 0.05 g² for movement detection.
+  see ADR-021.) FSM uses magnitude deviation > 0.06 g² (`MOVEMENT_THRESHOLD_G2`)
+  for movement detection.
 - `gyro_x/y/z` — ISM330DHCX gyroscope, ±250 dps FS, 8.75 mdps/LSB
   (DS13281 Table 3). `gyro_z` = yaw rate (turns/curves); `gyro_x/y` =
   torsional vibration from motor/bearing faults.
 - `temp_c` — HTS221, °C × 100. 0x7FFF if sensor unavailable.
 - `humidity_pct` — HTS221 %RH × 10. 0x7FFF if unavailable.
-- `power_mw` — **not transmitted**. Derived from `state`:
-  `POWER_IDLE_MW` (default 89 mW) or `POWER_MOVING_MW` (default 260 mW).
-  ADR-011 tracks the path to real INA3221/Alumet measurements.
+- `power_mw` — **not transmitted, not derived**. The old gateway-side
+  `state`→power estimate (`POWER_IDLE_MW` / `POWER_MOVING_MW`) was removed in
+  the schema-v4 raw-only cull (ADR-017). No per-shuttle power measurement
+  exists today; ADR-011 tracks the path to real INA3221/Alumet measurements.
 
 ### No reliability layer
 
 Each `sendto` is fire-and-forget. The packet either reaches the gateway
 within one WiFi hop or it is lost. There is no per-packet ACK, no retry,
-no `mission_active = 0` end-marker. The continuous stream (24 B every
-20 ms during MOVING, every 1 s during IDLE) is the reliability mechanism:
-losing one sample is invisible because the next one arrives moments later.
+no `mission_active = 0` end-marker.
+
+> **ADR-021:** there is no continuous 24-byte stream anymore — the radio is
+> off during both MOVING and IDLE except inside a drain window. Any
+> `PludosTelemetry` packets that do reach the gateway arrive only as
+> opportunistic bursts during that window. Reliability for the actual signal
+> is carried by the §2 drain path (CRC32 per chunk, BEGIN-ack, idempotent
+> re-drain), not by this best-effort live datagram.
 
 This is a deliberate trade-off, see ADR-015: liveness of the FSM and
 visibility of environmental data take priority over per-packet delivery.
@@ -258,9 +268,10 @@ Also written: `fl_phases` (per-phase summary: load/train/round_total, by `Alumet
 `stm_mission` (per-shuttle mission summary: `packets`/`duration_ms`, by the data-engine).
 See `docs/ANALYTICS.md §3` for full schemas.
 
-**Status (ADR-011):** Phase 1 done — `tegrastats` on Jetson, Intel RAPL on server.
-Phase 2 scaffolded — Alumet relay sidecar built, relay flags confirmed, hardware build pending.
-See ADR-011 in `docs/decisions.md`.
+**Status (ADR-011):** CLOSED (2026-05-26). Phase 1 — `tegrastats` on Jetson,
+Intel RAPL on server. Phase 2 — Alumet relay sidecar deployed and verified on
+hardware (INA3221 `input_current`/`input_voltage` → Prometheus :9095 + CSV +
+InfluxDB). See ADR-011 in `docs/decisions.md`.
 
 ---
 

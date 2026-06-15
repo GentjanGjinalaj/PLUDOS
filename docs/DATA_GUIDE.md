@@ -27,11 +27,16 @@ data-engine.py  (Jetson)
   └── on buffer pressure (soft/hard limit): intermediate flush
 ```
 
-> **ADR-021:** the high-rate MOVING vibration (accel 3332 Hz / gyro 416 Hz, ≈8:1)
-> and the 12.5 Hz IDLE snapshots are drained separately and land in `cap_accel_*`
-> / `cap_gyro_*` files, **not** the `mission_*.parquet` described here. This guide
-> documents the `PludosTelemetry` (`mission_*`) schema; for the drain capture see
-> ADR-020/021 and `docs/sampling_strategy.md`.
+> **ADR-021 — the `mission_*` live path is now dormant.** The firmware keeps the
+> radio off except during a drain window (TX gated on `wifi_driver_initialized`),
+> so in practice almost no `PludosTelemetry` packets reach the gateway and the
+> `mission_*.parquet` files documented here are usually empty or sparse. The
+> **real dataset** is the high-rate MOVING vibration (accel 3332 Hz / gyro 416 Hz,
+> ≈8:1) and the 12.5 Hz IDLE snapshots, which are drained on UDP `:5684` by
+> `drain_receiver.py` and land in `cap_accel_*` / `cap_gyro_*` files. This guide
+> documents the legacy `PludosTelemetry` (`mission_*`) schema; for the active
+> drain capture schema see `docs/parquet_schema.md §2`, ADR-020/021, and
+> `docs/sampling_strategy.md`.
 
 One Parquet file = one flush for one shuttle.
 Files are named `mission_s{id}_{unix_ms}.parquet`.
@@ -145,17 +150,29 @@ a future model needs them.
 
 ---
 
-## 6. Live InfluxDB fields (streamed in real time)
+## 6. InfluxDB measurements
 
-Written per-packet to the `stm_telemetry` measurement as the Jetson
-receives each packet — no buffer needed. All raw:
+The gateway writes three measurements. Two come from the active drain path
+(`drain_receiver.py`); the third is from the legacy live path and is now
+effectively dead. See `docs/ANALYTICS.md §3` for the full field/tag schema.
 
-`state`, `accel_x`, `accel_y`, `accel_z`, `tx_rate_hz`,
-`gyro_x`, `gyro_y`, `gyro_z`, `temp_c`, `humidity_pct`
+- **`stm_mission`** (drain summary, the live one Grafana actually shows) —
+  one point per drained mission/snapshot, tagged `source="drain"`,
+  `kind="mission"|"idle_snapshot"`. Fields: `packets_total`,
+  `packets_received`, `packets_lost`, `loss_pct`, `accel_samples`,
+  `gyro_samples`, `complete`, `accel_rms_g`, `accel_peak_g`,
+  `gyro_peak_dps`, and (idle snapshots) `temp_c`, `pressure_hpa`. Dashboards
+  filter on `source=="drain"`.
+- **`stm_idle_wave`** (drain, idle snapshots only) — per-sample waveform at
+  the snapshot ODR. Fields: `ax_g`, `ay_g`, `az_g`, and `gx_dps`/`gy_dps`/
+  `gz_dps` when gyro is present.
+- **`stm_telemetry`** (legacy live path, **dormant**) — was written per live
+  packet (`state`, `accel_*`, `gyro_*`, `temp_c`, `humidity_pct`,
+  `tx_rate_hz`). Since the radio is off outside drains it receives almost no
+  data, and no Grafana panel queries it.
 
-Gyro/temp/humidity fields are only written when present in the packet
-(IDLE packets may omit them). Mission summaries are written to
-`stm_mission` (`packets`, `duration_ms`) on each flush.
+Board power on the Jetson itself is measured by the alumet-relay sidecar
+(`input_current` / `input_voltage`, ADR-011), not by the data-engine.
 
 ---
 

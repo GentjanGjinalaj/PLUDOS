@@ -1,16 +1,34 @@
 # Parquet Schema — PLUDOS Shuttle Telemetry
 
-Each Parquet file represents one **mission flush** for one shuttle: the
-complete telemetry buffer from the first MOVING packet until 30 s of
-subsequent IDLE (or a mid-mission buffer-pressure overflow). Multiple
-files may exist per shuttle per day.
+The gateway writes **two families** of Parquet files into the same buffer
+directory:
 
-**Schema version:** v4 (raw-only). The gateway now stores **only raw
-signal** — no derived columns (`accel_mag`, `gyro_mag`, distance, energy,
-segmentation). All feature engineering happens at train time in
-`anomaly.py:_derive_features()`. This keeps the data-engine a pure
-collector and minimises Jetson CPU / SD-card load. Files produced by
-earlier versions will additionally carry derived columns that v4 ignores.
+1. **`cap_accel_*` / `cap_gyro_*` (drain captures) — the active dataset.**
+   High-rate IMU vibration drained from PSRAM on UDP `:5684` by
+   `drain_receiver.py` (ADR-020/021). This is where the real signal lives.
+   Schema in **§2** below.
+2. **`mission_s*` (live telemetry) — dormant.** The legacy `:5683`
+   `PludosTelemetry` flush handled by `data-engine.py`. Since ADR-021 the
+   firmware keeps the radio off outside drain windows, so these files are
+   usually empty/sparse. Schema in **§1** below, kept for reference.
+
+**Schema version:** v4 (raw-only). The gateway stores **only raw signal** —
+no derived columns (`accel_mag`, `gyro_mag`, distance, energy, segmentation).
+All feature engineering happens at train time in
+`anomaly.py:_derive_features()`. This keeps the data-engine a pure collector
+and minimises Jetson CPU / SD-card load. Files produced by earlier versions
+will additionally carry derived columns that v4 ignores.
+
+---
+
+# §1 — Live telemetry files (`mission_s*`, dormant)
+
+Each file represents one **mission flush** for one shuttle: the complete
+telemetry buffer from the first MOVING packet until 30 s of subsequent IDLE
+(or a mid-mission buffer-pressure overflow). Multiple files may exist per
+shuttle per day. **Note:** this path is dormant under ADR-021 (see header);
+the schema below documents what the gateway *would* write if live packets
+arrive during a drain window.
 
 ---
 
@@ -134,7 +152,7 @@ and XGBoost use them.
 - **Mission segmentation** (`moving_run_id`, `pause_duration_s`,
   `moving_run_dur_s`, `pause_count`, `is_long_pause`) — removed (v4).
   Derive at analysis time from `state` transitions if needed.
-- **`pressure_hpa`** — LPS22HH is read on the STM32 for local UART debug but not transmitted (ADR-015). Not in the wire protocol.
+- **`pressure_hpa`** — not in the live `PludosTelemetry` wire packet (ADR-015), so absent from these `mission_s*` files. It *is* carried for idle snapshots in the drain `DrainBegin` env stamp and stored in the `cap_*` files (see §2).
 - **GPS / position** — No GPS on the shuttle. Position is inferred from mission sequence number and shelf layout (future work).
 
 ---
@@ -165,4 +183,77 @@ moving = moving.assign(
     accel_mag=(moving["accel_x"]**2 + moving["accel_y"]**2 + moving["accel_z"]**2)**0.5
 )
 print(moving[["seq", "accel_mag", "accel_z", "seq_gap"]].describe())
+```
+
+---
+
+# §2 — Drain capture files (`cap_accel_*` / `cap_gyro_*`, active)
+
+Written by `drain_receiver.py:_write_stream_parquet()` — **one file per
+sensor per drained capture**. Accel and gyro are demuxed from the raw FIFO
+byte stream into **separate files at their own ODR** (no upsampling/padding
+of gyro to the accel rate). This is the dataset PLUDOS actually keeps.
+
+## File naming
+
+```
+cap_{sensor}_s{shuttle_id}_m{gw_mission_id}.parquet
+```
+
+- `sensor` — `accel` or `gyro`
+- `shuttle_id` — 1-based integer
+- `gw_mission_id` — **gateway-assigned** unix-ms capture id (`begin_wall_ms`),
+  **not** the on-wire firmware `mission_id` (which resets to 0 on STM32
+  reboot and is used only for in-flight reassembly grouping)
+
+Example: `cap_accel_s1_m1747123456789.parquet`
+
+## Columns
+
+| Column | Type | Unit | Description |
+|---|---|---|---|
+| `sample_index` | int32 | — | 0-based index within this capture. |
+| `t_ms` | float64 | ms (unix) | Per-sample time, **derived not stamped**: `t0_wall_ms + sample_index × 1000 / odr`. Capture wall-clock `t0_wall` recovered from `BEGIN_arrival − (tx_tick − t0_tick)` — no NTP offset (see `docs/wire_protocol.md §2`). |
+| `x` / `y` / `z` | int16 | raw LSB | Raw ISM330 counts at sensor full scale (accel ±2 g, gyro ±250 dps). Scale to physical units downstream (`ACCEL_G_PER_LSB` / `GYRO_DPS_PER_LSB`). Stored raw to keep the file a faithful copy of the FIFO. |
+| `shuttle_id` | int16 | — | 1-based integer (constant per file). |
+| `mission_id` | int64 | — | Gateway-assigned unix-ms capture id (constant per file). |
+| `odr_accel_hz` | float64 | Hz | Accel ODR (3332 MOVING; 12.5 idle snapshot — float because 12.5 isn't an int). |
+| `odr_gyro_hz` | float64 | Hz | Gyro ODR (416 MOVING; 12.5 idle snapshot). |
+| `t0_wall_ms` | int64 | ms (unix) | Anchored capture start (idle snapshots advance it past the trimmed settling head). |
+| `is_idle_snapshot` | bool | — | `True` = low-rate 12.5 Hz idle snapshot; `False` = MOVING mission. |
+| `temp_c` | float32 | °C | Env stamp from `DrainBegin` — idle snapshots only; NaN for MOVING. |
+| `pressure_hpa` | float32 | hPa | Env stamp from `DrainBegin` — idle snapshots only; NaN for MOVING. |
+| `all_packets_received` | bool | — | `True` if every drain chunk arrived (no loss). |
+| `packets_total` | int32 | chunks | Total drain chunks expected for this capture. |
+| `packets_received` | int32 | chunks | Chunks received. |
+| `packets_lost` | int32 | chunks | Chunks missing. |
+| `packet_loss_pct` | float32 | % | `100 × lost / total`. |
+| `missing_chunk_ranges` | str | — | Human-readable missing `chunk_seq` ranges (empty if complete). |
+
+## Idle-snapshot settling trim
+
+For `is_idle_snapshot` captures the first ~1 s (`IDLE_TRIM_MS`, default 1000)
+is dropped off the head: the ISM330 LPF2 resets on ODR change and those
+samples clip at the ±2 g rail. `t0_wall_ms` is advanced by the trimmed
+duration so `t_ms` stays honest. MOVING missions are **not** trimmed — their
+onset transient is real signal.
+
+## Reading drain files in Python
+
+```python
+import pandas as pd, glob
+
+ACCEL_G_PER_LSB = 2.0 / 32768.0   # ±2 g full scale
+
+files = sorted(glob.glob("/app/ram_buffer/cap_accel_s1_*.parquet"))
+df = pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
+df.sort_values(["mission_id", "sample_index"], inplace=True)
+
+# Scale raw int16 counts to g.
+for ax in ("x", "y", "z"):
+    df[ax + "_g"] = df[ax] * ACCEL_G_PER_LSB
+
+# Drains with any chunk loss — treat as partial.
+partial = df[~df["all_packets_received"]]
+print(f"rows from partial captures: {len(partial)}")
 ```

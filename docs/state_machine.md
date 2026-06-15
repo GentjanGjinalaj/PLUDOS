@@ -3,8 +3,11 @@
 Defines the idle/moving FSM that controls sampling rate and telemetry
 transmission rate on the STM32U585 edge node.
 
-**Version:** v2 (ADR-015). The previous CoAP buffer-and-flush model is
-replaced by a continuous unified UDP stream. There is no buffer.
+**Version:** v3 (ADR-015 FSM + ADR-020/021 capture-and-drain). ADR-015 replaced
+the CoAP buffer-and-flush model with a unified UDP path; ADR-020/021 then moved
+the actual signal off the live stream into a duty-cycled PSRAM capture that is
+drained after each run. The FSM below still gates behaviour, but the radio is
+off except during a drain window — there is no continuous TX.
 
 > **ADR-021 update — no continuous stream.** The radio is off during IDLE and
 > MOVING and powers on only to drain finished captures. The internal FSM poll
@@ -86,27 +89,27 @@ trigger.
 
 ---
 
-## Telemetry timing — no jitter, no buffer
+## Telemetry timing — duty-cycled drain (ADR-021)
 
-ADR-015 removed the jitter window and the SRAM buffer entirely. Each
-loop iteration:
+ADR-021 turned off the continuous live stream. The radio is powered down
+during both IDLE and MOVING; it only powers on to drain a finished capture.
+Each main-loop iteration:
 
 1. Sensors are read (cached env every 500 ms; accel every iteration).
-2. FSM is updated.
-3. If a transmit is due (every 20 ms in MOVING, every 10 s in IDLE), the
-   firmware calls `MX_WIFI_Socket_sendto` with the 24-byte packet and
-   returns immediately.
+2. FSM is updated; MOVING samples flow into the ISM330 FIFO → PSRAM ring.
+3. On MOVING→IDLE (mission end), or on an IDLE-snapshot cadence (10 s every
+   10 min), or on a PSRAM watermark, the radio powers on and the buffered
+   capture is drained on UDP `:5684` (see `wire_protocol.md §2`).
 
-No ACK is awaited. The `sendto` call returns within ~1 ms in normal
-operation and within the 10 s MX_WIFI IPC timeout in the worst case. A
-WiFi outage does not stall the FSM — the next iteration simply tries
-again.
+The live 24-byte `PludosTelemetry` path on `:5683` still exists in code but
+is gated on `wifi_driver_initialized`, which is only set during a drain
+window — so in practice no per-loop telemetry is transmitted. The signal
+PLUDOS keeps is the drained PSRAM capture, not the live datagram.
 
-Per-shuttle collision mitigation (when many shuttles enter IDLE
-simultaneously) is no longer needed: the 0.1 Hz IDLE rate × random
-boot-tick phase gives natural spread, and a single dropped UDP packet
-during a momentary burst is invisible because the next packet arrives
-within 10 s anyway.
+Per-shuttle collision mitigation now lives in the drain path: a
+1.0–15.0 s pseudo-random jitter before each drain (seeded from the device
+UID) decorrelates shuttles that finish missions at the same time, and a
+warm-up burst absorbs the post-power-on ARP/MAC-learning loss window.
 
 ---
 
@@ -136,11 +139,12 @@ each over I²C2. Reading both at 50 Hz would consume more than one full
 sample period.
 
 The firmware caches the last successful env read and refreshes it every
-500 ms (`ENV_READ_PERIOD_MS`). The cached values are stamped into every
-outgoing `PludosTelemetry` packet, so the gateway sees env data at the
-full transmit rate even though the sensors are physically read at 2 Hz.
-This is acceptable because temperature, humidity, and pressure change on
-seconds-to-minutes timescales.
+500 ms (`ENV_READ_PERIOD_MS`). The cached temp/humidity/pressure values are
+stamped onto the data that actually leaves the shuttle: the idle-snapshot
+`DrainBegin` carries `temp_c_x100` and `pressure_hpa_x10` (and any live
+`PludosTelemetry` packet sent during a drain window carries temp/humidity).
+Reading at 2 Hz is acceptable because temperature, humidity, and pressure
+change on seconds-to-minutes timescales.
 
 Sensor unavailability is signalled by the wire sentinel `0x7FFF` (32767) in
 any `int16_t` sensor field — accel, gyro, temp, and humidity alike. The

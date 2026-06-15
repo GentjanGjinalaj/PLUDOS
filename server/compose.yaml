@@ -51,9 +51,10 @@ services:
 
   # Alumet — server-side energy profiler (ADR-011)
   # Phase 1: measures server CPU energy via RAPL during FL round aggregation.
-  # Phase 2 (open): receives metric relay streams from Jetson Alumet instances
-  #   over gRPC on ALUMET_RELAY_PORT (50051). Requires the Jetson-side relay
-  #   sidecar to be deployed first (see ADR-011 in docs/decisions.md).
+  # Phase 2 (closed 2026-05-26): receives metric relay streams from Jetson Alumet
+  #   instances over gRPC on ALUMET_RELAY_PORT (50051) when a gateway sets
+  #   ALUMET_SERVER_ADDR. Jetson-side relay sidecar implemented and verified
+  #   (see ADR-011 in docs/decisions.md).
   #
   # RAPL requires access to /sys/class/powercap from the host. The volume
   # mount below is read-only. If RAPL is not available (AMD, VM, CI), Alumet

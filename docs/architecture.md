@@ -77,8 +77,9 @@ designed for ≥100 shuttles per gateway.
   and ships the booster bytes to the central server. Profiled by
   `AlumetProfiler` (see below).
 - `alumet-relay` service: sidecar that runs `alumet-cli` to read the
-  Jetson INA3221 (ADR-011 Phase 2). Dormant on hardware until flag
-  verification is finished.
+  Jetson INA3221 (ADR-011 Phase 2, CLOSED 2026-05-26). Active on hardware —
+  reads real sysfs rails and exports `input_current`/`input_voltage` via a
+  Prometheus endpoint on :9095, a rotated CSV, and direct InfluxDB writes.
 - `tailscale` service: optional sidecar joining the gateway to the Tailnet
   for Gateway↔Server reachability; activated via `--profile vpn`.
 
@@ -173,21 +174,31 @@ See ADR-011 in `decisions.md` for full decision history.
 
 ## Data flow (steady state, single mission)
 
-1. Shuttle wakes; STM32 streams 0.1 Hz `PludosTelemetry` packets in IDLE,
-   transitions to MOVING when accelerometer deviation > 0.05 g² for
-   500 ms (with 300 ms debounce).
-2. In MOVING the STM32 emits one 24-byte UDP packet per accelerometer
-   sample to `udp://<gateway>:5683` at 50 Hz (WiFi-capped), fire-and-forget.
-   No buffer, no ACK.
-3. Gateway parses each packet, derives `timestamp_ms = tick_ms + ntp_offset`,
-   tracks per-shuttle uint16 sequence wraps, and appends to the per-shuttle
-   in-memory list.
-4. When the shuttle has been in state==IDLE for `MISSION_END_IDLE_S`
-   (default 30 s) after any MOVING run, the gateway sorts the buffer by
-   `sequence_monotonic` and writes one Parquet file atomically (raw signal
-   only — feature engineering is deferred to train time in `anomaly.py`). A
-   `stm_mission` summary point (packets, duration_ms) is also pushed to
-   InfluxDB on a daemon thread.
+1. Shuttle is duty-cycled with the radio off (ADR-020/021). The STM32 runs
+   its FSM internally — 10 Hz IDLE poll, 50 Hz MOVING poll — and transitions
+   to MOVING when accelerometer deviation > 0.06 g² for 500 ms (with 300 ms
+   debounce). These poll rates gate state only; they are not TX rates.
+2. In MOVING the STM32 streams the ISM330 FIFO → an 8 MB PSRAM ring at
+   accel 3332 Hz / gyro 416 Hz (≈8:1). Nothing is transmitted live. IDLE
+   periodically captures a low-rate 12.5 Hz snapshot (10 s every ~10 min) to
+   the same ring.
+3. On mission end (MOVING→IDLE), on the IDLE-snapshot cadence, or on a PSRAM
+   watermark, the shuttle powers the radio on and drains the captured words
+   to `udp://<gateway>:5684` as `DrainBegin`/`DrainChunk`/`DrainEnd` frames.
+   The gateway acks each `DrainBegin`, reassembles by `chunk_seq`, validates
+   per-chunk CRC32, and recovers capture wall-clock from `tx_tick - t0_tick`
+   (no NTP offset on this path). The legacy live `:5683` listener still runs
+   but is effectively dormant — firmware gates that TX on a flag only set
+   during a drain window.
+4. The gateway writes one Parquet per `(shuttle_id, mission_id)` on
+   `DrainEnd` (or a quiet timeout): `cap_accel_*` / `cap_gyro_*` files holding
+   raw int16 samples plus per-mission metadata (ODRs, `t0_wall_ms`,
+   `is_idle_snapshot`, completeness). Idle snapshots are head-trimmed
+   (`IDLE_TRIM_MS`) to drop the LPF2 settling transient; MOVING is untrimmed.
+   Feature engineering is deferred to train time (`anomaly.py`). A
+   `stm_mission` summary (`source="drain"`: loss %, sample counts, vibration
+   stats) and, for idle snapshots, per-sample `stm_idle_wave` points are
+   pushed to InfluxDB on a daemon thread.
 5. Out of band (manual or scheduled), `flwr run .` starts an FL round; the
    server signals each gateway-side `ai-worker`, which loads the most
    recent `MAX_PARQUET_FILES` files, fits XGBoost, returns booster bytes.
@@ -203,8 +214,8 @@ See ADR-011 in `decisions.md` for full decision history.
 
 | Failure | Detection | Handling | Status |
 | --- | --- | --- | --- |
-| WiFi disconnect on shuttle | `wifi_station_ready` flag, MXCHIP events | FSM keeps sampling; UDP sends become no-ops (TELEMETRY_Send returns -1); on reconnect a short beacon probe re-bonds. Lost packets are accepted (ADR-015) | implemented |
-| Gateway unreachable | UDP is fire-and-forget — packets silently drop | No retry; the next 20 ms / 1 s packet replaces the lost one. STM32 keeps streaming | implemented (by design, ADR-015) |
+| WiFi disconnect on shuttle | `wifi_station_ready` flag, MXCHIP events | FSM keeps sampling into PSRAM; drain is deferred until the radio reconnects. A mission left undrained is retried on the next wake (re-drain is idempotent — gateway dedups on `(shuttle_id, mission_id, sample_index)`) | implemented |
+| Gateway unreachable at drain time | No `DrainAck` echo within the bounded wait window | Shuttle skips the chunk blast, keeps the capture in PSRAM, and retries the whole mission on the next wake. Drain chunks themselves are fire-and-forget (CRC32 + completeness flag, no per-chunk ARQ yet — Phase 2) | implemented (ADR-021 Phase 1) |
 | Gateway process crash | none on STM32 side | STM32 keeps sending into the void; resumes when data-engine restarts | accepted |
 | Gateway directory loss on reboot | `./ram_buffer` is a host bind-mount, not tmpfs | Buffered Parquet survives a container restart; only un-flushed in-memory packets are lost | mitigated |
 | Server unreachable (FL round) | Flower retry / hang | Round fails; gateway client error | not hardened |
