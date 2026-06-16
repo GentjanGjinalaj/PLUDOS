@@ -644,13 +644,26 @@ class DrainProtocol(asyncio.DatagramProtocol):
         re = self.missions.get(key)
         if re is None:
             return  # END with no BEGIN/chunks seen — nothing to write.
-        _finalise_mission(re, "END")
+        # Mark done + remove BEFORE the (blocking) parquet write, then run that write
+        # off the event loop. A back-to-back multi-mission drain (one wake drains the
+        # recovered mission + the new one) would otherwise stall here: the sync
+        # to_parquet blocks the loop so the next mission's BEGIN can't be acked in
+        # time, and the shuttle skips its blast. Off-loop keeps the ack path live.
+        self.recent_done[key] = time.monotonic()
+        self.missions.pop(key, None)
+        self._finalise_offloop(re, "END")
         # TODO ARQ phase 2: instead of finalising here, compute re.missing_ranges()
         # and reply to `addr` with a NAK (type 4) listing missing chunk_seq ranges,
         # or ACK_COMPLETE (type 5) if re.is_complete(). Only finalise after
         # ACK_COMPLETE or a bounded retransmit-round cap.
-        self.recent_done[key] = time.monotonic()
-        self.missions.pop(key, None)
+
+    # Run the sync parquet finalisation in a worker thread so the asyncio loop stays
+    # free to service the socket (esp. ack the next mission's BEGIN). The reassembler
+    # is already popped from self.missions, so no other path touches `re` concurrently.
+    def _finalise_offloop(self, re: MissionReassembler, reason: str) -> None:
+        loop = asyncio.get_running_loop()
+        fut = loop.run_in_executor(None, _finalise_mission, re, reason)
+        fut.add_done_callback(_log_finalise_exc)
 
     def error_received(self, exc: Exception) -> None:
         logger.error("[DRAIN] UDP socket error: %s", exc)
@@ -660,8 +673,16 @@ class DrainProtocol(asyncio.DatagramProtocol):
 # Quiet-timeout watchdog — Phase 1 blast may lose all 3 END packets.
 # ---------------------------------------------------------------------------
 
+# Log a swallowed exception from an off-loop _finalise_mission worker.
+def _log_finalise_exc(fut: "asyncio.Future") -> None:
+    exc = fut.exception()
+    if exc is not None:
+        logger.error("[DRAIN] finalise (off-loop) failed: %s", exc)
+
+
 # Finalise any mission that has seen no new chunk for DRAIN_QUIET_TIMEOUT_S.
 async def _drain_watchdog(proto: DrainProtocol) -> None:
+    loop = asyncio.get_running_loop()
     while True:
         await asyncio.sleep(_WATCHDOG_PERIOD_S)
         now = time.monotonic()
@@ -670,9 +691,11 @@ async def _drain_watchdog(proto: DrainProtocol) -> None:
             if re is None:
                 continue
             if (now - re.last_activity) >= DRAIN_QUIET_TIMEOUT_S:
-                _finalise_mission(re, "quiet-timeout")
+                # Pop first, then write off-loop — same reason as _on_end: keep the
+                # event loop free to ack incoming BEGINs during the parquet write.
                 proto.recent_done[key] = now
                 proto.missions.pop(key, None)
+                await loop.run_in_executor(None, _finalise_mission, re, "quiet-timeout")
         # Prune expired dedup entries so the map can't grow unbounded over a session.
         for key in [k for k, t in proto.recent_done.items() if (now - t) >= DEDUP_TTL_S]:
             del proto.recent_done[key]

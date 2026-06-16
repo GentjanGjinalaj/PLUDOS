@@ -116,6 +116,14 @@ files. Key behaviours:
   shuttle/mission tag, sample count (and any settling-trim count), and file
   size — a separate write from the `[INFLUXDB]` summary line, so both are
   visible.
+- **Off-loop finalisation:** mission finalisation (the sync `to_parquet`
+  write) runs in a worker thread via `run_in_executor`, not on the asyncio
+  loop. A wake that drains several missions back-to-back (e.g. a recovered
+  mission + a fresh one after a watchdog reset) would otherwise stall: the
+  blocking write delays the *next* mission's BEGIN-ack past the shuttle's
+  ack-wait budget, so the shuttle skips that mission's blast and the queue
+  stays one drain behind forever. The reassembler is popped from `missions`
+  before the write is scheduled, so no other path touches it concurrently.
 - **TTL dedup (`DEDUP_TTL_S`, default 10 s):** the firmware `mission_id` resets
   to low values on every STM32 reset, so it is unique only within one boot
   session. A finalised `(shuttle_id, mission_id)` is held in `recent_done` for
