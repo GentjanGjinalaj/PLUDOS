@@ -26,6 +26,7 @@
 #include "psram.h"
 #include <stdio.h>
 #include <string.h>
+#include <stddef.h>          /* offsetof() for the PSRAM persist-index CRC span */
 #include <math.h>            /* fabsf() for FSM threshold check */
 
 #include "mx_wifi.h"
@@ -265,7 +266,7 @@ static uint32_t tx_window_start_tick = 0U;
                                        * so normal operation never exhausts it; the depth only bounds how
                                        * many captures survive a long radio-dark idle (most-recent-N kept).
                                        * 256 × sizeof(CaptureMission_t) ≈ 8 KB SRAM. */
-#define CAP_RING_WTM_BYTES    (PSRAM_SIZE_BYTES - (PSRAM_SIZE_BYTES / 4U)) /* 75% = 6 MB drain trigger */
+#define CAP_RING_WTM_BYTES    (PSRAM_USABLE_BYTES - (PSRAM_USABLE_BYTES / 4U)) /* 75% of usable ring = drain trigger */
 #define CAP_WTM_COOLDOWN_MS   600000U /* 10 min back-off after a failed watermark safety-flush drain (gateway down) — stops the radio spinning at max duty overnight (opposite of ADR-021 intent) */
 
 /* Per-mission bookkeeping; the sample bytes themselves live in the PSRAM ring. */
@@ -285,10 +286,38 @@ typedef struct
 } CaptureMission_t;
 
 static CaptureMission_t cap_missions[CAP_MAX_MISSIONS];
+
+/* ADR-020 crash-recovery index, mirrored into the reserved top of PSRAM
+ * (PSRAM_PERSIST_ADDR). A reset before a drain wipes the SRAM bookkeeping below
+ * but not the PSRAM data, so this lets the next boot re-find sealed-but-undrained
+ * captures and drain them instead of losing them. CRC-validated: a cold boot or
+ * corrupt region fails the check and the firmware starts fresh. */
+#define CAP_PERSIST_MAGIC    0x504C4453UL  /* "PLDS" — PLUDOS Drain State */
+#define CAP_PERSIST_VERSION  1U
+
+typedef struct
+{
+  uint32_t magic;            /* CAP_PERSIST_MAGIC when the region holds a valid index */
+  uint32_t version;          /* layout version — mismatch ⇒ ignore and start fresh */
+  uint32_t struct_size;      /* sizeof(CapPersist_t) sanity guard against layout drift */
+  uint16_t mission_count;    /* mirror of cap_mission_count */
+  uint16_t slot_head;        /* mirror of cap_slot_head */
+  uint32_t ring_wptr;        /* mirror of cap_ring_wptr */
+  uint16_t next_id;          /* mirror of cap_next_id */
+  uint16_t wtm_hit;          /* mirror of cap_wtm_hit (widened for alignment) */
+  uint32_t undrained_bytes;  /* mirror of cap_undrained_bytes */
+  CaptureMission_t missions[CAP_MAX_MISSIONS];  /* mirror of cap_missions[] */
+  uint32_t crc32;            /* zlib CRC over every field above (offsetof span) */
+} CapPersist_t;
+
+/* The reserved region must hold the whole index; fail the build early if not. */
+_Static_assert(sizeof(CapPersist_t) <= PSRAM_PERSIST_BYTES,
+               "CapPersist_t exceeds reserved PSRAM persist region");
+
 static uint16_t cap_mission_count = 0U;  /* slots populated so far (grows up to CAP_MAX_MISSIONS) */
 static int16_t  cap_active_idx    = -1;  /* index of in-progress mission, -1 = none */
 static uint16_t cap_slot_head     = 0U;  /* FIFO reuse pointer: oldest slot, advanced once the ring is full */
-static uint32_t cap_ring_wptr     = 0U;  /* next PSRAM write offset [0, PSRAM_SIZE_BYTES) */
+static uint32_t cap_ring_wptr     = 0U;  /* next PSRAM write offset [0, PSRAM_USABLE_BYTES) */
 static uint16_t cap_next_id       = 1U;
 static uint8_t  cap_initialized   = 0U;
 static uint8_t  cap_wtm_hit       = 0U;  /* set when total un-drained bytes cross 75% (safety-flush trigger) */
@@ -379,7 +408,9 @@ static int32_t TELEMETRY_Send(void);
 static int8_t WIFI_PowerOn(void);
 static void WIFI_PowerOff(void);
 /* ADR-020 high-rate ISM330 FIFO capture engine (state-rated) */
-static int8_t   Capture_Init(void);
+static int8_t   Capture_Init(uint8_t recovered);
+static void     Capture_PersistSave(void);
+static uint8_t  Capture_PersistRestore(void);
 static int16_t  Capture_AllocSlot(void);
 static void     Capture_EnterMoving(void);
 static void     Capture_EnterIdleSnapshot(void);
@@ -997,22 +1028,30 @@ static void WIFI_PowerOff(void)
   HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
 }
 
-/* Put the FIFO in bypass and reset capture bookkeeping. Call once after the ISM330
- * boot init; PSRAM must already be memory-mapped (PSRAM_Init). Returns 0 on success. */
-static int8_t Capture_Init(void)
+/* Put the FIFO in bypass and arm the capture engine. Call once after the ISM330
+ * boot init; PSRAM must already be memory-mapped (PSRAM_Init). When `recovered`
+ * is non-zero the bookkeeping was already restored from the PSRAM persist index
+ * (Capture_PersistRestore) and must be kept — only the hardware FIFO is reset and
+ * the in-progress slot dropped; on a cold boot (`recovered == 0`) the whole index
+ * is zeroed. Returns 0 on success. */
+static int8_t Capture_Init(uint8_t recovered)
 {
   uint8_t bypass = CAP_FIFO_MODE_BYPASS;
   if (HAL_I2C_Mem_Write(&hi2c2, ISM330_ADDR, ISM330_FIFO_CTRL4, 1, &bypass, 1, 100) != HAL_OK)
   {
     return -1;
   }
-  cap_ring_wptr     = 0U;
-  cap_mission_count = 0U;
-  cap_slot_head     = 0U;
-  cap_active_idx    = -1;
-  cap_next_id       = 1U;
-  cap_wtm_hit       = 0U;
-  cap_initialized   = 1U;
+  if (recovered == 0U)
+  {
+    cap_ring_wptr       = 0U;
+    cap_mission_count   = 0U;
+    cap_slot_head       = 0U;
+    cap_next_id         = 1U;
+    cap_wtm_hit         = 0U;
+    cap_undrained_bytes = 0U;
+  }
+  cap_active_idx  = -1;  /* any capture in progress at reset is unsealed → discarded */
+  cap_initialized = 1U;
   return 0;
 }
 
@@ -1200,9 +1239,9 @@ static uint16_t Capture_Service(void)
     {
       ring[cap_ring_wptr] = cap_fifo_buf[i];
       cap_ring_wptr++;
-      if (cap_ring_wptr >= PSRAM_SIZE_BYTES)
+      if (cap_ring_wptr >= PSRAM_USABLE_BYTES)
       {
-        cap_ring_wptr = 0U; /* ring wrap */
+        cap_ring_wptr = 0U; /* ring wrap (stops short of the reserved persist region) */
       }
     }
     m->byte_count += bytes;
@@ -1271,6 +1310,10 @@ static void Capture_EnterIdle(void)
           (unsigned long)m->byte_count, (unsigned long)m->overrun_evts);
   HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
   cap_active_idx = -1;  /* mission is sealed; Drain_AllPending picks it up on the next wake */
+
+  /* Persist now: this sealed mission must survive a reset before it can be drained
+   * (the exact loss the crash-recovery index prevents — see Capture_PersistSave). */
+  Capture_PersistSave();
 }
 
 /* Running zlib/IEEE CRC-32 register (reflected, poly 0xEDB88320, no init/final).
@@ -1293,6 +1336,70 @@ static uint32_t Drain_CRC32_Update(uint32_t crc, const uint8_t *data, uint32_t l
 static uint32_t Drain_CRC32(const uint8_t *data, uint32_t len)
 {
   return Drain_CRC32_Update(0xFFFFFFFFUL, data, len) ^ 0xFFFFFFFFUL;
+}
+
+/* Mirror the capture bookkeeping into the reserved PSRAM persist region with a
+ * trailing CRC. Call after any change that must survive a reset (mission seal,
+ * mission drained). Writes go straight to memory-mapped PSRAM; the region is
+ * outside the data ring (PSRAM_USABLE_BYTES) so it is never clobbered by capture. */
+static void Capture_PersistSave(void)
+{
+  CapPersist_t *p = (CapPersist_t *)PSRAM_PERSIST_ADDR;
+  uint16_t i;
+
+  p->magic           = CAP_PERSIST_MAGIC;
+  p->version         = CAP_PERSIST_VERSION;
+  p->struct_size     = (uint32_t)sizeof(CapPersist_t);
+  p->mission_count   = cap_mission_count;
+  p->slot_head       = cap_slot_head;
+  p->ring_wptr       = cap_ring_wptr;
+  p->next_id         = cap_next_id;
+  p->wtm_hit         = (uint16_t)cap_wtm_hit;
+  p->undrained_bytes = cap_undrained_bytes;
+  for (i = 0U; i < CAP_MAX_MISSIONS; i++)
+  {
+    p->missions[i] = cap_missions[i];
+  }
+  /* CRC last, over every preceding field, so a torn write fails validation. */
+  p->crc32 = Drain_CRC32((const uint8_t *)p, (uint32_t)offsetof(CapPersist_t, crc32));
+}
+
+/* Restore the capture bookkeeping from the PSRAM persist region after a reset.
+ * Returns 1 if a valid, CRC-clean index was recovered (PSRAM data survived), 0 on
+ * a cold boot or corrupt region — in which case the caller runs the destructive
+ * self-test and starts fresh. Bulk capture bytes are NOT re-verified here; each
+ * drained mission still carries a whole-mission CRC the gateway checks, so any
+ * data corruption that slipped past a power glitch is rejected downstream. */
+static uint8_t Capture_PersistRestore(void)
+{
+  const CapPersist_t *p = (const CapPersist_t *)PSRAM_PERSIST_ADDR;
+  uint32_t crc;
+  uint16_t i;
+
+  if (p->magic != CAP_PERSIST_MAGIC)                  { return 0U; }
+  if (p->version != CAP_PERSIST_VERSION)              { return 0U; }
+  if (p->struct_size != (uint32_t)sizeof(CapPersist_t)) { return 0U; }
+
+  crc = Drain_CRC32((const uint8_t *)p, (uint32_t)offsetof(CapPersist_t, crc32));
+  if (crc != p->crc32)                                { return 0U; }
+
+  /* Range-check the mirrored indices before trusting them as array/ring bounds. */
+  if (p->mission_count > CAP_MAX_MISSIONS)            { return 0U; }
+  if (p->slot_head >= CAP_MAX_MISSIONS)               { return 0U; }
+  if (p->ring_wptr >= PSRAM_USABLE_BYTES)             { return 0U; }
+
+  cap_mission_count   = p->mission_count;
+  cap_slot_head       = p->slot_head;
+  cap_ring_wptr       = p->ring_wptr;
+  cap_next_id         = p->next_id;
+  cap_wtm_hit         = (uint8_t)p->wtm_hit;
+  cap_undrained_bytes = p->undrained_bytes;
+  for (i = 0U; i < CAP_MAX_MISSIONS; i++)
+  {
+    cap_missions[i] = p->missions[i];
+  }
+  cap_active_idx = -1;  /* any in-progress capture at reset was unsealed → discard */
+  return 1U;
 }
 
 /* Bind the shared UDP socket to a fixed local port so the gateway's DrainAck
@@ -1443,7 +1550,7 @@ static void Drain_Mission(int16_t idx)
     {
       drain_buf[sizeof(DrainChunkHdr_t) + k] = ring[off];
       off++;
-      if (off >= PSRAM_SIZE_BYTES) { off = 0U; } /* ring wrap */
+      if (off >= PSRAM_USABLE_BYTES) { off = 0U; } /* ring wrap (matches the write path) */
     }
 
     hdr->magic        = DRAIN_MAGIC;
@@ -1496,6 +1603,10 @@ static void Drain_Mission(int16_t idx)
   {
     cap_wtm_hit = 0U;
   }
+
+  /* Persist the drained flag so a reset later in this batch doesn't re-send an
+   * already-delivered mission (the gateway's dedup TTL won't span a reboot). */
+  Capture_PersistSave();
 }
 
 /* Wake the radio once to blast every sealed-but-undrained mission (the just-ended
@@ -1702,22 +1813,35 @@ int main(void)
   // PSRAM BRING-UP (APS6408 on OCTOSPI1) — ADR-020 capture buffer
   // -----------------------------------------------------------------
   /* Finish device-side config (CubeMX only init the peripheral) and enter
-     memory-mapped mode, then self-test before relying on the 8 MB region. */
+     memory-mapped mode. PSRAM contents survive an MCU reset, so before running the
+     destructive self-test we try to recover the capture index from the reserved
+     persist region — a valid CRC means sealed-but-undrained captures are still in
+     PSRAM and must NOT be wiped. Only a cold boot / corrupt region runs the test. */
+  uint8_t cap_recovered = 0U;
   if (PSRAM_Init() == 0)
   {
     sprintf(uart_buf, "[PSRAM] APS6408 memory-mapped at 0x%08lX (%lu KB)\r\n",
             PSRAM_BASE_ADDR, PSRAM_SIZE_BYTES / 1024U);
     HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
 
-    if (PSRAM_SelfTest() == 0)
+    cap_recovered = Capture_PersistRestore();
+    if (cap_recovered != 0U)
+    {
+      /* Warm reset with surviving data: keep it, skip the destructive self-test. */
+      sprintf(uart_buf, "[PSRAM] recovered capture index (%u missions) — self-test skipped\r\n",
+              (unsigned)cap_mission_count);
+      HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
+    }
+    else if (PSRAM_SelfTest() == 0)
     {
       sprintf(uart_buf, "[PSRAM] self-test PASS\r\n");
+      HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
     }
     else
     {
       sprintf(uart_buf, "[PSRAM] ERROR: self-test FAILED\r\n");
+      HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
     }
-    HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
   }
   else
   {
@@ -1786,8 +1910,9 @@ int main(void)
   uint8_t gyro_filter = 0x07;   /* CTRL6_C: FTYPE=111, other fields default 0 */
   (void)HAL_I2C_Mem_Write(&hi2c2, ISM330_ADDR, CTRL6_C, 1, &gyro_filter, 1, 100);
 
-  /* ADR-020: arm the high-rate FIFO capture engine (FIFO bypassed until first MOVING). */
-  if (Capture_Init() != 0)
+  /* ADR-020: arm the high-rate FIFO capture engine (FIFO bypassed until first MOVING).
+   * Pass cap_recovered so a warm-boot index restored above is kept, not zeroed. */
+  if (Capture_Init(cap_recovered) != 0)
   {
     sprintf(uart_buf, "[CAPTURE] ERROR: FIFO init failed\r\n");
     HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);

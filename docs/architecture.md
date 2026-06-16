@@ -216,6 +216,7 @@ See ADR-011 in `decisions.md` for full decision history.
 | --- | --- | --- | --- |
 | WiFi disconnect on shuttle | `wifi_station_ready` flag, MXCHIP events | FSM keeps sampling into PSRAM; drain is deferred until the radio reconnects. A mission left undrained is retried on the next wake (re-drain is idempotent — gateway dedups on `(shuttle_id, mission_id, sample_index)`) | implemented |
 | Gateway unreachable at drain time | No `DrainAck` echo within the bounded wait window | Shuttle skips the chunk blast, keeps the capture in PSRAM, and retries the whole mission on the next wake. Drain chunks themselves are fire-and-forget (CRC32 + completeness flag, no per-chunk ARQ yet — Phase 2) | implemented (ADR-021 Phase 1) |
+| MCU reset (IWDG/brownout) before drain | Boot reads CRC-validated PSRAM persist index | PSRAM survives a core reset; the capture bookkeeping is mirrored to a reserved 16 KB PSRAM region and restored on warm boot, so sealed-but-undrained captures (idle snapshots + pending mission) are re-drained instead of lost. The destructive PSRAM self-test is skipped on a valid recovery | implemented (ADR-021, 2026-06-16) |
 | Gateway process crash | none on STM32 side | STM32 keeps sending into the void; resumes when data-engine restarts | accepted |
 | Gateway directory loss on reboot | `./ram_buffer` is a host bind-mount, not tmpfs | Buffered Parquet survives a container restart; only un-flushed in-memory packets are lost | mitigated |
 | Server unreachable (FL round) | Flower retry / hang | Round fails; gateway client error | not hardened |

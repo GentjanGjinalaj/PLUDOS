@@ -15,6 +15,16 @@
 /* Usable PSRAM size in bytes (APS6408 = 64 Mbit = 8 MB). */
 #define PSRAM_SIZE_BYTES  0x00800000UL
 
+/* ADR-020 crash-recovery: reserve the top of PSRAM for a CRC-validated capture
+ * index that survives an MCU reset (IWDG/brownout). PSRAM keeps its contents
+ * across a core reset (the chip is externally powered), so a post-reset boot can
+ * rediscover sealed-but-undrained captures instead of losing them with the
+ * volatile SRAM bookkeeping. The capture data ring uses only PSRAM_USABLE_BYTES
+ * and never writes into the reserved region. */
+#define PSRAM_PERSIST_BYTES  0x00004000UL                              /* 16 KB reserved index region */
+#define PSRAM_USABLE_BYTES   (PSRAM_SIZE_BYTES - PSRAM_PERSIST_BYTES)  /* capture ring size */
+#define PSRAM_PERSIST_ADDR   (PSRAM_BASE_ADDR + PSRAM_USABLE_BYTES)    /* index region base address */
+
 /* Configure APS6408 mode registers and switch OCTOSPI1 to memory-mapped mode.
  * Must be called after MX_OCTOSPI1_Init(). Returns 0 on success, -1 on error. */
 int8_t PSRAM_Init(void);

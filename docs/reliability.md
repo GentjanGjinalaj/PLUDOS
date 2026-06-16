@@ -15,6 +15,13 @@ those marked **design** follow from the protocol choice.
 
 ## 1 — Loss points (by hop)
 
+### 1.0 STM32 capture buffer (before drain)
+
+| Scenario | Packets at risk | Mitigation |
+|----------|-----------------|------------|
+| MCU reset (IWDG watchdog / brownout) between *seal* and *drain* | All sealed-but-undrained captures staged in PSRAM (idle snapshots + the just-finished mission) | **Crash-recovery index** (ADR-021, 2026-06-16): the bookkeeping is mirrored into a CRC-validated 16 KB PSRAM region that survives a core reset; on warm boot the index is restored and the captures are re-drained. The PSRAM data itself is externally powered and persists across an MCU reset. |
+| PSRAM power loss (battery removal) | Entire undrained ring | Not recoverable — PSRAM is volatile on power loss. Out of scope for the watchdog/brownout case above. |
+
 ### 1.1 STM32 → Jetson (UDP)
 
 | Source | Loss mode | Expected rate |

@@ -830,3 +830,34 @@ gateway-side data loss:
   **gateway-assigned unix-ms id** (monotonic, never re-used across reboots); the
   firmware `mission_id` is kept only as the in-flight reassembly key that separates
   back-to-back drains within one boot session.
+
+**Implementation notes (2026-06-16) — crash-recovery capture index.**
+The IWDG net above (and any brownout) resets the MCU, but the capture bookkeeping
+lived only in plain SRAM (`cap_missions[]`, `cap_mission_count`, ring pointers),
+which boots zeroed. The PSRAM data itself survives a core reset (the APS6408 is
+externally powered), so a reset between *seal* and *drain* left the captured bytes
+sitting in PSRAM with no index pointing at them — every sealed-but-undrained
+capture (idle snapshots + the just-finished mission) was lost. Observed in the
+field: a drain-wake hang tripped the IWDG, the reset wiped the index, and both the
+queued idle data and the pending mission vanished while the *next* mission drained
+fine.
+- *PSRAM layout (`psram.h`):* reserve the top **16 KB** (`PSRAM_PERSIST_BYTES`) for
+  a persisted index; the capture data ring now uses only `PSRAM_USABLE_BYTES` and
+  its write/read wrap bounds were shrunk to match, so capture never writes into the
+  reserved region.
+- *Firmware (`main.c`):* `CapPersist_t` mirrors the bookkeeping (counts, ring write
+  pointer, slot head, next id, watermark accumulator, the full `cap_missions[]`
+  table) with a magic/version/struct-size header and a trailing CRC32.
+  `Capture_PersistSave()` rewrites it on every state change that must survive a reset
+  (mission seal in `Capture_EnterIdle`, mission marked drained in `Drain_Mission`).
+  On boot, `Capture_PersistRestore()` validates magic/version/size/CRC and
+  range-checks the mirrored indices before trusting them; a valid index means the
+  PSRAM data is intact, so the bookkeeping is restored and the **destructive PSRAM
+  self-test is skipped**. A cold boot or corrupt/torn region falls back to the
+  self-test and a fresh start. Bulk capture bytes are not re-verified on restore —
+  each drained mission still carries a whole-mission CRC the gateway checks, so any
+  data corruption that slipped past a power glitch is rejected downstream.
+- *Dedup interaction:* re-draining a recovered mission after reset is safe — the
+  gateway's short-TTL dedup (above) accepts the re-used in-flight `mission_id` as a
+  fresh drain, and the persisted `drained` flag stops an already-drained mission
+  from being re-sent.
