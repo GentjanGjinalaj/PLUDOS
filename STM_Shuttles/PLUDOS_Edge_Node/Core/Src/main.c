@@ -373,6 +373,7 @@ static uint8_t WIFI_IsIPv4Valid(const uint8_t ip_addr[4]);
 static void WIFI_LogStationEvent(uint8_t event);
 static MX_WIFI_STATUS_T WIFI_WaitForStationIP(uint8_t ip_addr[4], uint32_t timeout_ms);
 static void WIFI_DelayWithYield(uint32_t delay_ms);
+static void Drain_BindLocalPort(void);
 static void TELEMETRY_RefreshEnvCache(void);
 static int32_t TELEMETRY_Send(void);
 static int8_t WIFI_PowerOn(void);
@@ -956,6 +957,9 @@ static int8_t WIFI_PowerOn(void)
           jetson_ip, (unsigned)TELEMETRY_PORT);
   HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
 
+  /* Bind the local port so the gateway's DrainAck reaches Drain_WaitForAck. */
+  Drain_BindLocalPort();
+
   /* ADR-021: a DHCP lease does not mean the data path is flushed. The AP still
    * has to learn our MAC and resolve ARP, so the first few UDP datagrams after a
    * fresh association are silently dropped — fatal for a single-chunk idle-snapshot
@@ -1289,6 +1293,32 @@ static uint32_t Drain_CRC32_Update(uint32_t crc, const uint8_t *data, uint32_t l
 static uint32_t Drain_CRC32(const uint8_t *data, uint32_t len)
 {
   return Drain_CRC32_Update(0xFFFFFFFFUL, data, len) ^ 0xFFFFFFFFUL;
+}
+
+/* Bind the shared UDP socket to a fixed local port so the gateway's DrainAck
+ * (the BEGIN liveness echo, sent back to our packets' source address) is
+ * delivered to recvfrom() in Drain_WaitForAck. The EMW3080 only routes inbound
+ * UDP to a bound socket — same reason the beacon listener binds BEACON_PORT — so
+ * an unbound socket silently drops the ack and every drain skips its blast.
+ * Best-effort: a bind failure must not break sendto (ack just won't arrive), so
+ * the socket is left open. Re-run after every socket (re)create. */
+static void Drain_BindLocalPort(void)
+{
+  struct mx_sockaddr_in laddr = {0};
+
+  if (socket_id < 0) { return; }
+
+  laddr.sin_len         = sizeof(laddr);
+  laddr.sin_family      = MX_AF_INET;
+  laddr.sin_port        = PLUDOS_HTONS(DRAIN_PORT); /* local port; gateway replies to this source */
+  laddr.sin_addr.s_addr = 0U;                       /* INADDR_ANY */
+
+  if (MX_WIFI_Socket_bind(wifi_obj, socket_id, (struct mx_sockaddr *)&laddr, sizeof(laddr)) != MX_WIFI_STATUS_OK)
+  {
+    sprintf(uart_buf, "[DRAIN] WARNING: local bind on port %u failed — ack RX disabled\r\n",
+            (unsigned)DRAIN_PORT);
+    HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+  }
 }
 
 /* Bounded wait for the gateway's DRAIN_BEGIN liveness echo (DrainAck, type 6).
@@ -2104,6 +2134,9 @@ int main(void)
                 : "[NETWORK] WARNING: socket recreate failed (%ld)\r\n", (long)socket_id);
         HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
 
+        /* Re-bind the local port on the fresh socket so DrainAck RX keeps working. */
+        Drain_BindLocalPort();
+
         /* Network may have changed (different AP, new DHCP lease). Do a short beacon
          * probe so the loop is back in business in ≤BEACON_RETRY_TIMEOUT_MS ms — the FSM
          * cannot tolerate a 30 s pause here (last_movement_tick would go stale and trigger
@@ -2158,18 +2191,37 @@ int main(void)
     }
 
     /* -----------------------------------------------------------------
-     * PHASE 5: per-second status log so the terminal shows live activity
+     * PHASE 5: per-second status log — only while actually capturing
+     * (a MOVING run or an active idle snapshot store data). Plain IDLE
+     * polling stores nothing, so it gets a sparse 30 s heartbeat instead
+     * of 1 Hz terminal noise, which also cuts needless UART traffic.
      * --------------------------------------------------------------- */
     if ((HAL_GetTick() - tx_window_start_tick) >= 1000U)
     {
-      sprintf(uart_buf,
-              "[STREAM] %s tx=%lu/s (live decimated view) accel=(%.2f,%.2f,%.2f)g gyro=(%.1f,%.1f,%.1f)dps temp=%.1fC hum=%.0f%%\r\n",
-              (current_state == STATE_MOVING) ? "MOVING" : "IDLE",
-              (unsigned long)tx_count_window,
-              vib_x, vib_y, vib_z,
-              gyro_x, gyro_y, gyro_z,
-              cached_temp_c, cached_humidity_pct);
-      HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+      static uint32_t idle_hb_count = 0U;        /* seconds since last IDLE heartbeat */
+      uint8_t capturing = (current_state == STATE_MOVING) || (cap_snapshot_active != 0U);
+
+      if (capturing)
+      {
+        idle_hb_count = 0U;
+        sprintf(uart_buf,
+                "[STREAM] %s tx=%lu/s (live decimated view) accel=(%.2f,%.2f,%.2f)g gyro=(%.1f,%.1f,%.1f)dps temp=%.1fC hum=%.0f%%\r\n",
+                (current_state == STATE_MOVING) ? "MOVING" : "SNAPSHOT",
+                (unsigned long)tx_count_window,
+                vib_x, vib_y, vib_z,
+                gyro_x, gyro_y, gyro_z,
+                cached_temp_c, cached_humidity_pct);
+        HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+      }
+      /* IDLE: terse liveness line every 30 s so the terminal isn't dead between snapshots. */
+      else if (++idle_hb_count >= 30U)
+      {
+        idle_hb_count = 0U;
+        sprintf(uart_buf,
+                "[IDLE] alive accel=(%.2f,%.2f,%.2f)g temp=%.1fC hum=%.0f%%\r\n",
+                vib_x, vib_y, vib_z, cached_temp_c, cached_humidity_pct);
+        HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+      }
 
       /* Capture throughput while MOVING (expect ~3749 words/s = 3332 accel + 416 gyro). */
       if ((current_state == STATE_MOVING) || (cap_words_window > 0U))
