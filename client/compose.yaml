@@ -156,8 +156,13 @@ services:
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=admin
       - GF_USERS_ALLOW_SIGN_UP=false
+      # Referenced by provisioning/datasources/influxdb.yaml for the local datasource token.
+      - INFLUXDB_TOKEN=${INFLUXDB_TOKEN:-pludos-dev-token}
     volumes:
       - grafana_local_data:/var/lib/grafana
+      # Provision the InfluxDB datasource + dashboards on startup (was missing → empty Grafana).
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/dashboards:ro
       - /etc/localtime:/etc/localtime:ro
     depends_on:
       - influxdb-local

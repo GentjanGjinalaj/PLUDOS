@@ -1,0 +1,22 @@
+apiVersion: 1
+
+# Standalone Jetson datasource: points the local Grafana at the local
+# InfluxDB. Grafana-local sits on the default podman bridge (no host net),
+# while influxdb-local publishes 8086 on the host, so the container reaches
+# it via the bridge gateway 10.88.0.1 (DNS between containers is unavailable
+# on podman 3.4.4). The uid matches the committed dashboard so it binds.
+datasources:
+  - name: InfluxDB
+    type: influxdb
+    uid: efmtstss6rcw0d
+    access: proxy
+    url: http://10.88.0.1:8086
+    jsonData:
+      version: Flux
+      organization: pludos
+      defaultBucket: alumet_energy
+      tlsSkipVerify: true
+    secureJsonData:
+      token: ${INFLUXDB_TOKEN}
+    isDefault: true
+    editable: true
