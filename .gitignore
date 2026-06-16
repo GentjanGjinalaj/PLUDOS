@@ -62,6 +62,9 @@ client/ram_buffer/
 client/ram_buffer/model/
 client/ram_buffer_archive/
 
+# Internal design-council notes — kept local, not published.
+docs/DESIGN_COUNCIL.md
+
 # Claude Code worktrees (isolation branches, not for repo)
 .claude/worktrees/
 .claude/

@@ -46,13 +46,20 @@ PLUDOS (**P**ower-aware **L**ightweight **U**DP **D**ata **O**rchestration **S**
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
+> **Edge data path (ADR-021).** The primary shuttle→gateway link is the
+> **high-rate capture drain on UDP :5684**, not the live `:5683` stream (now
+> dormant — the radio is off during motion). Before blasting a multi-MB drain,
+> the shuttle waits for an **8-byte `DrainAck`** the gateway echoes on :5684 as
+> delivery evidence. See [`docs/MODULARITY_AND_PIPELINE.md`](docs/MODULARITY_AND_PIPELINE.md)
+> for the full STM↔Jetson contract (sampling, timestamps, drain protocol, schema).
+
 ### Layer 1 — Edge Provisioning (STM32 Shuttle)
 
 - **Hardware:** STM32U585AII6Q on B-U585I-IOT02A (Cortex-M33 @ 160 MHz, TrustZone non-secure)
 - **Runtime:** bare-metal C, HAL drivers, **no RTOS**
 - **Sensor pipeline:** ISM330DHCX 6-axis IMU (accel + gyro), HTS221 temperature/humidity, LPS22HH pressure
 - **State machine:** IDLE / MOVING FSM, entered on a vibration threshold. A 50 Hz internal poll only *detects* motion; it is not a data rate.
-- **Capture-and-drain (ADR-021):** during a run the IMU streams into a PSRAM ring buffer (accel 3332 Hz / gyro 416 Hz ≈ 8:1); IDLE takes a short 12.5 Hz snapshot every 10 min. The radio is **off** during motion and powers on only to drain the finished capture over UDP to port 5684. A 1–15 s pre-TX jitter decorrelates shuttles that stop together.
+- **Capture-and-drain (ADR-021):** during a run the IMU streams into a PSRAM ring buffer (accel 3332 Hz / gyro 416 Hz ≈ 8:1); IDLE takes a short 12.5 Hz snapshot every 10 min. The radio is **off** during motion and powers on only to drain the finished capture over UDP to port 5684. A 1–15 s pre-TX jitter decorrelates shuttles that stop together. The shuttle blasts a drain only after the gateway echoes an 8-byte `DrainAck` (delivery evidence — not ARQ); on silence it skips rather than waste radio energy.
 - **Zero-touch provisioning:** auto-discovers the gateway IP via a UDP beacon on port 5000
 
 ### Layer 2 — Edge Gateway (Jetson Orin Nano)
@@ -152,6 +159,7 @@ cd client
 cp .env.example .env          # set JETSON_HOSTNAME + SHUTTLE_GROUP
 PLUDOS_MODE=standalone podman-compose --profile standalone up -d
 # Grafana → http://<jetson-ip>:3000   (local InfluxDB, no central server)
+# warehouse Jetson: http://100.119.83.35:3000 (Tailscale, admin/admin) or http://192.168.0.100:3000 (LAN)
 ```
 
 In standalone mode `ai-worker` writes the latest model to
@@ -189,7 +197,7 @@ ssh <jetson> "podman logs -f pludos-data-engine | head -20"
 | Component | Technology |
 |---|---|
 | Firmware | C / STM32CubeIDE / HAL, bare-metal (no RTOS) |
-| Transport | raw UDP — live stream (:5683) + high-rate capture drain (:5684), fire-and-forget (ADR-015 / ADR-021) |
+| Transport | raw UDP — high-rate capture drain (:5684, primary) with 8-byte `DrainAck` delivery echo + dormant live stream (:5683); no CoAP (ADR-015 / ADR-021) |
 | Edge runtime | Python async/await, Podman containers |
 | AI/ML | Flower (federated learning), XGBoost (federated model), 1D-CNN autoencoder labeller (default) / IsolationForest (fallback) |
 | Energy monitoring | Alumet (UGA/LIG), INA3221 / RAPL / tegrastats, Prometheus |
