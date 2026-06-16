@@ -38,6 +38,8 @@ services:
     environment:
       - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER}
       - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD}
+      # Substituted into provisioning datasource tokens (local + Jetson influx).
+      - INFLUXDB_ADMIN_TOKEN=${INFLUXDB_ADMIN_TOKEN}
       # Anonymous viewer access — anyone who can reach port 3000 can see dashboards
       # without logging in. Admins still log in at /login for edit access.
       # Combine with `tailscale funnel 3000` to publish a read-only public URL.

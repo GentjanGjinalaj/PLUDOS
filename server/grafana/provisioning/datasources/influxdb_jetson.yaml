@@ -1,0 +1,25 @@
+apiVersion: 1
+
+# Second datasource on the laptop Grafana: queries the warehouse Jetson's
+# standalone InfluxDB over Tailscale. The Jetson runs standalone
+# (INFLUXDB_URL=localhost) and writes shuttle/drain data only to its own
+# InfluxDB, so this is the only way to see live field data from the laptop.
+# Reachable because the Jetson publishes 8086 on 0.0.0.0 and the laptop is on
+# the same tailnet (warehouse1-desktop-1 = 100.119.83.35). If the laptop is
+# off the tailnet this datasource just goes unhealthy — the local datasource
+# is unaffected. Same admin token as the laptop influx (pludos-dev-token).
+datasources:
+  - name: InfluxDB-Jetson
+    type: influxdb
+    uid: jetson-influx
+    access: proxy
+    url: http://100.119.83.35:8086
+    jsonData:
+      version: Flux
+      organization: pludos
+      defaultBucket: alumet_energy
+      tlsSkipVerify: true
+    secureJsonData:
+      token: ${INFLUXDB_ADMIN_TOKEN}
+    isDefault: false
+    editable: true
