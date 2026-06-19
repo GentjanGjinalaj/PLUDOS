@@ -174,8 +174,9 @@ def make_anomaly_labels_cnn(
         norm_std = windows.std(axis=(0, 1)) + 1e-8
         X_norm   = (windows - run_mean) / norm_std
 
-    # Conv1d expects (B, C, T) — permute from (W, T, D).
-    tensor = torch.tensor(X_norm).permute(0, 2, 1)
+    # Conv1d expects (B, C, T) — permute from (W, T, D). Cast to float32: Welford
+    # run_mean/norm_std are float64, so X_norm is double; model weights are float32.
+    tensor = torch.tensor(X_norm, dtype=torch.float32).permute(0, 2, 1)
 
     class _CNNAutoencoder(nn.Module):
         """Encoder halves T twice (stride=2); decoder restores it. ~6 K params total."""
@@ -251,7 +252,7 @@ def make_anomaly_labels_cnn(
         if len(idle_starts) >= CNN_MIN_IDLE_WINDOWS:
             idle_win  = np.stack([X_idle[s:s + CNN_WINDOW_SIZE] for s in idle_starts])
             idle_norm = (idle_win - run_mean) / norm_std
-            t_idle    = torch.tensor(idle_norm).permute(0, 2, 1)
+            t_idle    = torch.tensor(idle_norm, dtype=torch.float32).permute(0, 2, 1)
             with torch.no_grad():
                 idle_err = ((t_idle - model(t_idle)) ** 2).mean(dim=(1, 2)).numpy()
             threshold = float(idle_err.mean() + ANOMALY_K * idle_err.std()) + 1e-8
