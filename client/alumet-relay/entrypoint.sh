@@ -67,7 +67,13 @@ host          = "${INFLUXDB_URL:-http://localhost:8086}"
 token         = "${INFLUXDB_TOKEN:-}"
 org           = "${INFLUXDB_ORG:-pludos}"
 bucket        = "${INFLUXDB_BUCKET:-alumet_energy}"
-attributes_as = "field"
+# Attributes default to fields, EXCEPT the INA3221 channel label which is promoted
+# to a tag. Without this the 4 channels (VDD_IN/VDD_SOC/VDD_CPU_GPU_CV/channel_4)
+# share one (measurement, tags, timestamp) key and collide on write — last-write-wins
+# kept only one channel, so per-rail power (and any VDD_IN board total) was unrecoverable
+# in InfluxDB. As a tag the label splits them into 4 distinct series (cardinality 4).
+attributes_as      = "field"
+attributes_as_tags = ["ina_channel_label"]
 
 # CSV output — written to the bind-mounted logs dir, inspectable on the host.
 # Columns: timestamp; metric (with unit); channel label; value.
