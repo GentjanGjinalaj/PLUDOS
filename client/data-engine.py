@@ -34,6 +34,7 @@ import glob
 import logging
 import math
 import os
+import signal
 import socket
 import struct
 import sys
@@ -555,6 +556,20 @@ def _maybe_flush_mission(shuttle_id: str, now: float) -> None:
     if PLUDOS_MODE != "headless":
         _write_mission_summary(shuttle_id, pkts, duration_ms)
     _reset_shuttle_state(shuttle_id)
+
+
+def _flush_all_open_buffers() -> str:
+    """Force-flush every open per-shuttle buffer to Parquet, ignoring the IDLE
+    timeout. Called on SIGTERM/SIGINT so `podman stop` doesn't silently drop an
+    in-flight mission. Skips the InfluxDB summary — Parquet durability is the goal
+    and Influx I/O can block/fail during shutdown. Returns a short status string."""
+    flushed = 0
+    for shuttle_id in list(_telemetry_buf.keys()):
+        buf = _telemetry_buf.pop(shuttle_id, [])
+        if buf:
+            _flush(buf, "mission")
+            flushed += 1
+    return f"{flushed} buffer(s) flushed"
 
 
 # ---------------------------------------------------------------------------
@@ -1104,7 +1119,19 @@ async def main() -> None:
     asyncio.create_task(_heartbeat_task())
     threading.Thread(target=_watchdog_thread, name="watchdog", daemon=True).start()
 
-    await loop.create_future()  # run forever
+    # Graceful shutdown: flush in-flight per-shuttle buffers before exit so a
+    # `podman stop` (SIGTERM) or Ctrl-C (SIGINT) doesn't drop a buffered mission.
+    stop = asyncio.Event()
+
+    def _on_signal(signame: str) -> None:
+        status = _flush_all_open_buffers()
+        logger.info("[SHUTDOWN] %s received — %s; exiting", signame, status)
+        stop.set()
+
+    for _sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(_sig, _on_signal, _sig.name)
+
+    await stop.wait()  # run until a shutdown signal fires
 
 
 if __name__ == "__main__":

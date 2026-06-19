@@ -201,6 +201,12 @@ class MissionReassembler:
         # Monotonic time of the most recent accepted chunk — drives quiet timeout.
         self.last_activity = time.monotonic()
         self.finalised = False
+        # True only when all 3 BEGINs were lost and this reassembler was synthesised
+        # from a chunk header. With no BEGIN, t0_tick/tx_tick are 0 so the capture age
+        # collapses to 0 and every t_ms is anchored to BEGIN-arrival (off by the true
+        # capture age). Surfaced as the t0_reconstructed Parquet column so consumers
+        # can exclude these timestamps without conflating it with chunk-loss.
+        self.t0_reconstructed = False
 
     # Store one CRC-valid chunk, ignoring duplicates. Returns True if newly stored.
     def add_chunk(self, chunk_seq: int, payload: bytes) -> bool:
@@ -327,6 +333,11 @@ def _write_stream_parquet(
     lost = re.total_chunks - received
     loss_pct = (100.0 * lost / re.total_chunks) if re.total_chunks else 0.0
     df["all_packets_received"] = complete
+    # Honesty flag for the lost-BEGIN synth path: when True, t_ms/t0_wall_ms are
+    # anchored to BEGIN-arrival (not true capture time) and are off by the capture
+    # age. Kept distinct from all_packets_received (chunk-loss) — a synth drain can
+    # still receive every chunk.
+    df["t0_reconstructed"] = bool(re.t0_reconstructed)
     df["packets_total"] = pd.array([re.total_chunks] * n, dtype="int32")
     df["packets_received"] = pd.array([received] * n, dtype="int32")
     df["packets_lost"] = pd.array([lost] * n, dtype="int32")
@@ -630,9 +641,12 @@ class DrainProtocol(asyncio.DatagramProtocol):
                 "byte_count": 0, "word_count": 0, "t0_tick_ms": 0, "tx_tick_ms": 0,
             }
             re = MissionReassembler(f["shuttle_id"], f["mission_id"], synth)
+            re.t0_reconstructed = True
             self.missions[key] = re
             logger.warning(
-                "[DRAIN] CHUNK before BEGIN %s — synthesising reassembler (odr unknown)",
+                "[DRAIN] CHUNK before BEGIN %s — synthesising reassembler (odr unknown, "
+                "t0 falls back to arrival time; timestamps off by capture age, "
+                "t0_reconstructed=True)",
                 _tag(*key),
             )
         re.add_chunk(f["chunk_seq"], f["payload"])

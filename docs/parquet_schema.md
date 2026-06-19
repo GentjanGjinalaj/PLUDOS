@@ -224,6 +224,7 @@ Example: `cap_accel_s1_m1747123456789.parquet`
 | `temp_c` | float32 | °C | Env stamp from `DrainBegin` — idle snapshots only; NaN for MOVING. |
 | `pressure_hpa` | float32 | hPa | Env stamp from `DrainBegin` — idle snapshots only; NaN for MOVING. |
 | `all_packets_received` | bool | — | `True` if every drain chunk arrived (no loss). |
+| `t0_reconstructed` | bool | — | `True` if all 3 `DrainBegin` copies were lost and the reassembler was synthesised from a chunk header. With no BEGIN, `t0_tick`/`tx_tick` are 0, so `t_ms`/`t0_wall_ms` collapse to **BEGIN-arrival time** and are off by the true capture age. Distinct from `all_packets_received` — a synth drain can still receive every chunk. Exclude from timestamp-sensitive analysis. |
 | `packets_total` | int32 | chunks | Total drain chunks expected for this capture. |
 | `packets_received` | int32 | chunks | Chunks received. |
 | `packets_lost` | int32 | chunks | Chunks missing. |

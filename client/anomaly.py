@@ -23,6 +23,10 @@ import numpy as np
 import pandas as pd
 from sklearn.ensemble import IsolationForest
 
+# Single source of truth for the ISM330 ±2 g LSB scale (DS13281); drain captures
+# store raw int16 and are converted to g here.
+from drain_receiver import ACCEL_G_PER_LSB
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -103,18 +107,48 @@ def _derive_features(df: pd.DataFrame) -> pd.DataFrame:
 _DAILY_CONSOLIDATED_RE = re.compile(r"^\d{4}-\d{2}-\d{2}\.parquet$")
 
 
-# Keep only live mission telemetry Parquet; drop schema-incompatible files.
-# cap_* drain captures (ADR-021) carry the raw drain schema (sample_index, t_ms,
-# x, y, z, is_idle_snapshot, temp_c) — only temp_c overlaps the training feature
-# set, so loading them yields all-NaN rows that dropna() silently discards,
-# leaving a 0-sample frame and a garbage model. Prefix must match
-# drain_receiver.CAP_PREFIX ("cap").
+# Keep live mission telemetry AND cap_accel_* drain captures (ADR-021); drop
+# schema-incompatible files. cap_accel_* is adapted to the live schema by
+# _adapt_cap_accel below. cap_gyro_* is excluded on purpose: it is a separate
+# file at a different ODR (416 vs 3332 Hz) and the accel-only training path
+# (DESIGN_COUNCIL item 2, fork 1) does not align the two streams — revisit when
+# gyro alignment lands. Daily rollups are skipped to avoid double-counting rows
+# already present in their per-mission file.
 def _is_trainable_parquet(name: str) -> bool:
-    if name.startswith("cap_"):
+    if name.startswith("cap_") and not name.startswith("cap_accel_"):
         return False
     if _DAILY_CONSOLIDATED_RE.match(name):
         return False
     return True
+
+
+# Adapt a cap_accel_* drain capture to the live telemetry schema so the training
+# loader can consume it (DESIGN_COUNCIL item 2, accel-only fork). Conversions:
+#   - raw int16 axes (x/y/z at ISM330 ±2 g FS) → g via ACCEL_G_PER_LSB
+#   - is_idle_snapshot → state (idle=0, moving=1)
+#   - sample_index → seq (per-file monotonic sort key); seq_gap → 0 (contiguous)
+#   - gyro_*, humidity_pct, and MOVING temp_c are absent in this file → 0.0
+#     placeholders. This keeps rows past dropna() AND holds the XGBoost feature
+#     dimension constant across rounds. These channels carry no signal in the
+#     accel-only path; they gain meaning only once gyro alignment lands (fork 2/3).
+def _adapt_cap_accel(df: pd.DataFrame) -> pd.DataFrame:
+    out = pd.DataFrame()
+    out["shuttle_id"]   = df["shuttle_id"].astype(int)
+    out["seq"]          = df["sample_index"].astype(int)
+    out["seq_gap"]      = 0
+    out["state"]        = np.where(df["is_idle_snapshot"], 0, 1).astype(int)
+    out["accel_x"]      = df["x"].astype("float32") * ACCEL_G_PER_LSB
+    out["accel_y"]      = df["y"].astype("float32") * ACCEL_G_PER_LSB
+    out["accel_z"]      = df["z"].astype("float32") * ACCEL_G_PER_LSB
+    out["gyro_x"]       = 0.0
+    out["gyro_y"]       = 0.0
+    out["gyro_z"]       = 0.0
+    # temp_c is stamped only on idle snapshots (NaN for MOVING); fill so MOVING
+    # rows survive dropna(). humidity_pct is never in the drain schema.
+    out["temp_c"]       = (df["temp_c"].astype("float32").fillna(0.0)
+                           if "temp_c" in df.columns else 0.0)
+    out["humidity_pct"] = 0.0
+    return out
 
 
 def load_buffered_data() -> tuple[np.ndarray, np.ndarray, str]:
@@ -135,14 +169,18 @@ def load_buffered_data() -> tuple[np.ndarray, np.ndarray, str]:
     )
     if not files:
         raise FileNotFoundError(
-            "CRITICAL: No trainable mission Parquet files in buffer "
-            "(cap_* drain captures and daily-consolidated rollups are skipped — "
-            "their schema is incompatible with the training feature set). "
+            "CRITICAL: No trainable Parquet files in buffer (live mission_* and "
+            "cap_accel_* drain captures are accepted; cap_gyro_* and daily-consolidated "
+            "rollups are skipped). "
             "Ensure at least one shuttle mission has completed before triggering an FL round."
         )
 
     recent = files[-MAX_PARQUET_FILES:]
-    frames = [pd.read_parquet(os.path.join(BUFFER_DIR, f)) for f in recent]
+    frames = []
+    for f in recent:
+        raw = pd.read_parquet(os.path.join(BUFFER_DIR, f))
+        # cap_accel_* uses the raw drain schema — adapt it to the live schema first.
+        frames.append(_adapt_cap_accel(raw) if f.startswith("cap_accel_") else raw)
     df = pd.concat(frames, ignore_index=True)
     logger.info(
         "Loaded %d samples from %d Parquet file(s): %s … %s",
