@@ -462,8 +462,14 @@ def _finalise_mission(re: MissionReassembler, reason: str) -> None:
             t0_wall += int(round(accel_trim * 1000.0 / re.odr_accel_hz))
 
     paths = []
+    # Storage write-window: bracket the sync Parquet writes so INA3221 board power can be
+    # integrated over [write_start_ms, write_end_ms] for the per-drain storage energy cost,
+    # the same way recv_* bounds the reception (comms) energy. Both writes run in the
+    # off-loop finaliser thread, so this measures real disk-write work, not idle time.
+    write_start_ms = int(time.time() * 1000)
     a_path = _write_stream_parquet("accel", accel, re.odr_accel_hz, re, complete, missing, t0_wall, accel_trim)
     g_path = _write_stream_parquet("gyro", gyro, re.odr_gyro_hz, re, complete, missing, t0_wall, gyro_trim)
+    write_end_ms = int(time.time() * 1000)
     if a_path:
         paths.append(os.path.basename(a_path))
     if g_path:
@@ -506,6 +512,10 @@ def _finalise_mission(re: MissionReassembler, reason: str) -> None:
                 # which is back-dated to when the shuttle captured the data).
                 "recv_start_ms":    re.begin_wall_ms,
                 "recv_end_ms":      int(time.time() * 1000),
+                # Storage (Parquet write) window — see write_start_ms bracket above.
+                "write_start_ms":   write_start_ms,
+                "write_end_ms":     write_end_ms,
+                "write_duration_ms": write_end_ms - write_start_ms,
                 "is_idle_snapshot": re.is_idle_snapshot,
                 "packets_total":    re.total_chunks,
                 "packets_received": received,

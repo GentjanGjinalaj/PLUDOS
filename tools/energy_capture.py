@@ -97,15 +97,16 @@ def main() -> None:
     drains = flux(f'''
 from(bucket:"{BUCKET}") |> range(start:-12h)
   |> filter(fn:(r)=>r._measurement=="stm_mission" and r.kind=="mission")
-  |> filter(fn:(r)=>r._field=="recv_start_ms" or r._field=="recv_end_ms" or r._field=="accel_samples")
+  |> filter(fn:(r)=>r._field=="recv_start_ms" or r._field=="recv_end_ms" or r._field=="accel_samples" or r._field=="write_start_ms" or r._field=="write_end_ms")
   |> last()
   |> drop(columns:["_time","_start","_stop","_measurement"])
   |> pivot(rowKey:["gw_mission_id","shuttle_id"], columnKey:["_field"], valueColumn:"_value")
   |> sort(columns:["recv_start_ms"])
 ''')
-    hdr = f"  {'shuttle':7s} {'dur_s':>6s} {'nW':>3s} {'meanW':>7s} {'J_tot':>7s} {'+W':>6s} {'J_ingest':>8s}"
+    hdr = f"  {'shuttle':7s} {'rx_s':>5s} {'meanW':>7s} {'J_ingest':>8s} | {'wr_s':>5s} {'J_store':>7s}"
     print(hdr)
     tot, cnt = 0.0, 0
+    stot, scnt = 0.0, 0
     for d in drains:
         try:
             rs, re = int(float(d["recv_start_ms"])), int(float(d["recv_end_ms"]))
@@ -116,20 +117,41 @@ from(bucket:"{BUCKET}") |> range(start:-12h)
         dur = (re - rs) / 1000.0
         mw = mean_w(iso(rs), iso(re), "VDD_IN")
         if mw is None:
-            print(f"  s{d.get('shuttle_id','?'):6s} {dur:6.2f}  (no power samples in window)")
+            print(f"  s{d.get('shuttle_id','?'):6s} {dur:5.2f}  (no power samples in window)")
             continue
         over = (mw - vin) if vin is not None else None
         jing = over * dur if over is not None else None
         sid = d.get("shuttle_id", "?")
-        ov = f"{over:+.3f}" if over is not None else "n/a"
         ji = f"{jing:.2f}" if jing is not None else "n/a"
-        print(f"  s{sid:6s} {dur:6.2f}    {mw:7.3f} {mw * dur:7.2f} {ov:>6} {ji:>8}")
+
+        # Storage window: integrate board power over the Parquet write. Often sub-second
+        # at 5 Hz poll -> may land 0 power samples (shows n/a); bump ALUMET_POLL_INTERVAL
+        # for a tighter grid. J_store is the extra energy of persisting the drain to disk.
+        sdur_s = swj = None
+        try:
+            ws, we = int(float(d["write_start_ms"])), int(float(d["write_end_ms"]))
+            if we > ws:
+                sdur_s = (we - ws) / 1000.0
+                smw = mean_w(iso(ws), iso(we), "VDD_IN")
+                if smw is not None and vin is not None:
+                    swj = (smw - vin) * sdur_s
+        except (KeyError, ValueError):
+            pass
+        sd = f"{sdur_s:5.3f}" if sdur_s is not None else "  n/a"
+        sj = f"{swj:.3f}" if swj is not None else "n/a"
+        print(f"  s{sid:6s} {dur:5.2f} {mw:7.3f} {ji:>8} | {sd:>5} {sj:>7}")
         if jing is not None:
             tot += jing
             cnt += 1
+        if swj is not None:
+            stot += swj
+            scnt += 1
     if cnt:
-        print(f"  -> mean ingest overhead = {tot / cnt:.2f} J/drain (n={cnt})")
-    print("  J_ingest = (meanW_drain - idleW) * dur  -> extra energy to receive the drain")
+        print(f"  -> mean ingest overhead  = {tot / cnt:.2f} J/drain (n={cnt})")
+    if scnt:
+        print(f"  -> mean storage overhead = {stot / scnt:.3f} J/drain (n={scnt})")
+    print("  J_ingest = (meanW_drain - idleW) * rx_dur   -> energy to receive the drain")
+    print("  J_store  = (meanW_write - idleW) * wr_dur   -> energy to persist it to Parquet")
 
 
 if __name__ == "__main__":

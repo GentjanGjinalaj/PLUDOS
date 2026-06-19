@@ -32,15 +32,19 @@ CSV_KEEP="${ALUMET_CSV_KEEP:-3}"                              # rotated alumet_r
 LOG_KEEP="${ALUMET_LOG_KEEP:-5}"                              # per-restart .log files to retain (incl. current)
 
 # --- INA3221 sample cadence ---------------------------------------------------
-# Default 200 ms (5 Hz): a multi-MB MOVING drain lasts ~seconds, so 5 Hz lands
-# several real power samples per drain for an honest per-drain energy integral; the
-# old 1 s default caught at most one. Bounded by the ina3221 hwmon driver's own ADC
-# update rate — polling faster than the ADC re-reads stale values, so verify on the
-# Jetson before going below ~100 ms. flush_interval matches so points reach InfluxDB
-# promptly (a slow flush would batch drains together and blur the per-drain window).
-# Higher rate = proportionally more CSV/InfluxDB volume; CSV rotation already caps size.
-ALUMET_POLL_INTERVAL="${ALUMET_POLL_INTERVAL:-200ms}"
-ALUMET_FLUSH_INTERVAL="${ALUMET_FLUSH_INTERVAL:-200ms}"
+# Default 50 ms (20 Hz). A multi-MB drain lasts ~seconds, so 20 Hz lands plenty of
+# samples for the reception (comms) energy integral AND a few inside the sub-second
+# Parquet write window for the storage energy integral (5 Hz often caught zero there).
+# Honesty bound: the ina3221 hwmon driver re-reads its ADC every 1 ms (verified
+# `update_interval`=1 ms on the Jetson 2026-06-19), so polling up to a few hundred Hz
+# still reads fresh values, not stale cache. For a dedicated comms-profiling session
+# set ALUMET_POLL_INTERVAL=10ms (100 Hz) to capture the drain power *shape* — but at
+# 100 Hz the live CSV hits its size cap (and triggers a rotation/restart) in well under
+# an hour, so bump ALUMET_CSV_MAX_MB for sustained high-rate runs. flush_interval
+# matches so points reach InfluxDB promptly (a slow flush would batch drains together
+# and blur the per-drain window). Higher rate = proportionally more CSV/InfluxDB volume.
+ALUMET_POLL_INTERVAL="${ALUMET_POLL_INTERVAL:-50ms}"
+ALUMET_FLUSH_INTERVAL="${ALUMET_FLUSH_INTERVAL:-50ms}"
 
 # Prune old per-restart logs: keep the newest (LOG_KEEP - 1) so that, once the
 # current run's LOG_FILE is created below, at most LOG_KEEP files remain.

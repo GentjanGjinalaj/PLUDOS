@@ -518,6 +518,12 @@ def _write_drain_summary(summary: dict) -> None:
                 .field("recv_start_ms",    int(summary["recv_start_ms"]))
                 .field("recv_end_ms",      int(summary["recv_end_ms"]))
                 .field("recv_duration_ms", int(summary["recv_end_ms"]) - int(summary["recv_start_ms"]))
+                # Storage (Parquet write) window: integrate INA3221 power over
+                # [write_start_ms, write_end_ms] for the per-drain storage energy cost,
+                # measured separately from the reception (comms) window above.
+                .field("write_start_ms",    int(summary["write_start_ms"]))
+                .field("write_end_ms",      int(summary["write_end_ms"]))
+                .field("write_duration_ms", int(summary["write_duration_ms"]))
                 # DrainBegin v2 provenance: wire generation, drains abandoned since the
                 # last success (item 15 — abandoned-mission visibility), the MOVING label
                 # boundary in g² (item 10), and the pre-drain anti-collision wait (item 13).
