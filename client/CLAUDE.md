@@ -19,8 +19,9 @@ Three services managed by `compose.yaml` under Podman:
   to the central server. Gated behind `--profile vpn` so dev runs don't
   need Tailscale.
 - `alumet-relay`: sidecar that runs `alumet-cli` for INA3221 power
-  measurement (ADR-011 Phase 2). Currently dormant on hardware until
-  flag verification is finished.
+  measurement (ADR-011, closed). Active on hardware — INA3221 read from
+  sysfs, all three output modes (Prometheus + InfluxDB + CSV) verified
+  2026-05-26.
 
 Plus an optional `tailscale` sidecar (also behind `--profile vpn`) for
 joining the gateway to the central server's tailnet.

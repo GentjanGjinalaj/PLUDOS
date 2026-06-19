@@ -550,8 +550,9 @@ Phase 1 a mission is freed (`drained=1`) once the gateway echoes a `DRAIN_ACK` f
 its `DRAIN_BEGIN` — a liveness check, not a per-chunk guarantee; the full
 `ACK_COMPLETE` selective-repeat guarantee is Phase 2 (§9). If the echo is missing
 the shuttle skips the chunk blast entirely (keeps the radio dark) and retries the
-whole mission next wake; the gateway's `(shuttle_id, mission_id, sample_index)`
-dedup makes the re-drain idempotent.
+whole mission next wake; the gateway dedups on `(shuttle_id, mission_id)` within
+the `DEDUP_TTL_S` window, dropping an immediate re-drain — a retry after the window
+is stored as a fresh capture.
 
 ### Implemented vs pending
 

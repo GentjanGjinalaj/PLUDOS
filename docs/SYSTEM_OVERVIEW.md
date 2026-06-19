@@ -65,18 +65,18 @@ TIER 1 — EDGE (per shuttle)            TIER 2 — GATEWAY (per minifloor)     
 ┌───────────────────────────┐         ┌───────────────────────────────────┐  ┌──────────────────────────────┐
 │ STM32U585 (B-U585I-IOT02A) │         │ Jetson Orin Nano (Podman compose) │  │ Podman compose + Flower proc │
 │  ISM330DHCX IMU (I2C2)     │         │                                   │  │                              │
-│  HTS221 temp/hum (I2C2)    │  UDP    │  data-engine  :5683 ingest        │  │  influxdb        :8086       │
-│  LPS22HH (local debug only)│  24 B   │   └─ Parquet → ./ram_buffer       │  │  grafana         :3000       │
-│  EMW3080 Wi-Fi (SPI2)      │ ───────▶│  beacon       :5000 broadcast     │  │  alumet (RAPL)   :50051/:9094│
-│                            │  :5683  │                                   │  │  fl-trigger → flwr run .     │
-│  FSM: IDLE 0.1 Hz TX       │         │  ai-worker  Flower XGBoost client │  │  server.py  ServerApp        │
-│       MOVING 50 Hz TX      │◀────────│   AlumetProfiler 10 Hz scrape     │  │   XGBoostStrategy tree-union │
+│  HTS221 temp/hum (I2C2)    │  UDP    │  data-engine  :5683 live (dev/mock)│  │  influxdb        :8086       │
+│  LPS22HH (local debug only)│ drain   │   └─ Parquet → ./ram_buffer       │  │  grafana         :3000       │
+│  EMW3080 Wi-Fi (SPI2)      │  burst  │  drain_recv   :5684 reassemble    │  │  alumet (RAPL)   :50051/:9094│
+│                            │ ───────▶│  beacon       :5000 broadcast     │  │  fl-trigger → flwr run .     │
+│  FSM: IDLE 12.5Hz snapshot │  :5684  │                                   │  │  server.py  ServerApp        │
+│       MOVING → PSRAM ring  │◀────────│   AlumetProfiler 10 Hz scrape     │  │   XGBoostStrategy tree-union │
 │  (beacon listen :5000)     │ beacon  │  alumet-relay INA3221→:9095 Prom  │  │                              │
 └───────────────────────────┘         │  tailscale (vpn profile)          │  └──────────────────────────────┘
                                        └───────────────────────────────────┘
         STM↔GW: local Wi-Fi              GW energy: gRPC :50051 ──────────▶  server alumet (Phase 2)
                                          GW↔Server FL: gRPC over Tailscale ▶  Flower SuperLink
-                                         GW→InfluxDB: HTTP :8086 ──────────▶  fl_energy / fl_phases / stm_mission
+                                         GW→InfluxDB: HTTP :8086 ──────────▶  fl_energy / fl_phases / stm_mission / stm_idle_wave
 ```
 
 ### Mermaid
@@ -94,7 +94,7 @@ graph LR
   end
 
   subgraph T2[Tier 2 - Jetson Gateway]
-    DE[data-engine :5683]
+    DE[data-engine :5684 drain / :5683 live-dev]
     PARQ[(Parquet ./ram_buffer)]
     AIW[ai-worker Flower client]
     AR[alumet-relay INA3221 :9095]
@@ -115,8 +115,8 @@ graph LR
     SALU --> INFLUX
   end
 
-  WIFI -- UDP 24B :5683 --> DE
-  DE -- beacon :5000 --> WIFI
+  WIFI -- PSRAM drain burst :5684 --> DE
+  DE -- DrainAck :5684 + beacon :5000 --> WIFI
   AIW -- fl_energy/fl_phases HTTP :8086 --> INFLUX
   DE -- stm_mission HTTP :8086 --> INFLUX
   AIW -- booster bytes gRPC/Tailscale --> SRV
@@ -206,15 +206,30 @@ present any as measured ground truth.
    beacon on UDP 5000; bonds only if its `SHUTTLE_ID` is in the list
    (`docs/architecture.md` §Tier 1). Gateway broadcasts the beacon
    (`data-engine.py` `BEACON_PORT=5000`, `:148`).
-2. **FSM gates the TX rate.** IDLE samples 10 Hz internally, transmits 0.1 Hz;
-   crossing `MOVEMENT_THRESHOLD_G2=0.05f` (`main.c:120`) continuously for 500 ms
-   (300 ms debounce) → MOVING, transmits 50 Hz (WiFi-capped). Exit MOVING after
-   20 s with no above-threshold sample (`docs/state_machine.md`).
-3. **Telemetry send.** Each sample → one 24-byte UDP datagram to `<gateway>:5683`,
-   fire-and-forget, no ACK/retry (`docs/wire_protocol.md` §No reliability layer).
-4. **Gateway ingest.** `TelemetryProtocol.datagram_received` (`data-engine.py:668`)
-   validates size, unpacks, applies the `SHUTTLE_GROUP` ingress filter
-   (`data-engine.py:685`), and resolves a human name.
+2. **FSM gates capture, not a live TX rate (ADR-021).** Crossing
+   `MOVEMENT_THRESHOLD_G2=0.06f` (`main.c:123`) continuously for `MOVEMENT_DWELL_MS=500U`
+   (`main.c:124`) → MOVING; the IMU streams accel 3332 Hz / gyro 416 Hz into the
+   PSRAM ring via FIFO while the radio stays off. Exit MOVING after
+   `NO_MOVEMENT_TIMEOUT_MS=20000U` (`main.c:126`) with no above-threshold sample.
+   IDLE takes a 10 s snapshot at 12.5 Hz every 10 min (`CAP_IDLE_SNAP_*`,
+   `main.c:241-242`). The earlier continuous 50 Hz live `:5683` stream is gone —
+   `NETWORK_SendTelemetry()` is defined but no longer called (`docs/state_machine.md`).
+3. **Drain, not live send.** When the mission seals, the radio powers on and the
+   PSRAM ring is drained as a UDP burst to `<gateway>:5684` (`PLDR` frames:
+   DRAIN_BEGIN ×3, DRAIN_CHUNK …, DRAIN_END ×3). The shuttle waits for the gateway's
+   8-byte `DrainAck` (type 6 liveness echo, delivery evidence — not ARQ) before
+   blasting; on silence it skips rather than waste radio energy
+   (`docs/wire_protocol.md`, `client/drain_receiver.py`).
+   > **Steps 4–9 describe the live `:5683` ingest path.** Under ADR-021 the
+   > firmware no longer transmits live telemetry, so on real hardware this path
+   > carries only mock traffic (`tools/mock_stm32.py`); production data arrives via
+   > the `:5684` drain receiver (`drain_receiver.py` → `cap_accel_*`/`cap_gyro_*`
+   > Parquet + `stm_mission`/`stm_idle_wave` Influx). The live path is kept for the
+   > sim/dev loop and is byte-compatible with the same `PludosTelemetry` v3 struct.
+
+4. **Gateway ingest.** `TelemetryProtocol.datagram_received` (`data-engine.py`)
+   validates size, unpacks, applies the `SHUTTLE_GROUP` ingress filter,
+   and resolves a human name.
 5. **Temporal anchor.** First packet per shuttle sets `offset = receipt_ms − tick_ms`
    (`data-engine.py:707`); refreshed every `NTP_REFRESH_INTERVAL=100` packets or
    `NTP_REFRESH_MAX_S=60` s (`.env.example:62-63`). Sort key is `seq`, not
@@ -229,8 +244,11 @@ present any as measured ground truth.
    dtypes (float16 sensors, int8/int16/int32 identity) and `_flush` writes one
    zstd Parquet file atomically via `os.replace`. No derived columns — feature
    engineering happens later in `anomaly.py` at train time.
-9. **Mission summary → InfluxDB.** `_write_mission_summary` pushes `stm_mission`
-   (`packets`, `duration_ms`) on a daemon thread; skipped in `headless` mode.
+9. **Mission summary → InfluxDB.** On hardware the drain receiver's
+   `_write_drain_summary` pushes `stm_mission` (`source="drain"`: chunk counts,
+   loss_pct, accel/gyro stats) and, for idle snapshots, `stm_idle_wave`. The
+   live-path `_write_mission_summary` (`packets`, `duration_ms`, no `source` tag)
+   is the dormant dev-only writer. Both are skipped in `headless` mode.
 10. **FL round trigger.** `fl-trigger` polls InfluxDB and launches `flwr run .`
     when ≥ `FL_MIN_FIT_CLIENTS` gateways are ready (`server/compose.yaml:95-121`).
 11. **Local training.** `ai-worker` (`client.py`) loads the most recent

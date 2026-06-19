@@ -85,7 +85,13 @@ curl -s -X POST "http://localhost:8086/api/v2/query?org=pludos" \
   --data-raw '<paste Flux query here>'
 ```
 
-### Current shuttle state (IDLE=0 / MOVING=1)
+> **Legacy (ADR-021).** The four `stm_telemetry` queries below target the
+> continuous live stream, which is **no longer written** — the radio is off
+> except to drain finished captures, so `stm_telemetry` is empty. They are kept
+> for reference only. For current data query `stm_mission` (per-mission summary)
+> and `stm_idle_wave` (idle waveform); see `docs/DATA_GUIDE.md §6`.
+
+### Current shuttle state (IDLE=0 / MOVING=1) — *legacy, no live data*
 
 ```flux
 from(bucket: "alumet_energy")

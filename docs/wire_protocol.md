@@ -135,8 +135,9 @@ chunks back-to-back, then `DRAIN_END` (×3). The only back-channel is an 8-byte
 delivery evidence ("the Jetson is listening"), **not** retransmission. The shuttle
 waits a bounded window for it and only marks the mission drained if it arrives;
 otherwise it skips the chunk blast and retries the whole mission on the next wake
-(re-drain is idempotent — the gateway dedups on `(shuttle_id, mission_id,
-sample_index)`). The gateway reassembles by `chunk_seq`, validates each chunk's
+(the gateway drops a re-drain of a just-finalised `(shuttle_id, mission_id)` only
+within the `DEDUP_TTL_S` window; after it expires the retry is stored as a fresh
+capture under a new `gw_mission_id`). The gateway reassembles by `chunk_seq`, validates each chunk's
 CRC32, and writes one Parquet per `(shuttle_id, mission_id)` on `DRAIN_END` (or a
 quiet timeout), marking `complete=false` and recording gap ranges if any chunk is
 missing.

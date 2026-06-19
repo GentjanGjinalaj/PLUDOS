@@ -84,7 +84,7 @@ Defined tags: `[NETWORK]`, `[SENSOR]`, `[BUFFER]`, `[FSM]`, `[BEACON]`, `[SYSTEM
 `data-engine.py` runs on `asyncio`. Never block the event loop:
 - File I/O: PyArrow `to_parquet` is sync but fires only on flush (acceptable).
 - DB writes: use async client or run in executor.
-- Heavy CPU: belongs in `client.py` (separate process), not in the CoAP handler.
+- Heavy CPU: belongs in `client.py` (separate process), not in the UDP datagram handler.
 
 ### Naming
 

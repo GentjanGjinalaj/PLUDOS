@@ -21,26 +21,30 @@ first packet arrives.
   • LPS22HH (local debug only)     XGBoost + Flower client      • Grafana
                                    AlumetProfiler                 port 3000
          raw UDP 5683 ─────────►  • pludos-alumet-relay
-         (24-byte PludosTelemetry)  (INA3221, dormant)
+         (24-byte PludosTelemetry)  (INA3221, active — ADR-011 closed)
+         UDP 5684 drain ───────►
                                         gRPC over Tailscale ──►  flwr run .
                                         InfluxDB HTTP  ────────►  port 8086
 ```
 
-**Data flow summary (ADR-015 v2):**
-1. STM32 streams 0.1 Hz `PludosTelemetry` packets in IDLE; transitions to
-   MOVING when accelerometer deviation > 0.05 g² for 500 ms.
-2. In MOVING the STM32 emits one 24-byte UDP packet per accelerometer
-   sample to `udp://<gateway>:5683` at 10 Hz, fire-and-forget. No ACK, no
-   retry, no SRAM buffer.
-3. Gateway parses each packet, derives the absolute timestamp via per-shuttle
-   NTP offset, and appends to a per-shuttle in-memory list.
-4. When the shuttle stays in state==IDLE for `MISSION_END_IDLE_S` (default 30 s)
-   after any MOVING run, the gateway writes one Parquet file for that shuttle
-   and a `stm_mission` InfluxDB point. Per-shuttle buffer pressure flushes
-   are also possible (`SHUTTLE_SOFT_LIMIT` / `SHUTTLE_HARD_LIMIT`).
+**Data flow summary (ADR-021 duty cycle):**
+1. STM32 transitions to MOVING when accelerometer deviation > 0.05 g² for
+   500 ms. Under ADR-021 the radio is **off** during MOVING — there is no live
+   per-sample UDP stream.
+2. During MOVING the ISM330 FIFO fills an 8 MB PSRAM ring at high rate. After
+   the run, the STM32 powers the radio on and drains the capture as a UDP burst
+   to `udp://<gateway>:5684` (DRAIN_BEGIN/CHUNK/END frames, magic `PLDR`); the
+   gateway echoes a DRAIN_ACK liveness frame.
+3. `drain_receiver.py` reassembles the burst into `cap_accel_*` / `cap_gyro_*`
+   Parquet files (raw int16) and writes an `stm_mission` drain-summary point and,
+   for idle snapshots, an `stm_idle_wave` waveform point to InfluxDB.
+4. The legacy live :5683 listener still binds, but the firmware no longer
+   transmits a live MOVING stream, so the old `stm_telemetry` measurement is not
+   written — Flux queries against it return nothing.
 5. `flwr run .` triggers an FL round: each Jetson loads the most recent
    Parquet files, trains XGBoost, ships booster bytes over gRPC/Tailscale.
-6. `AlumetProfiler` writes 10 Hz power telemetry to InfluxDB during training.
+6. `alumet-relay` (INA3221 via sysfs, ADR-011 closed) writes power telemetry to
+   InfluxDB.
 
 ---
 
@@ -214,13 +218,14 @@ and the `INFLUXDB_*` block (required for energy telemetry to reach the server).
 
 The Jetson (JetPack 6 / Ubuntu 22.04) does **not** have `ufw` installed by
 default. No firewall configuration is needed: the `data-engine` container
-runs with `network_mode: host`, so ports 5683 and 5000 are bound directly
+runs with `network_mode: host`, so ports 5683, 5684 and 5000 are bound directly
 on the host network interface and are reachable from the WiFi subnet.
 
 If `ufw` is installed and active, allow the ports:
 
 ```bash
 sudo ufw allow 5683/udp   # raw UDP — 24-byte PludosTelemetry (ADR-016 v3)
+sudo ufw allow 5684/udp   # capture drain burst (ADR-020/021)
 sudo ufw allow 5000/udp   # UDP broadcast beacon (zero-touch provisioning)
 sudo ufw status
 ```
@@ -256,17 +261,20 @@ podman logs -f pludos-data-engine
 
 ```
 [BEACON] announcing 192.168.1.10 on UDP port 5000 every 10 s (group=1,2)
-[STM32-Alpha] NTP offset established: 1234567 ms (state=IDLE)
-[STM32-Alpha] IDLE 1.0Hz seq=1 accel=(0.00,-0.00,1.01)g temp=22.3°C hum=45% pwr=89mW e=0.00J
-[STM32-Alpha] MOVING 50.0Hz seq=180 accel=(-0.04,0.07,0.97)g temp=22.3°C hum=45% pwr=260mW e=0.27J
+[DRAIN] BEGIN shuttle=1 mission=... samples=...
+[STORAGE] wrote cap_accel_*.parquet shuttle=1 samples=... size=...
+[INFLUXDB] stm_mission(drain) written shuttle=1 m=... kind=moving recv=.../...
 ```
 
-**Verify a Parquet file was written** (appears after `MISSION_END_IDLE_S`
-of state==IDLE following any MOVING run, default 30 s):
+(The radio is off during MOVING under ADR-021, so you won't see a live
+per-sample stream — the capture arrives as a drain burst after each run.)
+
+**Verify a Parquet file was written** (a drain lands a `cap_accel_*` /
+`cap_gyro_*` file per capture):
 
 ```bash
 ls -lh ~/PLUDOS/client/ram_buffer/
-# mission_1779041235.parquet
+# cap_accel_s1_m<gw_mission_id>.parquet
 ```
 
 ### 2.7 Daily Operations & Monitoring
@@ -309,7 +317,7 @@ podman stop pludos-data-engine
 podman rm   pludos-data-engine
 ~/.local/bin/podman-compose up -d data-engine
 
-# 4. Verify the new version is running (check startup log line says "ADR-015 v2")
+# 4. Verify the new version is running (startup banner reads "ADR-016 v3 + gyro")
 podman logs --tail=5 pludos-data-engine
 ```
 
@@ -357,13 +365,15 @@ rm ~/.config/cni/net.d/client_default.conflist
 # podman recreates the file correctly on the next compose up
 ```
 
-### 2.8 Alumet Energy Monitoring (Phase 1 — tegrastats)
+### 2.8 Alumet Energy Monitoring (ADR-011 closed)
 
-The `AlumetProfiler` in `client/client.py` uses `tegrastats` to read the
-Jetson's INA3221 power rails (`VDD_GPU`, `VDD_CPU`, `VDD_SOC`) during each FL
-training round. `tegrastats` is part of JetPack — no installation needed.
+The `alumet-relay` sidecar reads the Jetson's INA3221 rails via sysfs and exposes
+them on a Prometheus endpoint (plus InfluxDB + CSV outputs). The `AlumetProfiler`
+in `client/client.py` scrapes that endpoint for real power during each FL round;
+`tegrastats` remains only as a debug/fallback source (`POWER_SOURCE=tegrastats`).
+`tegrastats` is part of JetPack — no installation needed.
 
-Verify before running an FL round:
+To verify the fallback path before running an FL round:
 
 ```bash
 # Confirm tegrastats is available
@@ -383,9 +393,9 @@ sudo jetson_clocks   # lock clocks
 In `TEST_MODE=1` (laptop), `AlumetProfiler` falls back to randomised mock
 values so InfluxDB points still flow without hardware.
 
-**Phase 2 (open):** replacing the `tegrastats` subprocess call with a local
-Alumet relay sidecar. See ADR-011 in `docs/decisions.md` and the
-`pludos-alumet` skill for the implementation plan.
+The local Alumet relay sidecar (`alumet-relay`) is the primary energy source —
+ADR-011 is closed (verified on hardware 2026-05-26). See ADR-011 in
+`docs/decisions.md` and the `pludos-alumet` skill.
 
 ### 2.8 Start the AI Worker (FL rounds)
 
@@ -742,7 +752,8 @@ How the three tiers discover each other:
 
 | Link | Protocol | Port | Config location |
 |---|---|---|---|
-| STM32 → Jetson (telemetry) | raw UDP (28 B) | 5683 | beacon-discovered; `wifi_credentials.h` → `JETSON_IP` is the boot-time fallback only |
+| STM32 → Jetson (telemetry) | raw UDP (24 B) | 5683 | beacon-discovered; `wifi_credentials.h` → `JETSON_IP` is the boot-time fallback only |
+| STM32 → Jetson (capture drain) | UDP burst (`PLDR`) | 5684 | beacon-discovered; drained after each MOVING run (ADR-020/021) |
 | Jetson → STM32 beacon | UDP broadcast | 5000 | `client/.env` → `GATEWAY_IP`, `SHUTTLE_GROUP` |
 | Jetson → Server (FL gRPC) | gRPC over Tailscale | 9091 | `client/.env` → `TS_AUTHKEY`; §3.6 Mode B |
 | Jetson → Server (InfluxDB) | HTTP over Tailscale | 8086 | `client/.env` → `INFLUXDB_URL` |
@@ -885,7 +896,7 @@ Rebuild and reflash after changes:
 #define MOVEMENT_DEBOUNCE_MS    300U    // ms — tolerance for sub-threshold dips during dwell
 #define NO_MOVEMENT_TIMEOUT_MS  20000U  // ms — no-above-threshold duration to exit MOVING
 #define SAMPLE_PERIOD_IDLE_MS   100U    // 10 Hz internal sampling in IDLE
-#define SAMPLE_PERIOD_MOVING_MS 20U     // 50 Hz sampling + transmit in MOVING
+#define SAMPLE_PERIOD_MOVING_MS 20U     // 50 Hz FSM poll in MOVING (radio off; IMU goes to PSRAM, not TX)
 #define TX_PERIOD_IDLE_MS       10000U  // 0.1 Hz UDP transmit in IDLE
 #define ENV_READ_PERIOD_MS      500U    // 2 Hz HTS221 cache refresh
 ```
@@ -956,7 +967,7 @@ cd client
 TEST_MODE=1 python3 data-engine.py
 # Add SHUTTLE_GROUP=1,2 to exercise the multi-Jetson pairing filter.
 
-# Terminal 2 — emit 28-byte PludosTelemetry to 127.0.0.1:5683
+# Terminal 2 — emit 24-byte PludosTelemetry to 127.0.0.1:5683
 cd ..
 python3 tools/mock_stm32.py
 # Env overrides: TELEMETRY_HOST, TELEMETRY_PORT, MOCK_SHUTTLES, FIRST_SHUTTLE_ID,

@@ -32,9 +32,10 @@ For a phone hotspot (Android), enable "Extended compatibility" / "2.4 GHz band".
 
 ### Jetson IP discovery
 
-Zero-touch via UDP beacon (post-ADR-015): the `data-engine` container broadcasts
+Zero-touch via UDP beacon: the `data-engine` container broadcasts
 `PLUDOS-GW:<ip>[:csv-shuttle-ids]` to `255.255.255.255:5000` every 10 s. The
-STM32 listens at boot and on every WiFi reconnect and updates its `JETSON_IP`
+STM32 `BEACON_Run()` discovers the gateway IP at runtime — at boot, on every
+WiFi reconnect, and periodically while IDLE — and updates its `JETSON_IP`
 runtime variable from the beacon. The `JETSON_IP` define in `wifi_credentials.h`
 is the **compile-time fallback** for the very first probe; once a beacon is
 seen, the runtime IP takes over.
@@ -51,17 +52,21 @@ hostname -I
 
 | Port | Protocol | Purpose |
 |---|---|---|
-| 5683 | UDP | 28-byte `PludosTelemetry` stream (ADR-015 v2) |
+| 5683 | UDP | 24-byte `PludosTelemetry` stream (ADR-016 v3) |
+| 5684 | UDP | High-rate PSRAM capture drain (ADR-020/021) |
 | 5000 | UDP | Beacon broadcast (zero-touch IP provisioning) |
 
 ```bash
 sudo ufw allow 5683/udp
+sudo ufw allow 5684/udp
 sudo ufw allow 5000/udp
 sudo ufw status
 ```
 
-Port 5684 (the legacy NC-UDP path) is no longer used — ADR-015 unified the two
-streams onto 5683.
+Under the ADR-021 duty cycle the radio is off during MOVING; high-rate IMU is
+captured to PSRAM and drained as a UDP burst on 5684 after the run. The 5683
+listener still exists for IDLE telemetry but the firmware no longer transmits a
+live stream during MOVING.
 
 ---
 

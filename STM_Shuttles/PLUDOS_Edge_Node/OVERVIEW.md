@@ -89,8 +89,9 @@ directly will be overwritten on the next regeneration.
 ## tools/
 
 - `tools/coap_udp_monitor.py` — a small laptop-side Python listener for
-  eyeballing the UDP/CoAP packets the firmware emits, without needing the full
-  Jetson stack running. Pure dev/test aid. **Weight: one-off helper.**
+  eyeballing the raw UDP packets the firmware emits, without needing the full
+  Jetson stack running. (Firmware no longer emits CoAP — ADR-015; the tool's
+  CoAP-parse path is legacy.) Pure dev/test aid. **Weight: one-off helper.**
 
 ## How it all connects
 

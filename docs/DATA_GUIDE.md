@@ -166,10 +166,12 @@ effectively dead. See `docs/ANALYTICS.md §3` for the full field/tag schema.
 - **`stm_idle_wave`** (drain, idle snapshots only) — per-sample waveform at
   the snapshot ODR. Fields: `ax_g`, `ay_g`, `az_g`, and `gx_dps`/`gy_dps`/
   `gz_dps` when gyro is present.
-- **`stm_telemetry`** (legacy live path, **dormant**) — was written per live
-  packet (`state`, `accel_*`, `gyro_*`, `temp_c`, `humidity_pct`,
-  `tx_rate_hz`). Since the radio is off outside drains it receives almost no
-  data, and no Grafana panel queries it.
+- **`stm_telemetry`** (legacy live path, **not written under ADR-021**) — was
+  written per live packet (`state`, `accel_*`, `gyro_*`, `temp_c`,
+  `humidity_pct`, `tx_rate_hz`). The radio is off outside drains, so the live
+  path is dead: `data-engine.py` never instantiates this measurement and no
+  Grafana panel queries it. Current data lives in `stm_mission` (per-mission
+  summary) and `stm_idle_wave` (idle waveform).
 
 Board power on the Jetson itself is measured by the alumet-relay sidecar
 (`input_current` / `input_voltage`, ADR-011), not by the data-engine.

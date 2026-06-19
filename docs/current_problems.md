@@ -70,8 +70,9 @@ multi-week run.
 `DRAIN_BEGIN`. Firmware sends `DRAIN_BEGIN` ×3, then `Drain_WaitForAck` (recvfrom
 with `SO_RCVTIMEO`, 5 attempts, ~750 ms cap) and sets `drained=1` **only** if the
 ack arrives. No ack ⇒ skip the chunk blast (radio stays dark), leave `drained=0`,
-retry the whole mission next wake. Re-drain is idempotent — the gateway dedups on
-`(shuttle_id, mission_id, sample_index)`. This is liveness evidence, **not** ARQ
+retry the whole mission next wake. The gateway dedups a just-finalised
+`(shuttle_id, mission_id)` for the `DEDUP_TTL_S` window so an immediate re-drain is
+dropped; a later retry is stored as a fresh capture. This is liveness evidence, **not** ARQ
 (types 4/5 stay reserved for Phase 2). See CHANGELOG "Drain Delivery-Evidence".
 **Hardware check pending:** `recvfrom` runs on the existing send socket (ephemeral
 port); the gateway replies to the BEGIN source address. Unverified on the MXCHIP

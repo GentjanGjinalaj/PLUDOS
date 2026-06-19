@@ -306,7 +306,7 @@ InfluxDB measurements actually written by `data-engine.py`:
 |---|---|---|---|
 | `stm_mission` (drain) | every drain | `shuttle_id`, `gateway`, `source=drain`, `kind=mission\|idle_snapshot` | `mission_id`, `packets_total/received/lost`, `loss_pct`, `accel_samples`, `gyro_samples`, `complete`, `temp_c`, `pressure_hpa` |
 | `stm_idle_wave` | each idle snapshot | `shuttle_id`, `gateway` | per-sample `ax_g/ay_g/az_g` (+ `gx_dps/gy_dps/gz_dps`) — the actual idle waveform |
-| `stm_mission` (live) / `stm_telemetry` | live path | `shuttle_id`, `gateway` | dormant under ADR-021 |
+| `stm_telemetry` (legacy live path) | — | — | **not written under ADR-021** — the live stream is removed; listed only so the dead measurement isn't mistaken for live data |
 
 InfluxDB writes are **fire-and-forget on a daemon thread**, so visualisation
 never stalls the receive loop. Grafana dashboards read these measurements;

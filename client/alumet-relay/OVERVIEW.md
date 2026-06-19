@@ -15,9 +15,9 @@ as its own container, reads the Jetson's on-board **INA3221** power rails, and
 publishes the numbers so the FL client (`client.py`'s `AlumetProfiler`) can tag
 each training round with its energy cost.
 
-This is **ADR-011 Phase 2**. It is built on hardware but was still being
-flag-verified on the real Jetson, so on some deployments it runs in a reduced
-mode.
+This is **ADR-011 Phase 2** (ADR-011 closed). It is active on hardware — the
+INA3221 is read from sysfs and all three output modes (Prometheus + InfluxDB +
+CSV) were verified on the real Jetson on 2026-05-26.
 
 ## The files
 

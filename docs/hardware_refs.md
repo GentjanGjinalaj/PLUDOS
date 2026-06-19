@@ -17,8 +17,8 @@ in the code differs, investigate before assuming the code is wrong.
 | Flash | 2 MB |
 | SRAM total | **786 KB** (768 KB main + 16 KB SRAM4 backup domain) |
 | WiFi | MXCHIP EMW3080 (SPI2), 2.4 GHz only |
-| IMU | ISM330DHCX (accel + gyro), I2C2, address 0x6B (SA0=VDD, left-shifted 0xD6 in firmware) |
-| Other sensors | LIS2MDL, LPS22HH, HTS221, VL53L5CX, 2× MEMS mics — not used yet |
+| IMU | ISM330DHCX (accel + gyro), I2C2, address 0x6B (SA0=VDD, left-shifted 0xD6 in firmware). MOVING capture: accel ODR 3332 Hz / gyro ODR 416 Hz; IDLE snapshot: 12.5 Hz |
+| Other sensors | LIS2MDL, LPS22HH, HTS221, VL53L5CX, 2× MEMS mics — HTS221 (temp/humidity) and LPS22HH (pressure) are read for env stamps; the rest unused |
 
 **Linker script:** `STM32U585AIIXQ_FLASH.ld`
 - Main SRAM mapped to 768 KB
@@ -29,7 +29,7 @@ in the code differs, investigate before assuming the code is wrong.
 **Key datasheets and references:**
 - STM32U585 Reference Manual (RM0456) — peripheral registers, clock tree
 - B-U585I-IOT02A User Manual (UM2839) — board schematic, pin assignments
-- ISM330DLC datasheet — accelerometer/gyro register map, ODR settings
+- ISM330DHCX datasheet — accelerometer/gyro register map, ODR settings
 - MXCHIP EMW3080 AT command guide — WiFi module SPI protocol
 
 **Known errata / issues:**
@@ -91,14 +91,18 @@ Migration to a dedicated server is listed as a future enhancement.
 
 | Component | Protocol | Port |
 |---|---|---|
-| STM32 → Jetson (telemetry) | Raw UDP (24-byte `PludosTelemetry`, ADR-016 v3) | 5683 |
+| STM32 → Jetson (live telemetry) | Raw UDP (24-byte `PludosTelemetry`, ADR-016 v3) | 5683 |
+| STM32 → Jetson (high-rate drain) | Raw UDP (`PLDR` drain frames, ADR-020/021) | 5684 |
 | Jetson → STM32 (beacon) | UDP broadcast (`PLUDOS-GW:<ip>[:csv-ids]`) | 5000 |
 | Jetson → Server (FL) | gRPC over Tailscale | 9091 |
 | Jetson → InfluxDB | HTTP over Tailscale | 8086 |
 | Gateway VPN | WireGuard (Tailscale) | 41641 UDP |
 
-Port 5684 (legacy NC-UDP for environmental data) was retired by ADR-015.
-Both channels are now unified into the single 24-byte `PludosTelemetry` on 5683.
+There is no CoAP anywhere in the current code — ADR-015 removed it. The live
+`PludosTelemetry` path on 5683 (ADR-016 v3) is dormant in practice: under
+ADR-020/021 the radio is off outside a drain window, so the signal PLUDOS keeps
+arrives as `PLDR` drain frames on 5684, reassembled into the `cap_*` Parquet
+files (see `wire_protocol.md §2`).
 
 **WiFi constraint:** The MXCHIP EMW3080 on the STM32 board only supports
 2.4 GHz. Hotspots must be configured to broadcast on 2.4 GHz only.

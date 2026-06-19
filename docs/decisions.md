@@ -784,8 +784,9 @@ corrections from the field design review:
    held in hardware reset) during MOVING and between drains. It is powered **on**
    to drain at: (a) MOVING→IDLE (the just-captured mission), and (b) a PSRAM
    **flush watermark** during long IDLE — a shuttle parked for hours still wakes
-   periodically to flush so the ring never overruns. After `ACK_COMPLETE` the
-   radio powers off again.
+   periodically to flush so the ring never overruns. After the drain finishes the
+   radio powers off again — in Phase 1 (current) that is the `DRAIN_ACK` liveness
+   echo, not per-chunk `ACK_COMPLETE` (selective-repeat ARQ is Phase 2, §9).
 3. **On-demand power primitives.** `WIFI_PowerOn()` (probe-once → hard-reset →
    init → connect → DHCP → socket) and `WIFI_PowerOff()` (close socket →
    disconnect → hold EMW3080 RESET low). Re-power costs ~4 s (DHCP-dominated) —

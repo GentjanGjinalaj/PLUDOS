@@ -62,8 +62,9 @@ one coherent change set. Still blast-over-UDP — no ARQ. See
   sends `DRAIN_BEGIN` ×3, waits a bounded window (`Drain_WaitForAck`, ~750 ms cap)
   for the echo, and **only** marks `drained=1` if it arrives. No echo ⇒ the chunk
   blast is skipped entirely (radio stays dark) and the whole mission retries on the
-  next wake. The re-drain is idempotent — the gateway dedups on
-  `(shuttle_id, mission_id, sample_index)`.
+  next wake. The gateway dedups a just-finalised `(shuttle_id, mission_id)` for the
+  `DEDUP_TTL_S` window, so an immediate re-drain is dropped; a retry after the
+  window is stored as a fresh capture under a new `gw_mission_id`.
 - **P1-8 · Stale `jetson_ip` never refreshed.** `jetson_ip` was resolved once at
   boot; both in-loop re-check paths (PHASE 3 / 3b) are dead under the ADR-021 duty
   cycle (gated on `wifi_driver_initialized`, which is 0 whenever the main loop runs
