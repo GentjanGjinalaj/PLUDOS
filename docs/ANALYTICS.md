@@ -85,7 +85,8 @@ drains. Distinguish them by the `source` tag.
 | `gateway` | tag | Jetson hostname |
 | `source` | tag | `"drain"` on drain-path points; **absent** on legacy live points |
 | `kind` | tag | `"mission"` (MOVING) or `"idle_snapshot"` (drain points only) |
-| `mission_id` | field | gateway-assigned unix-ms capture id |
+| `gw_mission_id` | tag | gateway-assigned unix-ms capture id — join key for energy attribution |
+| `mission_id` | field | gateway-assigned unix-ms capture id (same value, kept as a field for legacy panels) |
 | `packets_total` | field | total drain chunks expected |
 | `packets_received` | field | chunks received |
 | `packets_lost` | field | chunks missing |
@@ -96,6 +97,13 @@ drains. Distinguish them by the `source` tag.
 | `accel_rms_g` | field | accel-magnitude RMS (vibration intensity) |
 | `accel_peak_g` | field | accel-magnitude peak |
 | `gyro_peak_dps` | field | gyro-magnitude peak |
+| `recv_start_ms` | field | gateway-clock unix-ms when DRAIN_BEGIN arrived (drain RX window start) |
+| `recv_end_ms` | field | gateway-clock unix-ms at drain finalisation (drain RX window end) |
+| `recv_duration_ms` | field | `recv_end_ms − recv_start_ms` — drain reception duration; integrate alumet INA3221 power over the window for gateway drain energy |
+| `protocol_version` | field | DrainBegin wire-format generation (v2); `1` for a stale/un-reflashed node |
+| `skipped_since_last` | field | drains abandoned (WiFi-down or no gateway ack) since the last successful blast — abandoned-mission visibility |
+| `threshold_g2` | field | `MOVEMENT_THRESHOLD_G2` (g²) in force at capture — stamps the IDLE/MOVING label boundary so label drift across firmware/shuttles is visible |
+| `jitter_ms` | field | pre-drain anti-collision wait this wake (1000–15000 ms) — lets analysis undo cross-shuttle `t0_wall_ms` skew |
 | `temp_c` | field | env stamp (idle snapshots only) |
 | `pressure_hpa` | field | env stamp (idle snapshots only) |
 

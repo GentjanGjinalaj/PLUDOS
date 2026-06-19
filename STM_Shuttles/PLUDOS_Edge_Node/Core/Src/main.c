@@ -346,6 +346,7 @@ static uint8_t  cap_fifo_buf[CAP_FIFO_READ_WORDS * CAP_FIFO_WORD_BYTES]; /* SRAM
 #define DRAIN_WARMUP_GAP_MS    8U            /* inter-packet pace so each junk pkt actually reaches air (advances ARP/MAC-learning) instead of piling into the SPI TX queue */
 #define DRAIN_ODR_ACCEL_HZ     3332U
 #define DRAIN_ODR_GYRO_HZ      416U
+#define DRAIN_PROTO_VERSION    2U            /* DrainBegin wire-format generation; bump on any layout change */
 
 typedef struct __attribute__((packed))
 {
@@ -357,6 +358,13 @@ typedef struct __attribute__((packed))
   uint8_t  _pad;
   uint32_t byte_count; uint32_t word_count; uint32_t t0_tick_ms;
   uint32_t tx_tick_ms;  /* HAL_GetTick() at drain time; gateway derives capture age = tx-t0 */
+  /* --- v2 tail (DRAIN_PROTO_VERSION 2). Appended after the v1 fields so the
+   * offsets above are unchanged: a v2 gateway can still parse a stale v1 node's
+   * 36-byte BEGIN and flag the version skew by the short length. --- */
+  uint8_t  protocol_version;    /* DRAIN_PROTO_VERSION — wire-format generation */
+  uint8_t  skipped_since_last;  /* drains abandoned since the last successful blast; saturates at 255 (item 15) */
+  uint16_t threshold_g2_x1000;  /* MOVEMENT_THRESHOLD_G2 x1000 — stamps the IDLE/MOVING label boundary for drift tracking (item 10) */
+  uint16_t jitter_ms;           /* actual pre-drain anti-collision wait applied this wake — lets the gateway undo cross-shuttle t0 skew (item 13) */
 } DrainBegin_t;
 
 typedef struct __attribute__((packed))
@@ -425,6 +433,12 @@ static void     Drain_AllPending(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+/* Drain v2 telemetry stamped into each DrainBegin (item 13 / item 15). Both are
+ * file-scope so the producer (Drain_JitterDelay) and the consumer (Drain_Mission)
+ * share them across the per-wake drain batch. */
+static uint16_t g_drain_jitter_ms        = 0U;  /* last pre-drain anti-collision wait actually applied */
+static uint8_t  g_drain_skipped_since_last = 0U; /* drains abandoned since the last successful blast; saturates at 255 */
 
 // MX_WIFI SPI driver defines `wifi_obj_get` and `process_txrx_poll` in the
 // BSP implementation (mx_wifi_spi.c), so we do not redefine them here.
@@ -1483,6 +1497,9 @@ static void Drain_Mission(int16_t idx)
 
   if ((socket_id < 0) || (wifi_station_ready == 0U) || (jetson_ip[0] == 0))
   {
+    /* Link-down skip: no BEGIN goes out, so this abandonment can only be reported
+     * by the next successful drain's BEGIN (item 15 piggyback). Saturate at 255. */
+    if (g_drain_skipped_since_last < 255U) { g_drain_skipped_since_last++; }
     sprintf(uart_buf, "[DRAIN] skipped: WiFi/socket not ready (mission %u)\r\n",
             (unsigned)m->mission_id);
     HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
@@ -1517,6 +1534,11 @@ static void Drain_Mission(int16_t idx)
    * (capture start → drain, same boot/clock). Includes idle-exit wait + WiFi power-on,
    * so the gateway needs only: capture_wall = BEGIN_arrival - (tx_tick - t0_tick). */
   beg.tx_tick_ms   = HAL_GetTick();
+  /* v2 tail: version + provenance for offline analysis (items 10/13/15). */
+  beg.protocol_version   = DRAIN_PROTO_VERSION;
+  beg.skipped_since_last = g_drain_skipped_since_last;
+  beg.threshold_g2_x1000 = (uint16_t)(MOVEMENT_THRESHOLD_G2 * 1000.0f + 0.5f);
+  beg.jitter_ms          = g_drain_jitter_ms;
   for (k = 0U; k < DRAIN_CTRL_REPEAT; k++)
   {
     (void)MX_WIFI_Socket_sendto(wifi_obj, socket_id, (uint8_t *)&beg, sizeof(beg),
@@ -1531,6 +1553,9 @@ static void Drain_Mission(int16_t idx)
    * untouched so the watermark accounting still reflects the un-delivered data. */
   if (Drain_WaitForAck(m->mission_id) == 0U)
   {
+    /* No-ack skip (after BEGIN sent): this BEGIN already reported the prior count;
+     * bump so the next successful drain's BEGIN includes this abandonment too. */
+    if (g_drain_skipped_since_last < 255U) { g_drain_skipped_since_last++; }
     sprintf(uart_buf, "[DRAIN] mission %u: no gateway ack — skipping blast, retry next wake\r\n",
             (unsigned)m->mission_id);
     HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
@@ -1593,6 +1618,9 @@ static void Drain_Mission(int16_t idx)
           (unsigned)m->mission_id, (unsigned long)total_chunks,
           (unsigned long)m->byte_count, (unsigned long)crc_all);
   HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+
+  /* Full blast delivered: clear the skip counter so the next BEGIN starts fresh. */
+  g_drain_skipped_since_last = 0U;
 
   /* Retire the mission from the un-drained accumulator; clear the watermark once
    * the ring drops back below 75% so the safety flush re-arms for the next fill. */
@@ -1671,6 +1699,9 @@ static void Drain_JitterDelay(void)
 
   uint32_t steps   = (DRAIN_JITTER_MAX_MS - DRAIN_JITTER_MIN_MS) / DRAIN_JITTER_STEP_MS; /* 140 */
   uint32_t wait_ms = DRAIN_JITTER_MIN_MS + (rng_state % (steps + 1U)) * DRAIN_JITTER_STEP_MS;
+
+  /* Stamp the wait so this wake's BEGIN can report it (item 13): max 15000 ms fits u16. */
+  g_drain_jitter_ms = (uint16_t)wait_ms;
 
   sprintf(uart_buf, "[DRAIN] pre-TX jitter %lu.%lu s\r\n",
           (unsigned long)(wait_ms / 1000U), (unsigned long)((wait_ms % 1000U) / 100U));

@@ -6,6 +6,53 @@ order. Each entry maps to one or more ADRs or resolved backlog items
 
 ---
 
+## [Unreleased] — DrainBegin v2 Wire Bump + Drain Energy/Provenance
+
+**Goal:** Coordinated drain-protocol generation bump so each `DrainBegin` carries
+its own provenance, plus the gateway plumbing to measure the energy cost of a drain
+and to make InfluxDB writes back-pressure-safe. STM32 + Jetson only — no FL/server
+change. Nodes must be reflashed in lockstep; the gateway parser keeps a v1 fallback
+that warns on a stale node.
+
+### Changed
+- **DrainBegin wire format v1 → v2 (36 B → 42 B).** Four fields appended after the
+  v1 layout (offsets unchanged, so a v2 gateway still parses a v1 node's 36-byte
+  BEGIN and flags the skew by length): `protocol_version` (`DRAIN_PROTO_VERSION=2`),
+  `skipped_since_last` (drains abandoned since the last successful blast, saturates
+  at 255 — item 15), `threshold_g2_x1000` (the `MOVEMENT_THRESHOLD_G2` IDLE/MOVING
+  boundary stamped per-drain for drift tracking — item 10), `jitter_ms` (the actual
+  pre-drain anti-collision wait, so the gateway can undo cross-shuttle t0 skew —
+  item 13). Firmware (`main.c`), parser (`drain_receiver.py`), Parquet schema, and
+  the `stm_mission` Influx point all updated in one pass; docs synced
+  (`wire_protocol.md`, `parquet_schema.md`, `DATA_GUIDE.md`, `ANALYTICS.md`,
+  `MODULARITY_AND_PIPELINE.md`, `client/CLAUDE.md`).
+
+### Added
+- **Drain reception window (item N).** `stm_mission` now carries `recv_start_ms` /
+  `recv_end_ms` / `recv_duration_ms` (gateway clock, distinct from the back-dated
+  `t0_wall_ms` capture time). A Grafana panel can integrate INA3221 power over that
+  interval for the gateway energy cost of receiving each drain.
+- **`gw_mission_id` as an Influx tag (item 14)** so energy↔capture can be joined by
+  `(gateway, time-range)` in Flux/InfluxQL.
+- **Bounded InfluxDB writer pool (item 8).** Replaces the unbounded
+  one-daemon-thread-per-write pattern with a fixed pool + back-pressure (drop-with-
+  WARN at `INFLUX_MAX_PENDING`) and bounded exponential-backoff retry; cancelled on
+  shutdown (Parquet is the durability path).
+- **`SO_RCVBUF` clamp warning** on the drain socket — logs the exact host
+  `net.core.rmem_max` sysctl when the kernel clamps below the 4 MB request
+  (`network_mode: host`, so it must be set on the Jetson host).
+- **Alumet relay poll cadence env-driven** (`ALUMET_POLL_INTERVAL` /
+  `ALUMET_FLUSH_INTERVAL`, default 200 ms / 5 Hz) — final rate to be confirmed
+  against the measured INA3221 `update_interval` on hardware.
+
+### Notes
+- TTL dedup margin (item 7) documented in `drain_receiver.py`: 10 s does not fully
+  cover a 15 s jitter straggler (harmless distinct file) and a sub-10 s watchdog
+  reset could be wrongly dropped — accepted pending an EMW3080 reconnect-time bench
+  measurement.
+
+---
+
 ## [Unreleased] — Correctness & Consistency Fixes + FL Drain-Disconnect Guard
 
 **Goal:** Small correctness/consistency batch — no FL redesign, no firmware logic

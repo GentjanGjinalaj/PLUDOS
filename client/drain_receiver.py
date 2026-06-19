@@ -73,6 +73,22 @@ IDLE_TRIM_MS = float(os.getenv("IDLE_TRIM_MS", "1000"))
 # apart, so a post-reset (or post-IWDG-watchdog) drain is accepted instead of
 # silently dropped as a duplicate. See ADR-021: firmware mission_id restarts at 0
 # on every STM32 reset, so it is unique only within one boot session.
+#
+# Margin analysis (DESIGN_COUNCIL item 7):
+#   - Drop-window (want covered): a late duplicate must be dropped. Worst case is
+#     a retransmit straggler of the same drain — bounded by the burst duration
+#     plus the 1–15 s pre-drain anti-collision jitter, so up to ~15 s after the
+#     first copy lands. A 10 s TTL does NOT fully cover a 15 s straggler; the
+#     residual risk is a second Parquet file for the same capture (the gw-assigned
+#     gw_mission_id differs, so it is a distinct, harmless file — not corruption).
+#   - Accept-window (want NOT dropped): a genuine post-reset re-use of mission_id=0
+#     is only at risk if the shuttle resets, reconnects WiFi, runs, and finalises a
+#     new drain within 10 s. The EMW3080 WiFi reconnect time dominates this gap and
+#     is UNMEASURED — needs a bench measurement before tightening the TTL. Until
+#     then 10 s is a deliberate middle ground: long enough to swallow normal late
+#     duplicates, short enough that a realistic reconnect-bound reset clears it.
+# Net: a fast watchdog reset finalising inside 10 s would be wrongly dropped; this
+# is accepted as low-probability pending the reconnect-time measurement.
 DEDUP_TTL_S = float(os.getenv("DEDUP_TTL_S", "10.0"))
 
 # ---------------------------------------------------------------------------
@@ -81,6 +97,7 @@ DEDUP_TTL_S = float(os.getenv("DEDUP_TTL_S", "10.0"))
 
 # 0x52444C50 = ASCII "PLDR" in memory order P,L,D,R (little-endian u32).
 DRAIN_MAGIC = 0x52444C50
+DRAIN_PROTO_VERSION = 2  # current DrainBegin wire-format generation (matches firmware)
 
 # Packet type bytes.
 TYPE_BEGIN = 1
@@ -93,10 +110,17 @@ TYPE_ACK   = 6
 
 # DrainBegin_t: magic(4) type(1) sid(1) mid(2) total_chunks(2) odr_a(2) odr_g(2)
 #               temp_c_x100(2,int16) pressure_hpa_x10(2) is_idle_snapshot(1) _pad(1)
-#               byte_count(4) word_count(4) t0_tick_ms(4) tx_tick_ms(4) = 36 B (ADR-021 §1).
-BEGIN_FMT  = "<IBBHHHHhHBBIIII"
-BEGIN_SIZE = struct.calcsize(BEGIN_FMT)
-assert BEGIN_SIZE == 36, f"DrainBegin must be 36 bytes, got {BEGIN_SIZE}"
+#               byte_count(4) word_count(4) t0_tick_ms(4) tx_tick_ms(4)         = 36 B (v1).
+# v2 tail (DRAIN_PROTO_VERSION 2): protocol_version(1) skipped_since_last(1)
+#               threshold_g2_x1000(2) jitter_ms(2)                              = 42 B total.
+# Appended after the v1 fields so v1 offsets are unchanged — a stale v1 node's
+# 36-byte BEGIN is detectable here by its short length (see _parse_packet).
+BEGIN_FMT_V1 = "<IBBHHHHhHBBIIII"
+BEGIN_FMT    = BEGIN_FMT_V1 + "BBHH"
+BEGIN_SIZE_V1 = struct.calcsize(BEGIN_FMT_V1)
+BEGIN_SIZE    = struct.calcsize(BEGIN_FMT)
+assert BEGIN_SIZE_V1 == 36, f"DrainBegin v1 must be 36 bytes, got {BEGIN_SIZE_V1}"
+assert BEGIN_SIZE == 42, f"DrainBegin v2 must be 42 bytes, got {BEGIN_SIZE}"
 
 # Sentinels for an absent env stamp (MOVING missions / failed sensor read).
 TEMP_INVALID_X100 = 0x7FFF
@@ -188,6 +212,13 @@ class MissionReassembler:
         self.t0_tick_ms = begin["t0_tick_ms"]
         # Transmit-time STM tick: tx_tick - t0_tick is the exact age of this data at drain.
         self.tx_tick_ms = begin["tx_tick_ms"]
+        # v2 provenance tail (defaults cover a synthesised/v1 BEGIN): wire generation,
+        # drains skipped since the last success (item 15), the MOVING label boundary in
+        # g² (item 10), and the pre-drain anti-collision wait in ms (item 13).
+        self.protocol_version = begin.get("protocol_version", 1)
+        self.skipped_since_last = begin.get("skipped_since_last", 0)
+        self.threshold_g2 = begin.get("threshold_g2_x1000", 0) / 1000.0
+        self.jitter_ms = begin.get("jitter_ms", 0)
         # Wall-clock time the BEGIN arrived — the reference the capture age is subtracted from.
         self.begin_wall_ms = int(time.time() * 1000)
         # Gateway-assigned output id (unix ms). The firmware mission_id resets to
@@ -338,6 +369,12 @@ def _write_stream_parquet(
     # age. Kept distinct from all_packets_received (chunk-loss) — a synth drain can
     # still receive every chunk.
     df["t0_reconstructed"] = bool(re.t0_reconstructed)
+    # v2 BEGIN provenance, broadcast per-mission so the offline corpus is self-describing:
+    # threshold_g2 = MOVING label boundary (item 10), jitter_ms = pre-drain wait used to
+    # undo cross-shuttle t0 skew (item 13). 0 / version 1 on a synth or v1 BEGIN.
+    df["protocol_version"] = pd.array([re.protocol_version] * n, dtype="int16")
+    df["threshold_g2"] = pd.array([re.threshold_g2] * n, dtype="float32")
+    df["jitter_ms"] = pd.array([re.jitter_ms] * n, dtype="int32")
     df["packets_total"] = pd.array([re.total_chunks] * n, dtype="int32")
     df["packets_received"] = pd.array([received] * n, dtype="int32")
     df["packets_lost"] = pd.array([lost] * n, dtype="int32")
@@ -461,6 +498,14 @@ def _finalise_mission(re: MissionReassembler, reason: str) -> None:
             _summary_sink({
                 "shuttle_id":       re.shuttle_id,
                 "mission_id":       re.gw_mission_id,
+                # Gateway-clock reception window (NOT capture time): begin_wall_ms is when
+                # DRAIN_BEGIN landed, recv_end_ms is finalisation now. These bound the
+                # interval during which the Jetson radio/CPU did the drain RX+reassembly,
+                # so a Grafana panel can integrate INA3221 power over [start,end] to get the
+                # gateway energy cost of receiving this drain (distinct from t0_wall_ms,
+                # which is back-dated to when the shuttle captured the data).
+                "recv_start_ms":    re.begin_wall_ms,
+                "recv_end_ms":      int(time.time() * 1000),
                 "is_idle_snapshot": re.is_idle_snapshot,
                 "packets_total":    re.total_chunks,
                 "packets_received": received,
@@ -475,6 +520,11 @@ def _finalise_mission(re: MissionReassembler, reason: str) -> None:
                 "accel_rms_g":      accel_rms,
                 "accel_peak_g":     accel_peak,
                 "gyro_peak_dps":    gyro_peak,
+                # v2 BEGIN provenance (items 10/13/15) — see MissionReassembler.
+                "protocol_version":   re.protocol_version,
+                "skipped_since_last": re.skipped_since_last,
+                "threshold_g2":       re.threshold_g2,
+                "jitter_ms":          re.jitter_ms,
                 # Idle snapshots are small (~12.5 Hz) — carry the trimmed samples so
                 # data-engine can write a per-sample waveform to Influx that matches the
                 # Parquet file; None for high-rate missions.
@@ -500,10 +550,18 @@ def _parse_packet(data: bytes):
         return None
 
     if ptype == TYPE_BEGIN:
-        if len(data) < BEGIN_SIZE:
+        # Accept the v1 prefix even from a stale (un-reflashed) v1 node, but warn —
+        # the v2 provenance tail (proto/threshold/jitter/skip) is then unavailable.
+        if len(data) < BEGIN_SIZE_V1:
             return None
         (_, _, sid, mid, total, odr_a, odr_g, temp_x100, press_x10, is_idle, _pad,
-         byte_count, word_count, t0_tick, tx_tick) = struct.unpack_from(BEGIN_FMT, data, 0)
+         byte_count, word_count, t0_tick, tx_tick) = struct.unpack_from(BEGIN_FMT_V1, data, 0)
+        if len(data) >= BEGIN_SIZE:
+            proto, skipped, thr_x1000, jitter_ms = struct.unpack_from("<BBHH", data, BEGIN_SIZE_V1)
+        else:
+            logger.warning("[DRAIN] v1 BEGIN from shuttle %s (%d B) — node needs reflash to v%d",
+                           sid, len(data), DRAIN_PROTO_VERSION)
+            proto, skipped, thr_x1000, jitter_ms = 1, 0, 0, 0
         return (TYPE_BEGIN, {
             "shuttle_id": sid, "mission_id": mid, "total_chunks": total,
             "odr_accel_hz": odr_a, "odr_gyro_hz": odr_g,
@@ -511,6 +569,8 @@ def _parse_packet(data: bytes):
             "is_idle_snapshot": is_idle,
             "byte_count": byte_count, "word_count": word_count,
             "t0_tick_ms": t0_tick, "tx_tick_ms": tx_tick,
+            "protocol_version": proto, "skipped_since_last": skipped,
+            "threshold_g2_x1000": thr_x1000, "jitter_ms": jitter_ms,
         })
 
     if ptype == TYPE_CHUNK:
@@ -738,5 +798,16 @@ async def start_drain_receiver(buffer_dir: str, summary_sink=None) -> None:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, DRAIN_RCVBUF_BYTES)
         actual = sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
         logger.info("[DRAIN] SO_RCVBUF requested=%d granted=%d", DRAIN_RCVBUF_BYTES, actual)
+        # Linux reports back ~2× the requested value (bookkeeping overhead), so a fully
+        # honoured request gives granted ≥ requested. granted < requested means the kernel
+        # clamped to net.core.rmem_max — the 4 MB buffer we asked for is not in effect and
+        # drains can still overflow mid-burst. The container runs with network_mode: host,
+        # so this must be raised on the Jetson host, not via a compose sysctl.
+        if actual < DRAIN_RCVBUF_BYTES:
+            logger.warning(
+                "[DRAIN] SO_RCVBUF clamped to %d < requested %d — raise host rmem_max: "
+                "`sudo sysctl -w net.core.rmem_max=%d` (persist in /etc/sysctl.d/)",
+                actual, DRAIN_RCVBUF_BYTES, DRAIN_RCVBUF_BYTES,
+            )
     logger.info("[DRAIN] high-rate capture drain listener bound on port %d", DRAIN_PORT)
     asyncio.create_task(_drain_watchdog(proto))

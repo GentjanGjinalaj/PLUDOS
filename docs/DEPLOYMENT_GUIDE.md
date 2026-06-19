@@ -169,6 +169,28 @@ podman-compose --version
 Minimum requirements: Ubuntu 22.04 (L4T r35.x), WiFi on the same 2.4 GHz
 network as the STM32 shuttle(s).
 
+#### Kernel UDP receive buffer (drain receiver)
+
+The high-rate capture drain (UDP `:5684`) arrives as a multi-MB burst with no
+inter-chunk pacing. `drain_receiver.py` requests a 4 MB `SO_RCVBUF` so a full
+mission fits even if the asyncio loop briefly stalls (e.g. during a prior
+mission's Parquet write). The kernel clamps that request to `net.core.rmem_max`,
+whose default (~208 KB) is far too small — when clamped, a drain can drop a
+consecutive run of chunks mid-burst.
+
+`data-engine` runs with `network_mode: host`, so this **cannot** be set via a
+compose `sysctl:` block — it must be raised once on the Jetson host:
+
+```bash
+echo 'net.core.rmem_max=4194304' | sudo tee /etc/sysctl.d/30-pludos-drain.conf
+sudo sysctl --system
+sysctl net.core.rmem_max   # expect: net.core.rmem_max = 4194304
+```
+
+If skipped, the data-engine log prints a `[DRAIN] SO_RCVBUF clamped to … <
+requested …` warning at startup and the drain path runs with the smaller buffer
+(lossier under burst).
+
 ### 2.2 Clone the Repository
 
 ```bash

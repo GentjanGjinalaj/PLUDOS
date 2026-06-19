@@ -31,6 +31,17 @@ CSV_MAX_BYTES=$(( ${ALUMET_CSV_MAX_MB:-200} * 1024 * 1024 ))  # rotate live CSV 
 CSV_KEEP="${ALUMET_CSV_KEEP:-3}"                              # rotated alumet_readings_*.csv to retain
 LOG_KEEP="${ALUMET_LOG_KEEP:-5}"                              # per-restart .log files to retain (incl. current)
 
+# --- INA3221 sample cadence ---------------------------------------------------
+# Default 200 ms (5 Hz): a multi-MB MOVING drain lasts ~seconds, so 5 Hz lands
+# several real power samples per drain for an honest per-drain energy integral; the
+# old 1 s default caught at most one. Bounded by the ina3221 hwmon driver's own ADC
+# update rate — polling faster than the ADC re-reads stale values, so verify on the
+# Jetson before going below ~100 ms. flush_interval matches so points reach InfluxDB
+# promptly (a slow flush would batch drains together and blur the per-drain window).
+# Higher rate = proportionally more CSV/InfluxDB volume; CSV rotation already caps size.
+ALUMET_POLL_INTERVAL="${ALUMET_POLL_INTERVAL:-200ms}"
+ALUMET_FLUSH_INTERVAL="${ALUMET_FLUSH_INTERVAL:-200ms}"
+
 # Prune old per-restart logs: keep the newest (LOG_KEEP - 1) so that, once the
 # current run's LOG_FILE is created below, at most LOG_KEEP files remain.
 find "${LOG_DIR}" -maxdepth 1 -name 'alumet-*.log' -type f -printf '%T@ %p\n' \
@@ -40,8 +51,8 @@ find "${LOG_DIR}" -maxdepth 1 -name 'alumet-*.log' -type f -printf '%T@ %p\n' \
 # All sections are always written; which plugins activate is controlled via --plugins.
 cat > "${CONFIG}" <<TOML
 [plugins.jetson]
-poll_interval  = "1s"
-flush_interval = "1s"
+poll_interval  = "${ALUMET_POLL_INTERVAL}"
+flush_interval = "${ALUMET_FLUSH_INTERVAL}"
 
 [plugins.prometheus-exporter]
 host                     = "0.0.0.0"
@@ -98,6 +109,7 @@ else
     echo "[ALUMET-RELAY] mode=local plugins=${PLUGINS} (no InfluxDB output)"
 fi
 echo "[ALUMET-RELAY] prometheus=:${ALUMET_PROMETHEUS_PORT:-9095} csv=${LOG_DIR}/alumet_readings.csv"
+echo "[ALUMET-RELAY] ina3221 poll=${ALUMET_POLL_INTERVAL} flush=${ALUMET_FLUSH_INTERVAL}"
 
 # Run agent + tee in background so we can also run a watchdog alongside.
 alumet-agent --config "${CONFIG}" --plugins "${PLUGINS}" 2>&1 | tee "${LOG_FILE}" &
@@ -141,8 +153,8 @@ ZERO_THRESHOLD="${ALUMET_ZERO_THRESHOLD:-5}"
         # file. Instead, when the live CSV passes CSV_MAX_BYTES, snapshot it to a
         # timestamped archive and kill the agent: Podman restarts the container
         # and the plugin reopens output_path fresh (truncated to 0). force_flush
-        # stays on; at most ~1 reading in the cp→restart window is lost (≈2-day
-        # cadence at 200 MB / 1 Hz).
+        # stays on; at most ~1 reading in the cp→restart window is lost (rotation
+        # cadence scales with poll rate: ≈2 days at 200 MB / 1 Hz, ≈10 h at 5 Hz).
         csv="${LOG_DIR}/alumet_readings.csv"
         csv_bytes=$(stat -c%s "${csv}" 2>/dev/null || echo 0)
         if [ "${csv_bytes}" -ge "${CSV_MAX_BYTES}" ]; then

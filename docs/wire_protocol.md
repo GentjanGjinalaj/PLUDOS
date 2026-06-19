@@ -154,7 +154,7 @@ format without changing the on-wire layout of types 1–3 or the type-6 ack.
 
 ### Packet types
 ```c
-/* type=1 DRAIN_BEGIN — control, sent x3 for robustness. 36 bytes. */
+/* type=1 DRAIN_BEGIN — control, sent x3 for robustness. 42 bytes (proto v2). */
 typedef struct __attribute__((packed)) {
   uint32_t magic;        /* 0x52444C50                                   */
   uint8_t  type;         /* 1                                            */
@@ -175,6 +175,19 @@ typedef struct __attribute__((packed)) {
                          /* tx_tick - t0_tick. Gateway stamps capture     */
                          /* wall = BEGIN_arrival - capture_age (exact,    */
                          /* same-boot, no NTP offset needed)              */
+  /* --- v2 tail (DRAIN_PROTO_VERSION 2). Appended after the v1 fields so v1
+   * byte offsets are unchanged; a v2 gateway parses a stale v1 node's 36-byte
+   * BEGIN and flags the skew by the short length. --- */
+  uint8_t  protocol_version;    /* 2 — DrainBegin wire-format generation        */
+  uint8_t  skipped_since_last;  /* drains abandoned since the last successful    */
+                         /*     blast; saturates at 255 (abandoned-mission     */
+                         /*     visibility — no notify packet, piggybacked here) */
+  uint16_t threshold_g2_x1000;  /* MOVEMENT_THRESHOLD_G2 ×1000 (e.g. 60 = 0.06  */
+                         /*     g²) — stamps the IDLE/MOVING label boundary so   */
+                         /*     label drift across firmware/shuttles is visible  */
+  uint16_t jitter_ms;    /* actual pre-drain anti-collision wait applied this   */
+                         /* wake (1000..15000) — lets the gateway undo the      */
+                         /* cross-shuttle t0_wall skew offline                  */
 } DrainBegin_t;
 /* Idle snapshots (ADR-021 §1) run accel+gyro both at 12.5 Hz. The integer
  * odr_* fields can't carry .5, so when is_idle_snapshot=1 the gateway uses

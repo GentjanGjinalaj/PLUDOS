@@ -170,7 +170,7 @@ Wire contract (authoritative layout in `wire_protocol.md §2`):
 
 | Frame | Type | Size | Role |
 |---|---|---|---|
-| `DrainBegin` | 1 | **36 B** | opens a mission: magic, shuttle/mission id, total chunks, ODRs, env stamp, `byte_count`, `word_count`, **`t0_tick_ms`**, **`tx_tick_ms`** |
+| `DrainBegin` | 1 | **42 B (v2)** | opens a mission: magic, shuttle/mission id, total chunks, ODRs, env stamp, `byte_count`, `word_count`, **`t0_tick_ms`**, **`tx_tick_ms`**, + v2 tail: `protocol_version`, `skipped_since_last`, `threshold_g2_x1000`, `jitter_ms` |
 | `DrainChunk` | 2 | **18 B hdr + ≤1400 B** | one slice of raw FIFO words; carries `chunk_seq`, `total_chunks`, `payload_len`, **per-chunk CRC32** |
 | `DrainEnd` | 3 | — | closes a mission: `total_chunks` + **CRC32 over all data** |
 | `DrainAck` | 6 | **8 B** | **gateway→shuttle** echo of a BEGIN — *delivery evidence*, see §4.3 |

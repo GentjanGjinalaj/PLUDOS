@@ -102,7 +102,7 @@ live hot loop and are reassembled by `drain_receiver.py` into
 `cap_accel_*` / `cap_gyro_*` Parquet files, distinct from the live telemetry
 files. Key behaviours:
 
-- **Self-timed timestamps (no NTP offset):** each `DrainBegin` (36 bytes)
+- **Self-timed timestamps (no NTP offset):** each `DrainBegin` (42 bytes, proto v2)
   carries `t0_tick_ms` and `tx_tick_ms`. Capture age = `tx_tick - t0_tick`
   (same-boot `HAL_GetTick`, exact), so capture wall-clock =
   `BEGIN_arrival - capture_age`. The old per-shuttle NTP-offset / boot-anchor

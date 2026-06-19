@@ -30,6 +30,7 @@ There is no CoAP and no second port. Packet loss is tolerated — the next
 """
 
 import asyncio
+import concurrent.futures
 import glob
 import logging
 import math
@@ -188,6 +189,19 @@ _INFLUXDB_BUCKET = os.getenv("INFLUXDB_BUCKET", "alumet_energy")
 
 # Human-readable gateway tag written to every stm_mission InfluxDB point.
 _GATEWAY_TAG = os.getenv("JETSON_HOSTNAME", socket.gethostname())
+
+# Bounded InfluxDB writer pool (DESIGN_COUNCIL item 8). The summary/telemetry
+# writes are fire-and-forget so the asyncio loop never blocks on DB I/O, but the
+# old "one daemon thread per write" pattern let a stalled InfluxDB pile up
+# unbounded threads — the 1 Hz telemetry batch is the worst offender. Route every
+# write through a small fixed pool with back-pressure (drop with WARN when the
+# queue saturates) and retry transient failures with bounded exponential back-off.
+_INFLUX_MAX_PENDING          = int(os.getenv("INFLUX_MAX_PENDING", "64"))
+_INFLUX_WRITE_ATTEMPTS       = int(os.getenv("INFLUX_WRITE_ATTEMPTS", "3"))
+_INFLUX_WRITE_BACKOFF_BASE_S = float(os.getenv("INFLUX_WRITE_BACKOFF_BASE_S", "0.5"))
+_INFLUX_POOL    = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="influx")
+_influx_lock    = threading.Lock()
+_influx_pending = 0  # in-flight + queued jobs; guarded by _influx_lock
 
 # State enum mirrors the STM32 firmware.
 STATE_IDLE   = 0
@@ -356,12 +370,53 @@ def _flush(buf: list[dict], prefix: str) -> None:
     buf.clear()
 
 
+# Submit an InfluxDB write job to the bounded pool. Caps in-flight work so a
+# stalled DB can't spawn unbounded threads; drops the job with a WARN when the
+# queue is saturated rather than blocking the caller (the asyncio loop).
+def _submit_influx(fn) -> None:
+    global _influx_pending
+    with _influx_lock:
+        if _influx_pending >= _INFLUX_MAX_PENDING:
+            logger.warning(
+                "[INFLUXDB] write queue saturated (%d pending) — dropping write",
+                _influx_pending,
+            )
+            return
+        _influx_pending += 1
+
+    def _runner() -> None:
+        global _influx_pending
+        try:
+            fn()
+        finally:
+            with _influx_lock:
+                _influx_pending -= 1
+
+    _INFLUX_POOL.submit(_runner)
+
+
+# Write with bounded exponential back-off for transient InfluxDB failures.
+# Runs in a pool worker thread, so time.sleep() is safe (never on the asyncio loop).
+def _influx_write_retry(write_api, **kwargs) -> None:
+    last_exc: Exception | None = None
+    for attempt in range(_INFLUX_WRITE_ATTEMPTS):
+        try:
+            write_api.write(**kwargs)
+            return
+        except Exception as exc:
+            last_exc = exc
+            if attempt + 1 < _INFLUX_WRITE_ATTEMPTS:
+                time.sleep(_INFLUX_WRITE_BACKOFF_BASE_S * (2 ** attempt))
+    if last_exc is not None:
+        raise last_exc
+
+
 def _write_mission_summary(
     shuttle_id: str,
     packets: int,
     duration_ms: float,
 ) -> None:
-    # Fire-and-forget background thread so the asyncio loop is never blocked by InfluxDB I/O.
+    # Dispatched on the bounded InfluxDB pool so the asyncio loop is never blocked by DB I/O.
     def _write() -> None:
         client = InfluxDBClient(url=_INFLUXDB_URL, token=_INFLUXDB_TOKEN, org=_INFLUXDB_ORG)
         try:
@@ -373,8 +428,9 @@ def _write_mission_summary(
                 .field("duration_ms", duration_ms)
                 .time(time.time_ns(), WritePrecision.NS)
             )
-            client.write_api(write_options=SYNCHRONOUS).write(
-                bucket=_INFLUXDB_BUCKET, record=point
+            _influx_write_retry(
+                client.write_api(write_options=SYNCHRONOUS),
+                bucket=_INFLUXDB_BUCKET, record=point,
             )
             logger.info(
                 "[INFLUXDB] stm_mission shuttle=%s pkts=%d dur=%.0fms",
@@ -385,7 +441,7 @@ def _write_mission_summary(
         finally:
             client.close()
 
-    threading.Thread(target=_write, daemon=True).start()
+    _submit_influx(_write)
 
 
 # Write one idle snapshot's accel/gyro waveform to Influx (stm_idle_wave), one point
@@ -428,7 +484,7 @@ def _write_drain_summary(summary: dict) -> None:
         return
     sid = str(summary["shuttle_id"])
 
-    # Fire-and-forget background thread so the asyncio loop is never blocked by InfluxDB I/O.
+    # Dispatched on the bounded InfluxDB pool so the asyncio loop is never blocked by DB I/O.
     def _write() -> None:
         client = InfluxDBClient(url=_INFLUXDB_URL, token=_INFLUXDB_TOKEN, org=_INFLUXDB_ORG)
         try:
@@ -438,6 +494,15 @@ def _write_drain_summary(summary: dict) -> None:
                 .tag("gateway",     _GATEWAY_TAG)
                 .tag("source",      "drain")
                 .tag("kind",        "idle_snapshot" if summary["is_idle_snapshot"] else "mission")
+                # gw_mission_id as a TAG (not just the field below) is the energy↔capture
+                # join key (DESIGN_COUNCIL item 14): Flux/InfluxQL can only group/join on
+                # tags. The point is stamped at t0_wall_ms, so energy samples are joined by
+                # (gateway, time-range). Tradeoff: gw_mission_id is unix-ms → unbounded tag
+                # cardinality; acceptable at thesis scale (few shuttles, bounded missions).
+                # Tagging the alumet/fl_phases energy stream itself is out of Jetson scope —
+                # fl_phases is server-written; the alumet sidecar emits mission-agnostic
+                # samples, so the join is resolved downstream against this record.
+                .tag("gw_mission_id", str(int(summary["mission_id"])))
                 .field("mission_id",       int(summary["mission_id"]))
                 .field("packets_total",    int(summary["packets_total"]))
                 .field("packets_received", int(summary["packets_received"]))
@@ -446,6 +511,20 @@ def _write_drain_summary(summary: dict) -> None:
                 .field("accel_samples",    int(summary["accel_samples"]))
                 .field("gyro_samples",     int(summary["gyro_samples"]))
                 .field("complete",         bool(summary["complete"]))
+                # Gateway-clock drain reception window (item N): bounds the interval the
+                # Jetson spent receiving+reassembling this drain. A Grafana panel integrates
+                # INA3221 power (alumet_energy) over [recv_start_ms, recv_end_ms] for the
+                # gateway energy cost of the drain. recv_end-recv_start is the RX duration.
+                .field("recv_start_ms",    int(summary["recv_start_ms"]))
+                .field("recv_end_ms",      int(summary["recv_end_ms"]))
+                .field("recv_duration_ms", int(summary["recv_end_ms"]) - int(summary["recv_start_ms"]))
+                # DrainBegin v2 provenance: wire generation, drains abandoned since the
+                # last success (item 15 — abandoned-mission visibility), the MOVING label
+                # boundary in g² (item 10), and the pre-drain anti-collision wait (item 13).
+                .field("protocol_version",   int(summary.get("protocol_version", 1)))
+                .field("skipped_since_last", int(summary.get("skipped_since_last", 0)))
+                .field("threshold_g2",       float(summary.get("threshold_g2", 0.0)))
+                .field("jitter_ms",          int(summary.get("jitter_ms", 0)))
                 # Stamp the point at the anchored mission start (t0_wall_ms), NOT now —
                 # drains arrive bursted, so wall-clock-of-arrival collapses spacing.
                 .time(int(summary["t0_wall_ms"]) * 1_000_000, WritePrecision.NS)
@@ -464,7 +543,7 @@ def _write_drain_summary(summary: dict) -> None:
                 point = point.field("pressure_hpa", float(summary["pressure_hpa"]))
 
             write_api = client.write_api(write_options=SYNCHRONOUS)
-            write_api.write(bucket=_INFLUXDB_BUCKET, record=point)
+            _influx_write_retry(write_api, bucket=_INFLUXDB_BUCKET, record=point)
 
             # Idle snapshots are small — also write the per-sample accel/gyro waveform
             # (option B) so Grafana can plot rest vibration. High-rate missions stay
@@ -486,7 +565,7 @@ def _write_drain_summary(summary: dict) -> None:
         finally:
             client.close()
 
-    threading.Thread(target=_write, daemon=True).start()
+    _submit_influx(_write)
 
 
 def _unpack_telemetry(raw: bytes) -> dict:
@@ -719,14 +798,15 @@ def _write_telemetry_batch(points: list) -> None:
     def _write() -> None:
         client = InfluxDBClient(url=_INFLUXDB_URL, token=_INFLUXDB_TOKEN, org=_INFLUXDB_ORG)
         try:
-            client.write_api(write_options=SYNCHRONOUS).write(
-                bucket=_INFLUXDB_BUCKET, record=points
+            _influx_write_retry(
+                client.write_api(write_options=SYNCHRONOUS),
+                bucket=_INFLUXDB_BUCKET, record=points,
             )
         except Exception as exc:
             logger.debug("[INFLUXDB] telemetry batch write failed: %s", exc)
         finally:
             client.close()
-    threading.Thread(target=_write, daemon=True).start()
+    _submit_influx(_write)
 
 
 async def _status_log_task() -> None:
@@ -1132,6 +1212,11 @@ async def main() -> None:
         loop.add_signal_handler(_sig, _on_signal, _sig.name)
 
     await stop.wait()  # run until a shutdown signal fires
+
+    # Drop any queued InfluxDB writes on shutdown — Parquet durability is the goal
+    # (mirrors _flush_all_open_buffers); the pool's worker threads are non-daemon,
+    # so cancelling keeps a stalled DB from blocking process exit.
+    _INFLUX_POOL.shutdown(wait=False, cancel_futures=True)
 
 
 if __name__ == "__main__":

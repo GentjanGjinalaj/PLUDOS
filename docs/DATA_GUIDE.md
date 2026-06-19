@@ -158,11 +158,18 @@ effectively dead. See `docs/ANALYTICS.md §3` for the full field/tag schema.
 
 - **`stm_mission`** (drain summary, the live one Grafana actually shows) —
   one point per drained mission/snapshot, tagged `source="drain"`,
-  `kind="mission"|"idle_snapshot"`. Fields: `packets_total`,
+  `kind="mission"|"idle_snapshot"`, and `gw_mission_id` (the gateway-assigned
+  unix-ms id — the join key for energy attribution). Fields: `packets_total`,
   `packets_received`, `packets_lost`, `loss_pct`, `accel_samples`,
   `gyro_samples`, `complete`, `accel_rms_g`, `accel_peak_g`,
-  `gyro_peak_dps`, and (idle snapshots) `temp_c`, `pressure_hpa`. Dashboards
-  filter on `source=="drain"`.
+  `gyro_peak_dps`, `recv_start_ms`, `recv_end_ms`, `recv_duration_ms` (the
+  gateway-clock drain reception window — integrate alumet INA3221 power over
+  `[recv_start_ms, recv_end_ms]` for the gateway energy cost of the drain),
+  `protocol_version`, `skipped_since_last` (drains abandoned since the last
+  success — abandoned-mission visibility), `threshold_g2` (the MOVING label
+  boundary in g², stamped per capture), `jitter_ms` (pre-drain anti-collision
+  wait, undoes cross-shuttle `t0_wall_ms` skew), and (idle snapshots) `temp_c`,
+  `pressure_hpa`. Dashboards filter on `source=="drain"`.
 - **`stm_idle_wave`** (drain, idle snapshots only) — per-sample waveform at
   the snapshot ODR. Fields: `ax_g`, `ay_g`, `az_g`, and `gx_dps`/`gy_dps`/
   `gz_dps` when gyro is present.

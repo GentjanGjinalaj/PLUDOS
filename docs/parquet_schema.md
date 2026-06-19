@@ -230,6 +230,9 @@ Example: `cap_accel_s1_m1747123456789.parquet`
 | `packets_lost` | int32 | chunks | Chunks missing. |
 | `packet_loss_pct` | float32 | % | `100 × lost / total`. |
 | `missing_chunk_ranges` | str | — | Human-readable missing `chunk_seq` ranges (empty if complete). |
+| `protocol_version` | int16 | — | `DrainBegin` wire-format generation (v2). `1` on a synthesised (lost-BEGIN) or stale v1 capture. |
+| `threshold_g2` | float32 | g² | `MOVEMENT_THRESHOLD_G2` in force when this capture was labelled MOVING — makes the IDLE/MOVING boundary explicit so label drift across firmware/shuttles is recoverable offline. `0` on a synth/v1 BEGIN. |
+| `jitter_ms` | int32 | ms | Pre-drain anti-collision wait applied this wake (1000–15000). Lets offline analysis undo the cross-shuttle `t0_wall_ms` skew the jitter introduces. `0` on a synth/v1 BEGIN. |
 
 ## Idle-snapshot settling trim
 
