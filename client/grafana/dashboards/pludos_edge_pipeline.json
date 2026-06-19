@@ -192,7 +192,7 @@
         {
           "refId": "A",
           "datasource": { "type": "influxdb", "uid": "efmtstss6rcw0d" },
-          "query": "cur = from(bucket: \"alumet_energy\") |> range(start: -5m) |> filter(fn: (r) => r._measurement == \"input_current\" and r._field == \"value\") |> aggregateWindow(every: 30s, fn: mean, createEmpty: false) |> keep(columns: [\"_time\", \"_value\"]) |> rename(columns: {_value: \"i_ma\"}) volt = from(bucket: \"alumet_energy\") |> range(start: -5m) |> filter(fn: (r) => r._measurement == \"input_voltage\" and r._field == \"value\") |> aggregateWindow(every: 30s, fn: mean, createEmpty: false) |> keep(columns: [\"_time\", \"_value\"]) |> rename(columns: {_value: \"u_mv\"}) join(tables: {c: cur, v: volt}, on: [\"_time\"]) |> map(fn: (r) => ({_time: r._time, _value: r.i_ma * r.u_mv / 1000000.0})) |> last()"
+          "query": "cur = from(bucket: \"alumet_energy\") |> range(start: -5m) |> filter(fn: (r) => r._measurement == \"input_current\" and r._field == \"value\" and r.ina_channel_label == \"VDD_IN\") |> aggregateWindow(every: 30s, fn: mean, createEmpty: false) |> keep(columns: [\"_time\", \"_value\"]) |> rename(columns: {_value: \"i_ma\"}) volt = from(bucket: \"alumet_energy\") |> range(start: -5m) |> filter(fn: (r) => r._measurement == \"input_voltage\" and r._field == \"value\" and r.ina_channel_label == \"VDD_IN\") |> aggregateWindow(every: 30s, fn: mean, createEmpty: false) |> keep(columns: [\"_time\", \"_value\"]) |> rename(columns: {_value: \"u_mv\"}) join(tables: {c: cur, v: volt}, on: [\"_time\"]) |> map(fn: (r) => ({_time: r._time, _value: r.i_ma * r.u_mv / 1000000.0})) |> last()"
         }
       ],
       "gridPos": { "h": 4, "w": 8, "x": 16, "y": 5 },
@@ -250,7 +250,7 @@
         {
           "refId": "A",
           "datasource": { "type": "influxdb", "uid": "efmtstss6rcw0d" },
-          "query": "from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"stm_mission\" and r.source == \"drain\") |> filter(fn: (r) => r.shuttle_id =~ /${shuttle:regex}/ and r.kind =~ /${kind:regex}/) |> pivot(rowKey: [\"_time\", \"shuttle_id\", \"kind\"], columnKey: [\"_field\"], valueColumn: \"_value\") |> keep(columns: [\"_time\", \"shuttle_id\", \"kind\", \"packets_received\", \"packets_total\", \"loss_pct\", \"accel_samples\", \"gyro_samples\", \"complete\"]) |> sort(columns: [\"_time\"], desc: true) |> limit(n: 200)"
+          "query": "from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"stm_mission\" and r.source == \"drain\") |> filter(fn: (r) => r.shuttle_id =~ /${shuttle:regex}/ and r.kind =~ /${kind:regex}/) |> pivot(rowKey: [\"_time\", \"shuttle_id\", \"kind\"], columnKey: [\"_field\"], valueColumn: \"_value\") |> keep(columns: [\"_time\", \"shuttle_id\", \"kind\", \"packets_received\", \"packets_total\", \"loss_pct\", \"accel_samples\", \"gyro_samples\", \"recv_duration_ms\", \"complete\"]) |> sort(columns: [\"_time\"], desc: true) |> limit(n: 200)"
         }
       ],
       "gridPos": { "h": 10, "w": 24, "x": 0, "y": 18 },
@@ -266,6 +266,7 @@
           { "matcher": { "id": "byName", "options": "loss_pct" }, "properties": [ { "id": "displayName", "value": "Loss %" }, { "id": "unit", "value": "percent" }, { "id": "decimals", "value": 1 }, { "id": "custom.width", "value": 90 }, { "id": "custom.cellOptions", "value": { "type": "color-background" } }, { "id": "thresholds", "value": { "mode": "absolute", "steps": [ { "value": 0, "color": "green" }, { "value": 2, "color": "yellow" }, { "value": 10, "color": "red" } ] } } ] },
           { "matcher": { "id": "byName", "options": "accel_samples" }, "properties": [ { "id": "displayName", "value": "Accel" }, { "id": "decimals", "value": 0 } ] },
           { "matcher": { "id": "byName", "options": "gyro_samples" }, "properties": [ { "id": "displayName", "value": "Gyro" }, { "id": "decimals", "value": 0 } ] },
+          { "matcher": { "id": "byName", "options": "recv_duration_ms" }, "properties": [ { "id": "displayName", "value": "Recv (ms)" }, { "id": "unit", "value": "ms" }, { "id": "decimals", "value": 0 }, { "id": "custom.width", "value": 100 } ] },
           { "matcher": { "id": "byName", "options": "complete" }, "properties": [ { "id": "displayName", "value": "Complete" }, { "id": "decimals", "value": 0 }, { "id": "custom.width", "value": 90 } ] }
         ]
       }
@@ -401,7 +402,7 @@
         {
           "refId": "A",
           "datasource": { "type": "influxdb", "uid": "efmtstss6rcw0d" },
-          "query": "cur = from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"input_current\" and r._field == \"value\") |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false) |> keep(columns: [\"_time\", \"_value\"]) |> rename(columns: {_value: \"i_ma\"}) volt = from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"input_voltage\" and r._field == \"value\") |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false) |> keep(columns: [\"_time\", \"_value\"]) |> rename(columns: {_value: \"u_mv\"}) join(tables: {c: cur, v: volt}, on: [\"_time\"]) |> map(fn: (r) => ({_time: r._time, _value: r.i_ma * r.u_mv / 1000000.0}))"
+          "query": "cur = from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"input_current\" and r._field == \"value\" and r.ina_channel_label == \"VDD_IN\") |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false) |> keep(columns: [\"_time\", \"_value\"]) |> rename(columns: {_value: \"i_ma\"}) volt = from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"input_voltage\" and r._field == \"value\" and r.ina_channel_label == \"VDD_IN\") |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false) |> keep(columns: [\"_time\", \"_value\"]) |> rename(columns: {_value: \"u_mv\"}) join(tables: {c: cur, v: volt}, on: [\"_time\"]) |> map(fn: (r) => ({_time: r._time, _value: r.i_ma * r.u_mv / 1000000.0}))"
         }
       ],
       "gridPos": { "h": 8, "w": 8, "x": 0, "y": 54 },
@@ -417,7 +418,7 @@
         {
           "refId": "A",
           "datasource": { "type": "influxdb", "uid": "efmtstss6rcw0d" },
-          "query": "from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"input_current\" and r._field == \"value\") |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)"
+          "query": "from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"input_current\" and r._field == \"value\" and r.ina_channel_label == \"VDD_IN\") |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)"
         }
       ],
       "gridPos": { "h": 8, "w": 8, "x": 8, "y": 54 },
@@ -433,12 +434,46 @@
         {
           "refId": "A",
           "datasource": { "type": "influxdb", "uid": "efmtstss6rcw0d" },
-          "query": "from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"input_voltage\" and r._field == \"value\") |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)"
+          "query": "from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"input_voltage\" and r._field == \"value\" and r.ina_channel_label == \"VDD_IN\") |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)"
         }
       ],
       "gridPos": { "h": 8, "w": 8, "x": 16, "y": 54 },
       "fieldConfig": { "defaults": { "unit": "mvolt", "min": 4500, "max": 5500, "custom": { "lineWidth": 2, "fillOpacity": 0, "drawStyle": "line", "showPoints": "never", "spanNulls": false } } },
       "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single" } }
+    },
+    {
+      "id": 144,
+      "type": "timeseries",
+      "title": "Power by Rail (W)",
+      "description": "Per-rail power = current \u00d7 voltage for each INA3221 channel (VDD_IN = board total; VDD_SOC, VDD_CPU_GPU_CV, channel_4 are sub-rails). Joined per time window.",
+      "datasource": { "type": "influxdb", "uid": "efmtstss6rcw0d" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "efmtstss6rcw0d" },
+          "query": "cur = from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"input_current\" and r._field == \"value\") |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false) |> keep(columns: [\"_time\", \"_value\", \"ina_channel_label\"]) |> rename(columns: {_value: \"i_ma\"}) volt = from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"input_voltage\" and r._field == \"value\") |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false) |> keep(columns: [\"_time\", \"_value\", \"ina_channel_label\"]) |> rename(columns: {_value: \"u_mv\"}) join(tables: {c: cur, v: volt}, on: [\"_time\", \"ina_channel_label\"]) |> map(fn: (r) => ({_time: r._time, ina_channel_label: r.ina_channel_label, _value: r.i_ma * r.u_mv / 1000000.0})) |> group(columns: [\"ina_channel_label\"])"
+        }
+      ],
+      "gridPos": { "h": 8, "w": 16, "x": 0, "y": 62 },
+      "fieldConfig": { "defaults": { "unit": "watt", "min": 0, "custom": { "lineWidth": 2, "fillOpacity": 10, "drawStyle": "line", "showPoints": "never", "spanNulls": false } } },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } }
+    },
+    {
+      "id": 145,
+      "type": "stat",
+      "title": "Board Energy in View (J)",
+      "description": "VDD_IN board energy over the selected range = sum of 1 s-windowed board power (rectangle integral of real INA3221 samples, no modelling). 1 J = 1 W\u00b7s.",
+      "datasource": { "type": "influxdb", "uid": "efmtstss6rcw0d" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "efmtstss6rcw0d" },
+          "query": "cur = from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"input_current\" and r._field == \"value\" and r.ina_channel_label == \"VDD_IN\") |> aggregateWindow(every: 1s, fn: mean, createEmpty: false) |> keep(columns: [\"_time\", \"_value\"]) |> rename(columns: {_value: \"i_ma\"}) volt = from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"input_voltage\" and r._field == \"value\" and r.ina_channel_label == \"VDD_IN\") |> aggregateWindow(every: 1s, fn: mean, createEmpty: false) |> keep(columns: [\"_time\", \"_value\"]) |> rename(columns: {_value: \"u_mv\"}) join(tables: {c: cur, v: volt}, on: [\"_time\"]) |> map(fn: (r) => ({_time: r._time, _value: r.i_ma * r.u_mv / 1000000.0})) |> sum()"
+        }
+      ],
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 62 },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "value", "colorMode": "background", "graphMode": "none" },
+      "fieldConfig": { "defaults": { "unit": "joule", "decimals": 0, "color": { "mode": "fixed", "fixedColor": "orange" } } }
     }
   ],
   "time": { "from": "now-24h", "to": "now" },
