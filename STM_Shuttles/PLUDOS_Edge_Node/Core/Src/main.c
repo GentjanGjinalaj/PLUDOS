@@ -118,9 +118,20 @@ static uint32_t last_above_threshold_tick = 0U; /* same value, separate name for
 static uint32_t continuous_movement_start_tick = 0U; /* tick when the current dwell began */
 static uint32_t fsm_settle_until_tick = 0U; /* suppress motion trigger until this tick: OUTX is filter-settling after a CTRL1_XL ODR change */
 
-/* UNCALIBRATED — set threshold = mean(idle_mag²) + 5σ after recording
-   5 min IDLE + 5 min motion on the actual fixture. Current 0.06 is a guess. */
-#define MOVEMENT_THRESHOLD_G2   0.06f    /* |mag² - 1g²| trigger — tilt-immune (magnitude stays 1g at any orientation) and captures horizontal travel (deviation ~= a_horiz²). TUNE from UART rest-floor capture. */
+/* TEMP calibration flag (item K): 1 = stream |mag²-1g²| each IDLE cycle over UART
+   for rest-floor capture; 0 = normal operation. Leave at 0 in shipped builds. */
+#define CAL_REST_FLOOR          0
+
+/* Movement trigger on |mag² - 1g²| — tilt-immune (magnitude stays 1g at any
+   orientation) and captures horizontal travel (deviation ~= a_horiz²).
+   A 2026-06-24 bench rest-floor capture gave mean+5σ ≈ 0.022, but flashing that
+   value stuck the shuttle in STATE_MOVING at rest: the clean still-on-fixture
+   capture underestimates the real in-situ noise floor (ambient surface vibration
+   + handling), whose raw spikes re-trip the 0.022 threshold inside every 20s
+   timeout window so it never returns to IDLE. Held at the conservative 0.06,
+   which holds IDLE in situ. Re-tighten only against an in-situ (not clean-bench)
+   rest capture. */
+#define MOVEMENT_THRESHOLD_G2   0.06f
 #define MOVEMENT_DWELL_MS       500U     /* continuous-above duration to enter STATE_MOVING (0.5s: reliable real-world trigger without qualifying transient shakes) */
 #define MOVEMENT_DEBOUNCE_MS    300U     /* sub-threshold tolerance inside a dwell — survives motion microbreaks */
 #define NO_MOVEMENT_TIMEOUT_MS  20000U   /* no above-threshold sample for this long → STATE_IDLE */
@@ -2097,6 +2108,18 @@ int main(void)
 
         a_mag_g2 = (vib_x * vib_x) + (vib_y * vib_y) + (vib_z * vib_z);
         deviation = fabsf(a_mag_g2 - 1.0f);
+
+#if CAL_REST_FLOOR
+        /* TEMP rest-floor logger (item K): dump |mag²-1g²| each IDLE cycle over UART so
+           MOVEMENT_THRESHOLD_G2 can be set to mean+5σ from a dead-still capture. Steady
+           idle ODR ⇒ no LPF2 settling, so the stream is a clean rest floor. Set
+           CAL_REST_FLOOR back to 0 (and reflash) after calibration. */
+        if (current_state == STATE_IDLE)
+        {
+          int cal_n = sprintf(uart_buf, "[CAL] dev=%.5f\r\n", deviation);
+          HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, (uint16_t)cal_n, 100);
+        }
+#endif
 
         /* Magnitude-deviation detection: |a_mag² - 1g²|. Tilt-immune (gravity keeps
          * total magnitude at 1g for any mounting orientation, so static tilt reads ~0)
