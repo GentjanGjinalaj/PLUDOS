@@ -473,6 +473,41 @@ def _write_idle_waveform(write_api, sid: str, summary: dict) -> None:
         write_api.write(bucket=_INFLUXDB_BUCKET, record=points)
 
 
+# Write a MOVING mission's decimated vibration envelope to Influx (stm_mission_wave). The
+# full 3332/416 Hz capture is too dense for Influx (it stays in Parquet); drain_receiver
+# decimates it to a ~50 Hz peak envelope. Accel and gyro are independent point streams
+# (different effective ODRs after decimation), each timed off the anchored mission t0.
+def _write_mission_waveform(write_api, sid: str, summary: dict) -> None:
+    t0_ms = int(summary["t0_wall_ms"])
+    a_lsb = drain_receiver.ACCEL_G_PER_LSB
+    g_lsb = drain_receiver.GYRO_DPS_PER_LSB
+    points = []
+    accel = summary.get("mwave_accel") or []
+    a_odr = float(summary.get("mwave_accel_odr") or 0.0)
+    a_step = 1000.0 / a_odr if a_odr > 0 else 0.0
+    for i, (ax, ay, az) in enumerate(accel):
+        points.append(Point("stm_mission_wave")
+                      .tag("shuttle_id", sid)
+                      .tag("gateway",    _GATEWAY_TAG)
+                      .field("ax_g", ax * a_lsb)
+                      .field("ay_g", ay * a_lsb)
+                      .field("az_g", az * a_lsb)
+                      .time(int((t0_ms + i * a_step) * 1_000_000), WritePrecision.NS))
+    gyro = summary.get("mwave_gyro") or []
+    g_odr = float(summary.get("mwave_gyro_odr") or 0.0)
+    g_step = 1000.0 / g_odr if g_odr > 0 else 0.0
+    for j, (gx, gy, gz) in enumerate(gyro):
+        points.append(Point("stm_mission_wave")
+                      .tag("shuttle_id", sid)
+                      .tag("gateway",    _GATEWAY_TAG)
+                      .field("gx_dps", gx * g_lsb)
+                      .field("gy_dps", gy * g_lsb)
+                      .field("gz_dps", gz * g_lsb)
+                      .time(int((t0_ms + j * g_step) * 1_000_000), WritePrecision.NS))
+    if points:
+        write_api.write(bucket=_INFLUXDB_BUCKET, record=points)
+
+
 # Mirror one finalised high-rate drain (mission or idle snapshot) into InfluxDB as an
 # stm_mission point so Grafana shows shuttle activity even though the live :5683 stream
 # is off (ADR-021). High-rate waveforms stay in Parquet; only this summary goes to Influx.
@@ -551,11 +586,13 @@ def _write_drain_summary(summary: dict) -> None:
             write_api = client.write_api(write_options=SYNCHRONOUS)
             _influx_write_retry(write_api, bucket=_INFLUXDB_BUCKET, record=point)
 
-            # Idle snapshots are small — also write the per-sample accel/gyro waveform
-            # (option B) so Grafana can plot rest vibration. High-rate missions stay
-            # in Parquet only (too many samples for Influx).
+            # Idle snapshots are small — write the full per-sample waveform. MOVING missions
+            # are too dense for the full rate, so write only the decimated peak envelope
+            # (stm_mission_wave) drain_receiver attached. Full rate stays in Parquet.
             if summary.get("accel_xyz"):
                 _write_idle_waveform(write_api, sid, summary)
+            elif summary.get("mwave_accel"):
+                _write_mission_waveform(write_api, sid, summary)
             # recv/drain_loss describe the UDP drain from the STM, NOT the Influx write
             # (which either succeeds above or raises into the except below). Labelled
             # explicitly so the number isn't misread as a database write failure.

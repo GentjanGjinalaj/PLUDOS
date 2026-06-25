@@ -75,6 +75,14 @@ IDLE_TRIM_MS = float(os.getenv("IDLE_TRIM_MS", "1000"))
 # ~30 s, so dropping the first few tens of ms is negligible). Set 0 to disable.
 MOVING_TRIM_MS = float(os.getenv("MOVING_TRIM_MS", "30"))
 
+# Mission waveform decimation target. A MOVING mission is 3332 Hz accel / 416 Hz gyro —
+# hundreds of thousands of samples, far too many to mirror per-point into InfluxDB. The
+# full rate stays in Parquet; only a decimated envelope at this rate goes to Influx for the
+# Grafana "Mission Waveform" panels (idle snapshots keep their full 12.5 Hz waveform). The
+# envelope is a per-axis signed peak-per-bin, which preserves the vibration shape (peaks),
+# not a stride sample (which would alias). ~50 Hz over a ~30 s mission ≈ 1500 points.
+MISSION_WAVE_HZ = float(os.getenv("MISSION_WAVE_HZ", "50"))
+
 # Recently-finalised dedup window. Late duplicate packets of a just-finalised
 # drain arrive within ~seconds; a firmware reset re-using the same mission_id
 # comes tens of seconds later (re-init WiFi + run + drain). This TTL tells them
@@ -444,6 +452,28 @@ def _trim_settling(
     return samples[trim_n:], trim_n
 
 
+# Decimate a high-rate stream to ~target_hz for the InfluxDB mission waveform. Each output
+# point is the per-axis signed peak (max |v|, sign kept) over its bin, so the envelope keeps
+# the vibration peaks instead of aliasing like a stride sample would. Returns (envelope,
+# effective_odr_hz) where effective_odr = odr/bin so data-engine can time the points off t0.
+def _decimate_envelope(
+    samples: list[tuple[int, int, int]], odr_hz: float, target_hz: float
+) -> tuple[list[tuple[int, int, int]], float]:
+    if not samples or odr_hz <= 0 or target_hz <= 0:
+        return [], 0.0
+    bin_n = max(1, int(round(odr_hz / target_hz)))
+    if bin_n <= 1:
+        return list(samples), odr_hz
+    a = np.asarray(samples, dtype=np.int32)
+    out: list[tuple[int, int, int]] = []
+    for start in range(0, len(a), bin_n):
+        window = a[start:start + bin_n]
+        # argmax over |v| per axis, then read the signed value at that index.
+        idx = np.argmax(np.abs(window), axis=0)
+        out.append((int(window[idx[0], 0]), int(window[idx[1], 1]), int(window[idx[2], 2])))
+    return out, odr_hz / bin_n
+
+
 # Finalise one capture: assemble bytes, demux, write accel + gyro Parquet files.
 def _finalise_mission(re: MissionReassembler, reason: str) -> None:
     if re.finalised:
@@ -506,6 +536,15 @@ def _finalise_mission(re: MissionReassembler, reason: str) -> None:
     accel_rms, accel_peak = _mag_stats(accel, ACCEL_G_PER_LSB)
     _,         gyro_peak  = _mag_stats(gyro,  GYRO_DPS_PER_LSB)
 
+    # Mission waveform envelope for Grafana: idle snapshots ship their full waveform (below),
+    # but a MOVING mission is too dense for Influx, so mirror only a decimated peak envelope.
+    # Computed here off the same trimmed samples so it shares t0 with the Parquet/summary.
+    mwave_accel = mwave_gyro = None
+    mwave_accel_odr = mwave_gyro_odr = 0.0
+    if not re.is_idle_snapshot:
+        mwave_accel, mwave_accel_odr = _decimate_envelope(accel, re.odr_accel_hz, MISSION_WAVE_HZ)
+        mwave_gyro,  mwave_gyro_odr  = _decimate_envelope(gyro,  re.odr_gyro_hz,  MISSION_WAVE_HZ)
+
     # Mirror a per-mission summary into InfluxDB (Grafana). Sink failure must never
     # break the drain path, so swallow everything — parquet is already written above.
     if _summary_sink is not None:
@@ -550,6 +589,13 @@ def _finalise_mission(re: MissionReassembler, reason: str) -> None:
                 "odr_hz":           re.odr_accel_hz,
                 "accel_xyz":        accel if re.is_idle_snapshot else None,
                 "gyro_xyz":         gyro  if re.is_idle_snapshot else None,
+                # MOVING missions: decimated peak envelope (None for idle snapshots, which
+                # use the full-waveform path above). Each axis stream carries its own
+                # effective ODR so data-engine times the points off t0_wall.
+                "mwave_accel":      mwave_accel,
+                "mwave_accel_odr":  mwave_accel_odr,
+                "mwave_gyro":       mwave_gyro,
+                "mwave_gyro_odr":   mwave_gyro_odr,
             })
         except Exception as exc:
             logger.warning("[DRAIN] summary sink failed (%s): %s",

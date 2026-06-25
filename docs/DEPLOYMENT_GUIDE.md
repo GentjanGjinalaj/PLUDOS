@@ -14,7 +14,7 @@ first packet arrives.
   ─────────────────────          ─────────────────             ───────────────
   STM32U585 on B-U585I-IOT02A    Jetson Orin Nano Super        Laptop (Ubuntu)
                                  Developer Kit (8 GB)
-  • Accelerometer (ISM330DLC)    • pludos-data-engine           • Flower ServerApp
+  • Accel+Gyro (ISM330DHCX)      • pludos-data-engine           • Flower ServerApp
   • Temp/Humidity (HTS221)         UDP listener port 5683         (flwr run .)
   • WiFi: MXCHIP EMW3080           Beacon UDP port 5000         • InfluxDB 2.7
     2.4 GHz only                 • pludos-ai-worker               port 8086
@@ -1023,7 +1023,7 @@ podman exec pludos-data-engine ls /app/ram_buffer/  # list Parquet files
 
 # --- Server ---
 cd ~/PLUDOS/server && podman-compose up -d    # start InfluxDB + Grafana
-cd ~/PLUDOS && flwr run .                     # start FL round (3 rounds)
+cd ~/PLUDOS && flwr run .                     # start FL run (10 rounds by default, FL_NUM_ROUNDS)
 # InfluxDB UI:  http://localhost:8086  (admin / adminpassword)
 # Grafana UI:   http://localhost:3000  (admin / admin)
 

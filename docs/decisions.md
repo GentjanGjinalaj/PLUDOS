@@ -809,8 +809,10 @@ corrections from the field design review:
 **Still open (unchanged from ADR-020 §open):** anti-alias filter corners per ODR,
 ISM330 achieved bandwidth/noise, IMU current per mode, fault frequencies. Plus new:
 the flush-watermark threshold and IDLE ODR are provisional — set them once IMU
-idle current and ring-fill rate are measured. Also: the MCU itself still busy-waits
-in `WIFI_DelayWithYield` (no `WFI` sleep) — a separate power follow-up.
+idle current and ring-fill rate are measured. (Resolved in Phase 3: the idle loop
+no longer busy-waits — the MCU enters Stop2 between captures and wakes on ISM330
+motion or RTC timer, behind `STOP2_IDLE_ENABLE`; see `energy_lpm_design.md`. The
+*measured* power saving is still pending a bench run.)
 
 **Implementation notes (2026-06-04) — drain-hang recovery + reset-safe dedup.**
 Two fixes from a cycle test that reproduced a drain-wake hang and a silent

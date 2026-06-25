@@ -24,7 +24,9 @@ in the code differs, investigate before assuming the code is wrong.
 - Main SRAM mapped to 768 KB
 - SRAM4 (16 KB) not mapped by default; available for backup domain use
 - Stack: 1 KB (`_Min_Stack_Size = 0x400`)
-- Heap: 4 KB (`_Min_Heap_Size = 0x1000`, reserved for newlib internals)
+- Heap: 16 KB (`_Min_Heap_Size = 0x4000`; shared by newlib `printf` and the MXCHIP
+  WiFi BSP, which `malloc`s 2.5 KB net buffers — raised from 0x1000 after a NULL-alloc
+  spin caused IWDG resets during drain, see CHANGELOG Phase 3)
 
 **Key datasheets and references:**
 - STM32U585 Reference Manual (RM0456) — peripheral registers, clock tree
@@ -36,8 +38,11 @@ in the code differs, investigate before assuming the code is wrong.
 - EXTI interrupt routing for MXCHIP SPI requires manual `HAL_GPIO_EXTI_Rising_Callback`
   in `stm32u5xx_it.c`. Without this, the SPI semaphore is never signalled and
   WiFi hangs. See `WIFI_FIX_AND_BUILD.md`.
-- No RTC crystal / battery by default → no persistent real-time clock. The NTP
-  offset workaround is documented in `state_machine.md` and `wire_protocol.md`.
+- No RTC battery (VBAT) by default → no persistent real-time clock across power loss.
+  An LSE crystal (PC14/PC15) *is* present and locking; Phase 3 configures the RTC
+  peripheral + wake-up timer off LSE, but only as a **Stop2 wake source**, not a wall
+  clock. The NTP offset workaround (relative-tick anchoring) is still the time base,
+  documented in `state_machine.md` and `wire_protocol.md`.
 
 ---
 

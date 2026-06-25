@@ -57,7 +57,7 @@
     {
       "id": 100,
       "type": "row",
-      "title": "◉ Fleet Health",
+      "title": "\u25c9 Fleet Health",
       "collapsed": false,
       "gridPos": {
         "h": 1,
@@ -514,7 +514,7 @@
       "id": 109,
       "type": "stat",
       "title": "Jetson Power Now (W)",
-      "description": "Live INA3221 board power = last input_current × last input_voltage over the past 5 min.",
+      "description": "Live INA3221 board power = last input_current \u00d7 last input_voltage over the past 5 min.",
       "datasource": {
         "type": "influxdb",
         "uid": "efmtstss6rcw0d"
@@ -577,7 +577,7 @@
     {
       "id": 110,
       "type": "row",
-      "title": "📦 Data Quality",
+      "title": "\ud83d\udce6 Data Quality",
       "collapsed": false,
       "gridPos": {
         "h": 1,
@@ -589,7 +589,7 @@
     {
       "id": 111,
       "type": "timeseries",
-      "title": "Packet Loss % per Drain — by shuttle & kind",
+      "title": "Packet Loss % per Drain \u2014 by shuttle & kind",
       "description": "Per-drain blast loss (Phase-1 fire-and-forget). Spikes = WiFi contention or weak link.",
       "datasource": {
         "type": "influxdb",
@@ -642,7 +642,7 @@
     {
       "id": 112,
       "type": "timeseries",
-      "title": "Samples per Drain — accel & gyro by shuttle",
+      "title": "Samples per Drain \u2014 accel & gyro by shuttle",
       "description": "How many IMU samples each drain delivered. Low values = truncated capture or heavy loss.",
       "datasource": {
         "type": "influxdb",
@@ -943,7 +943,7 @@
     {
       "id": 120,
       "type": "row",
-      "title": "📈 Vibration Signal",
+      "title": "\ud83d\udcc8 Vibration Signal",
       "collapsed": false,
       "gridPos": {
         "h": 1,
@@ -955,7 +955,7 @@
     {
       "id": 121,
       "type": "timeseries",
-      "title": "Accel peak / rms per Drain — by shuttle",
+      "title": "Accel peak / rms per Drain \u2014 by shuttle",
       "description": "Per-drain accelerometer intensity. Grouped by shuttle so it scales to the whole fleet.",
       "datasource": {
         "type": "influxdb",
@@ -1007,7 +1007,7 @@
     {
       "id": 122,
       "type": "timeseries",
-      "title": "Gyro peak per Drain — by shuttle",
+      "title": "Gyro peak per Drain \u2014 by shuttle",
       "description": "Per-drain peak angular rate.",
       "datasource": {
         "type": "influxdb",
@@ -1059,7 +1059,7 @@
     {
       "id": 123,
       "type": "timeseries",
-      "title": "Idle Waveform — accel (g) by shuttle",
+      "title": "Idle Waveform \u2014 accel (g) by shuttle",
       "description": "Raw per-sample idle accel signature (ax/ay/az) from stm_idle_wave. Pick one shuttle in $shuttle for a clean trace.",
       "datasource": {
         "type": "influxdb",
@@ -1111,7 +1111,7 @@
     {
       "id": 124,
       "type": "timeseries",
-      "title": "Idle Waveform — gyro (dps) by shuttle",
+      "title": "Idle Waveform \u2014 gyro (dps) by shuttle",
       "description": "Raw per-sample idle gyro signature (gx/gy/gz) from stm_idle_wave.",
       "datasource": {
         "type": "influxdb",
@@ -1161,21 +1161,125 @@
       }
     },
     {
+      "id": 125,
+      "type": "timeseries",
+      "title": "Mission Waveform \u2014 accel (g) by shuttle",
+      "description": "Per-mission vibration envelope (decimated ~50 Hz peak-per-bin from the full 3332/416 Hz capture; full rate stays in Parquet).",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "efmtstss6rcw0d"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "efmtstss6rcw0d"
+          },
+          "query": "from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"stm_mission_wave\" and (r._field == \"ax_g\" or r._field == \"ay_g\" or r._field == \"az_g\")) |> filter(fn: (r) => r.shuttle_id =~ /${shuttle:regex}/) |> group(columns: [\"shuttle_id\", \"_field\"]) |> keep(columns: [\"_time\", \"_value\", \"shuttle_id\", \"_field\"])"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 45
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "accG",
+          "custom": {
+            "drawStyle": "points",
+            "lineWidth": 0,
+            "showPoints": "always",
+            "spanNulls": false,
+            "pointSize": 3,
+            "fillOpacity": 0
+          },
+          "displayName": "S${__field.labels.shuttle_id} ${__field.labels._field}",
+          "color": {
+            "mode": "palette-classic"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 126,
+      "type": "timeseries",
+      "title": "Mission Waveform \u2014 gyro (dps) by shuttle",
+      "description": "Per-mission vibration envelope (decimated ~50 Hz peak-per-bin from the full 3332/416 Hz capture; full rate stays in Parquet).",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "efmtstss6rcw0d"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "efmtstss6rcw0d"
+          },
+          "query": "from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"stm_mission_wave\" and (r._field == \"gx_dps\" or r._field == \"gy_dps\" or r._field == \"gz_dps\")) |> filter(fn: (r) => r.shuttle_id =~ /${shuttle:regex}/) |> group(columns: [\"shuttle_id\", \"_field\"]) |> keep(columns: [\"_time\", \"_value\", \"shuttle_id\", \"_field\"])"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 45
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": {
+            "drawStyle": "points",
+            "lineWidth": 0,
+            "showPoints": "always",
+            "spanNulls": false,
+            "pointSize": 3,
+            "fillOpacity": 0
+          },
+          "displayName": "S${__field.labels.shuttle_id} ${__field.labels._field}",
+          "color": {
+            "mode": "palette-classic"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
       "id": 130,
       "type": "row",
-      "title": "🌡 Environment (STM32 on-board sensors)",
+      "title": "\ud83c\udf21 Environment (STM32 on-board sensors)",
       "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 45
+        "y": 53
       }
     },
     {
       "id": 131,
       "type": "timeseries",
-      "title": "Temperature (°C) — per shuttle",
+      "title": "Temperature (\u00b0C) \u2014 per shuttle",
       "datasource": {
         "type": "influxdb",
         "uid": "efmtstss6rcw0d"
@@ -1194,7 +1298,7 @@
         "h": 7,
         "w": 12,
         "x": 0,
-        "y": 46
+        "y": 54
       },
       "fieldConfig": {
         "defaults": {
@@ -1228,7 +1332,7 @@
     {
       "id": 132,
       "type": "timeseries",
-      "title": "Pressure (hPa) — per shuttle",
+      "title": "Pressure (hPa) \u2014 per shuttle",
       "datasource": {
         "type": "influxdb",
         "uid": "efmtstss6rcw0d"
@@ -1247,7 +1351,7 @@
         "h": 7,
         "w": 12,
         "x": 12,
-        "y": 46
+        "y": 54
       },
       "fieldConfig": {
         "defaults": {
@@ -1281,20 +1385,20 @@
     {
       "id": 140,
       "type": "row",
-      "title": "🖥 Jetson Power — INA3221 via Alumet",
+      "title": "\ud83d\udda5 Jetson Power \u2014 INA3221 via Alumet",
       "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 53
+        "y": 61
       }
     },
     {
       "id": 141,
       "type": "timeseries",
       "title": "Board Input Power (W)",
-      "description": "Power = input_current × input_voltage, joined per time window.",
+      "description": "Power = input_current \u00d7 input_voltage, joined per time window.",
       "datasource": {
         "type": "influxdb",
         "uid": "efmtstss6rcw0d"
@@ -1313,7 +1417,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 54
+        "y": 62
       },
       "fieldConfig": {
         "defaults": {
@@ -1365,7 +1469,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 54
+        "y": 62
       },
       "fieldConfig": {
         "defaults": {
@@ -1416,7 +1520,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 54
+        "y": 62
       },
       "fieldConfig": {
         "defaults": {
@@ -1450,7 +1554,7 @@
       "id": 144,
       "type": "timeseries",
       "title": "Power by Rail (W)",
-      "description": "Per-rail power = current × voltage for each INA3221 channel (VDD_IN = board total; VDD_SOC, VDD_CPU_GPU_CV, channel_4 are sub-rails). Joined per time window.",
+      "description": "Per-rail power = current \u00d7 voltage for each INA3221 channel (VDD_IN = board total; VDD_SOC, VDD_CPU_GPU_CV, channel_4 are sub-rails). Joined per time window.",
       "datasource": {
         "type": "influxdb",
         "uid": "efmtstss6rcw0d"
@@ -1469,7 +1573,7 @@
         "h": 8,
         "w": 16,
         "x": 0,
-        "y": 62
+        "y": 70
       },
       "fieldConfig": {
         "defaults": {
@@ -1502,7 +1606,7 @@
       "id": 145,
       "type": "stat",
       "title": "Board Energy in View (J)",
-      "description": "VDD_IN board energy over the selected range = sum of 1 s-windowed board power (rectangle integral of real INA3221 samples, no modelling). 1 J = 1 W·s.",
+      "description": "VDD_IN board energy over the selected range = sum of 1 s-windowed board power (rectangle integral of real INA3221 samples, no modelling). 1 J = 1 W\u00b7s.",
       "datasource": {
         "type": "influxdb",
         "uid": "efmtstss6rcw0d"
@@ -1521,7 +1625,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 62
+        "y": 70
       },
       "options": {
         "reduceOptions": {
@@ -1569,7 +1673,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 70
+        "y": 78
       },
       "options": {
         "footer": {

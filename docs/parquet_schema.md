@@ -239,8 +239,9 @@ Example: `cap_accel_s1_m1747123456789.parquet`
 For `is_idle_snapshot` captures the first ~1 s (`IDLE_TRIM_MS`, default 1000)
 is dropped off the head: the ISM330 LPF2 resets on ODR change and those
 samples clip at the ±2 g rail. `t0_wall_ms` is advanced by the trimmed
-duration so `t_ms` stays honest. MOVING missions are **not** trimmed — their
-onset transient is real signal.
+duration so `t_ms` stays honest. MOVING missions get a much shorter head trim
+(`MOVING_TRIM_MS`, default **30 ms**) to drop the ODR-switch glitch at onset
+while keeping the run — most of the onset transient is real signal.
 
 ## Reading drain files in Python
 

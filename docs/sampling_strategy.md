@@ -566,8 +566,10 @@ is stored as a fresh capture.
   ADR-015 always-on live stream; `WIFI_PowerOff()` is built but not yet wired to a
   trigger.
 
-> **MCU sleep is a separate, smaller power item:** the idle loop currently busy-waits
-> in `WIFI_DelayWithYield` rather than entering `WFI`/stop mode. Tracked as a follow-up.
+> **MCU sleep (resolved in Phase 3):** the idle loop no longer busy-waits — the MCU
+> enters **Stop2** between captures and wakes on ISM330 motion (INT1/EXTI11) or an RTC
+> timer, behind `STOP2_IDLE_ENABLE`. See `energy_lpm_design.md`. Bench measurement of
+> the actual saving is still pending.
 
 ---
 

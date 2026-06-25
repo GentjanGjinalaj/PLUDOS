@@ -19,11 +19,13 @@ shuttle energy must be measured externally.
 
 ## 1. Why this matters
 
-The MCU runs flat-out at 160 MHz and **never sleeps**. The main loop polls the
-ISM330 over I2C with `HAL_Delay` busy-waits through the entire idle period — and the
-idle period is large: an idle snapshot fires only every `CAP_IDLE_SNAP_PERIOD_MS`
-(600 000 ms = 10 min, `main.c`), so the device spends ~9 min 50 s out of every
-10 min doing nothing but polling at full clock.
+**Pre-Phase-3 baseline (the problem this design fixes):** the MCU ran flat-out at
+160 MHz and **never slept**. The main loop polled the ISM330 over I2C with `HAL_Delay`
+busy-waits through the entire idle period — and the idle period is large: an idle
+snapshot fires only every `CAP_IDLE_SNAP_PERIOD_MS` (600 000 ms = 10 min, `main.c`),
+so the device spent ~9 min 50 s out of every 10 min doing nothing but polling at full
+clock. Phase 3 (this design, behind `STOP2_IDLE_ENABLE`) replaces that busy-poll with
+Stop2 sleep; the paragraphs below describe the baseline the saving is measured *against*.
 
 For an *energy-aware* thesis this is internally inconsistent. The in-code idle-power
 assumption implies ~27 days of battery; observed battery life is **1–2 days**

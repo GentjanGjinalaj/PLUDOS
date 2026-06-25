@@ -62,10 +62,12 @@ makes the tiers swappable and independently testable.
 - **On board but unused in firmware:** LIS2MDL magnetometer, VL53L5CX
   ToF/gesture, 2× MEMS mics, ambient-light sensor. Adding any needs a CubeMX-side
   peripheral change first.
-- **Power note for FL/energy work:** the two user LEDs are driven off; the board
-  is currently un-optimised (MCU never sleeps, onboard power LED hardwired). A
-  10 000 mAh pack lasts ~1–2 days — energy modelling should treat the present
-  firmware as a *worst-case* baseline, not the floor.
+- **Power note for FL/energy work:** the two user LEDs are driven off. The MCU now
+  enters **Stop2** between captures and wakes on ISM330 motion (INT1/EXTI11) or an
+  RTC timer (Phase 3, behind `STOP2_IDLE_ENABLE`) — the old "never sleeps" busy-poll
+  is the *pre-Phase-3* baseline. The onboard power LED is still hardwired. The
+  ~1–2 day life of a 10 000 mAh pack was measured on the busy-poll firmware; the
+  Stop2 saving is **unmeasured** (bench measurement pending, see `energy_lpm_design.md`).
 
 ### 1.2 Jetson gateway — Orin Nano Super Developer Kit
 
