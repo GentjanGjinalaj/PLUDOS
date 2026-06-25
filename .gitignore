@@ -49,11 +49,8 @@ docs/DEPLOYMENT_CHECKLIST.md
 docs/THESIS_KEYPOINTS.md
 docs/QUICK_REFERENCE.md
 docs/JETSON_DEPLOYMENT.md
-docs/current_problems.md
 docs/next_steps.md
 docs/future_options.md
-docs/to-do.md
-docs/to-do_results.md
 # Log directories — auto-created at runtime, never committed.
 # server.py creates logs/ via mkdir(parents=True, exist_ok=True).
 # entrypoint.sh creates client/logs/alumet/ via mkdir -p.
@@ -65,7 +62,6 @@ client/ram_buffer_archive/
 
 # Internal design-council notes — kept local, not published.
 docs/DESIGN_COUNCIL.md
-docs/DESIGN_COUNCIL_PLAN.md
 
 # Claude Code worktrees (isolation branches, not for repo)
 .claude/worktrees/
