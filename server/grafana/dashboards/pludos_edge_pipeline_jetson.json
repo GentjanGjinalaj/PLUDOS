@@ -3,7 +3,10 @@
   "uid": "pludos-edge-jetson",
   "title": "PLUDOS Edge Pipeline (warehouse1)",
   "description": "Edge data pipeline: shuttle drains, data quality, vibration signal, environment, Jetson power. Every panel honours the time picker and the $shuttle / $kind variables. No FL panels (that lives on the server System Monitor).",
-  "tags": ["pludos", "edge"],
+  "tags": [
+    "pludos",
+    "edge"
+  ],
   "timezone": "browser",
   "refresh": "30s",
   "schemaVersion": 39,
@@ -14,26 +17,38 @@
         "name": "shuttle",
         "label": "Shuttle",
         "type": "query",
-        "datasource": { "type": "influxdb", "uid": "jetson-influx" },
+        "datasource": {
+          "type": "influxdb",
+          "uid": "jetson-influx"
+        },
         "query": "import \"influxdata/influxdb/schema\" schema.tagValues(bucket: \"alumet_energy\", tag: \"shuttle_id\", predicate: (r) => r._measurement == \"stm_mission\")",
         "refresh": 2,
         "includeAll": true,
         "multi": true,
         "allValue": ".*",
-        "current": { "text": "All", "value": "$__all" },
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
         "sort": 3
       },
       {
         "name": "kind",
         "label": "Drain kind",
         "type": "query",
-        "datasource": { "type": "influxdb", "uid": "jetson-influx" },
+        "datasource": {
+          "type": "influxdb",
+          "uid": "jetson-influx"
+        },
         "query": "import \"influxdata/influxdb/schema\" schema.tagValues(bucket: \"alumet_energy\", tag: \"kind\", predicate: (r) => r._measurement == \"stm_mission\")",
         "refresh": 2,
         "includeAll": true,
         "multi": true,
         "allValue": ".*",
-        "current": { "text": "All", "value": "$__all" },
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
         "sort": 1
       }
     ]
@@ -44,229 +59,884 @@
       "type": "row",
       "title": "\u25c9 Fleet Health",
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      }
     },
     {
       "id": 101,
       "type": "stat",
       "title": "Active Shuttles",
       "description": "Distinct shuttle_id that drained in the selected time range.",
-      "datasource": { "type": "influxdb", "uid": "jetson-influx" },
+      "datasource": {
+        "type": "influxdb",
+        "uid": "jetson-influx"
+      },
       "targets": [
         {
           "refId": "A",
-          "datasource": { "type": "influxdb", "uid": "jetson-influx" },
+          "datasource": {
+            "type": "influxdb",
+            "uid": "jetson-influx"
+          },
           "query": "from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"stm_mission\" and r._field == \"packets_total\" and r.source == \"drain\") |> keep(columns: [\"shuttle_id\"]) |> group() |> distinct(column: \"shuttle_id\") |> count()"
         }
       ],
-      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 1 },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "value", "colorMode": "background", "graphMode": "none" },
-      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "fixed", "fixedColor": "blue" } } }
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 0,
+        "y": 1
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value",
+        "colorMode": "background",
+        "graphMode": "none"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          }
+        }
+      }
     },
     {
       "id": 102,
       "type": "stat",
       "title": "Drains in Range",
       "description": "Total drains (after $shuttle / $kind filter) in the selected range.",
-      "datasource": { "type": "influxdb", "uid": "jetson-influx" },
+      "datasource": {
+        "type": "influxdb",
+        "uid": "jetson-influx"
+      },
       "targets": [
         {
           "refId": "A",
-          "datasource": { "type": "influxdb", "uid": "jetson-influx" },
+          "datasource": {
+            "type": "influxdb",
+            "uid": "jetson-influx"
+          },
           "query": "from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"stm_mission\" and r._field == \"packets_total\" and r.source == \"drain\") |> filter(fn: (r) => r.shuttle_id =~ /${shuttle:regex}/ and r.kind =~ /${kind:regex}/) |> group() |> count()"
         }
       ],
-      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 1 },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "value", "colorMode": "background", "graphMode": "none" },
-      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "fixed", "fixedColor": "purple" } } }
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 4,
+        "y": 1
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value",
+        "colorMode": "background",
+        "graphMode": "none"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "purple"
+          }
+        }
+      }
     },
     {
       "id": 103,
       "type": "stat",
       "title": "Missions",
       "description": "Drains of kind=mission in range (ignores $kind).",
-      "datasource": { "type": "influxdb", "uid": "jetson-influx" },
+      "datasource": {
+        "type": "influxdb",
+        "uid": "jetson-influx"
+      },
       "targets": [
         {
           "refId": "A",
-          "datasource": { "type": "influxdb", "uid": "jetson-influx" },
+          "datasource": {
+            "type": "influxdb",
+            "uid": "jetson-influx"
+          },
           "query": "from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"stm_mission\" and r._field == \"packets_total\" and r.source == \"drain\" and r.kind == \"mission\") |> filter(fn: (r) => r.shuttle_id =~ /${shuttle:regex}/) |> group() |> count()"
         }
       ],
-      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 1 },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "value", "colorMode": "background", "graphMode": "none" },
-      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "fixed", "fixedColor": "green" } } }
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 8,
+        "y": 1
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value",
+        "colorMode": "background",
+        "graphMode": "none"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "green"
+          }
+        }
+      }
     },
     {
       "id": 104,
       "type": "stat",
       "title": "Idle Snapshots",
       "description": "Drains of kind=idle_snapshot in range (ignores $kind).",
-      "datasource": { "type": "influxdb", "uid": "jetson-influx" },
+      "datasource": {
+        "type": "influxdb",
+        "uid": "jetson-influx"
+      },
       "targets": [
         {
           "refId": "A",
-          "datasource": { "type": "influxdb", "uid": "jetson-influx" },
+          "datasource": {
+            "type": "influxdb",
+            "uid": "jetson-influx"
+          },
           "query": "from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"stm_mission\" and r._field == \"packets_total\" and r.source == \"drain\" and r.kind == \"idle_snapshot\") |> filter(fn: (r) => r.shuttle_id =~ /${shuttle:regex}/) |> group() |> count()"
         }
       ],
-      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 1 },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "value", "colorMode": "background", "graphMode": "none" },
-      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "fixed", "fixedColor": "yellow" } } }
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 12,
+        "y": 1
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value",
+        "colorMode": "background",
+        "graphMode": "none"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "yellow"
+          }
+        }
+      }
     },
     {
       "id": 105,
       "type": "stat",
       "title": "Mean Loss %",
       "description": "Average per-drain packet loss across the filtered drains in range.",
-      "datasource": { "type": "influxdb", "uid": "jetson-influx" },
+      "datasource": {
+        "type": "influxdb",
+        "uid": "jetson-influx"
+      },
       "targets": [
         {
           "refId": "A",
-          "datasource": { "type": "influxdb", "uid": "jetson-influx" },
+          "datasource": {
+            "type": "influxdb",
+            "uid": "jetson-influx"
+          },
           "query": "from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"stm_mission\" and r._field == \"loss_pct\" and r.source == \"drain\") |> filter(fn: (r) => r.shuttle_id =~ /${shuttle:regex}/ and r.kind =~ /${kind:regex}/) |> group() |> mean()"
         }
       ],
-      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 1 },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "value", "colorMode": "background", "graphMode": "none" },
-      "fieldConfig": { "defaults": { "unit": "percent", "decimals": 1, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "value": 0, "color": "green" }, { "value": 2, "color": "yellow" }, { "value": 10, "color": "red" } ] } } }
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 16,
+        "y": 1
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value",
+        "colorMode": "background",
+        "graphMode": "none"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 1,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "value": 0,
+                "color": "green"
+              },
+              {
+                "value": 2,
+                "color": "yellow"
+              },
+              {
+                "value": 10,
+                "color": "red"
+              }
+            ]
+          }
+        }
+      }
     },
     {
       "id": 106,
       "type": "stat",
       "title": "Max Loss %",
       "description": "Worst single-drain packet loss in range.",
-      "datasource": { "type": "influxdb", "uid": "jetson-influx" },
+      "datasource": {
+        "type": "influxdb",
+        "uid": "jetson-influx"
+      },
       "targets": [
         {
           "refId": "A",
-          "datasource": { "type": "influxdb", "uid": "jetson-influx" },
+          "datasource": {
+            "type": "influxdb",
+            "uid": "jetson-influx"
+          },
           "query": "from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"stm_mission\" and r._field == \"loss_pct\" and r.source == \"drain\") |> filter(fn: (r) => r.shuttle_id =~ /${shuttle:regex}/ and r.kind =~ /${kind:regex}/) |> group() |> max()"
         }
       ],
-      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 1 },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "value", "colorMode": "background", "graphMode": "none" },
-      "fieldConfig": { "defaults": { "unit": "percent", "decimals": 1, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "value": 0, "color": "green" }, { "value": 2, "color": "yellow" }, { "value": 10, "color": "red" } ] } } }
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 20,
+        "y": 1
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value",
+        "colorMode": "background",
+        "graphMode": "none"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 1,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "value": 0,
+                "color": "green"
+              },
+              {
+                "value": 2,
+                "color": "yellow"
+              },
+              {
+                "value": 10,
+                "color": "red"
+              }
+            ]
+          }
+        }
+      }
     },
     {
       "id": 107,
       "type": "stat",
       "title": "Last Drain Age",
       "description": "Time since the most recent filtered drain finished. Large value = no recent activity.",
-      "datasource": { "type": "influxdb", "uid": "jetson-influx" },
+      "datasource": {
+        "type": "influxdb",
+        "uid": "jetson-influx"
+      },
       "targets": [
         {
           "refId": "A",
-          "datasource": { "type": "influxdb", "uid": "jetson-influx" },
+          "datasource": {
+            "type": "influxdb",
+            "uid": "jetson-influx"
+          },
           "query": "from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"stm_mission\" and r._field == \"packets_total\" and r.source == \"drain\") |> filter(fn: (r) => r.shuttle_id =~ /${shuttle:regex}/ and r.kind =~ /${kind:regex}/) |> group() |> last() |> map(fn: (r) => ({ _time: r._time, _value: float(v: int(v: now()) - int(v: r._time)) / 1000000000.0 }))"
         }
       ],
-      "gridPos": { "h": 4, "w": 8, "x": 0, "y": 5 },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "value", "colorMode": "background", "graphMode": "none" },
-      "fieldConfig": { "defaults": { "unit": "s", "decimals": 0, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "value": 0, "color": "green" }, { "value": 3600, "color": "yellow" }, { "value": 86400, "color": "red" } ] } } }
+      "gridPos": {
+        "h": 4,
+        "w": 8,
+        "x": 0,
+        "y": 5
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value",
+        "colorMode": "background",
+        "graphMode": "none"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 0,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "value": 0,
+                "color": "green"
+              },
+              {
+                "value": 3600,
+                "color": "yellow"
+              },
+              {
+                "value": 86400,
+                "color": "red"
+              }
+            ]
+          }
+        }
+      }
     },
     {
       "id": 108,
       "type": "stat",
       "title": "Completeness %",
       "description": "Share of filtered drains where every chunk arrived (complete==1).",
-      "datasource": { "type": "influxdb", "uid": "jetson-influx" },
+      "datasource": {
+        "type": "influxdb",
+        "uid": "jetson-influx"
+      },
       "targets": [
         {
           "refId": "A",
-          "datasource": { "type": "influxdb", "uid": "jetson-influx" },
+          "datasource": {
+            "type": "influxdb",
+            "uid": "jetson-influx"
+          },
           "query": "from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"stm_mission\" and r._field == \"complete\" and r.source == \"drain\") |> filter(fn: (r) => r.shuttle_id =~ /${shuttle:regex}/ and r.kind =~ /${kind:regex}/) |> map(fn: (r) => ({ r with _value: if r._value then 1.0 else 0.0 })) |> group() |> mean() |> map(fn: (r) => ({ r with _value: r._value * 100.0 }))"
         }
       ],
-      "gridPos": { "h": 4, "w": 8, "x": 8, "y": 5 },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "value", "colorMode": "background", "graphMode": "none" },
-      "fieldConfig": { "defaults": { "unit": "percent", "decimals": 1, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "value": 0, "color": "red" }, { "value": 90, "color": "yellow" }, { "value": 100, "color": "green" } ] } } }
+      "gridPos": {
+        "h": 4,
+        "w": 8,
+        "x": 8,
+        "y": 5
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value",
+        "colorMode": "background",
+        "graphMode": "none"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 1,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "value": 0,
+                "color": "red"
+              },
+              {
+                "value": 90,
+                "color": "yellow"
+              },
+              {
+                "value": 100,
+                "color": "green"
+              }
+            ]
+          }
+        }
+      }
     },
     {
       "id": 109,
       "type": "stat",
       "title": "Jetson Power Now (W)",
       "description": "Live INA3221 board power = last input_current \u00d7 last input_voltage over the past 5 min.",
-      "datasource": { "type": "influxdb", "uid": "jetson-influx" },
+      "datasource": {
+        "type": "influxdb",
+        "uid": "jetson-influx"
+      },
       "targets": [
         {
           "refId": "A",
-          "datasource": { "type": "influxdb", "uid": "jetson-influx" },
-          "query": "cur = from(bucket: \"alumet_energy\") |> range(start: -5m) |> filter(fn: (r) => r._measurement == \"input_current\" and r._field == \"value\") |> aggregateWindow(every: 30s, fn: mean, createEmpty: false) |> keep(columns: [\"_time\", \"_value\"]) |> rename(columns: {_value: \"i_ma\"}) volt = from(bucket: \"alumet_energy\") |> range(start: -5m) |> filter(fn: (r) => r._measurement == \"input_voltage\" and r._field == \"value\") |> aggregateWindow(every: 30s, fn: mean, createEmpty: false) |> keep(columns: [\"_time\", \"_value\"]) |> rename(columns: {_value: \"u_mv\"}) join(tables: {c: cur, v: volt}, on: [\"_time\"]) |> map(fn: (r) => ({_time: r._time, _value: r.i_ma * r.u_mv / 1000000.0})) |> last()"
+          "datasource": {
+            "type": "influxdb",
+            "uid": "jetson-influx"
+          },
+          "query": "cur = from(bucket: \"alumet_energy\") |> range(start: -5m) |> filter(fn: (r) => r._measurement == \"input_current\" and r._field == \"value\" and r.ina_channel_label == \"VDD_IN\") |> aggregateWindow(every: 30s, fn: mean, createEmpty: false) |> keep(columns: [\"_time\", \"_value\"]) |> rename(columns: {_value: \"i_ma\"}) volt = from(bucket: \"alumet_energy\") |> range(start: -5m) |> filter(fn: (r) => r._measurement == \"input_voltage\" and r._field == \"value\" and r.ina_channel_label == \"VDD_IN\") |> aggregateWindow(every: 30s, fn: mean, createEmpty: false) |> keep(columns: [\"_time\", \"_value\"]) |> rename(columns: {_value: \"u_mv\"}) join(tables: {c: cur, v: volt}, on: [\"_time\"]) |> map(fn: (r) => ({_time: r._time, _value: r.i_ma * r.u_mv / 1000000.0})) |> last()"
         }
       ],
-      "gridPos": { "h": 4, "w": 8, "x": 16, "y": 5 },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "value", "colorMode": "background", "graphMode": "none" },
-      "fieldConfig": { "defaults": { "unit": "watt", "decimals": 2, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "value": 0, "color": "green" }, { "value": 15, "color": "yellow" }, { "value": 22, "color": "red" } ] } } }
+      "gridPos": {
+        "h": 4,
+        "w": 8,
+        "x": 16,
+        "y": 5
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value",
+        "colorMode": "background",
+        "graphMode": "none"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "watt",
+          "decimals": 2,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "value": 0,
+                "color": "green"
+              },
+              {
+                "value": 15,
+                "color": "yellow"
+              },
+              {
+                "value": 22,
+                "color": "red"
+              }
+            ]
+          }
+        }
+      }
     },
     {
       "id": 110,
       "type": "row",
       "title": "\ud83d\udce6 Data Quality",
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 9 }
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 9
+      }
     },
     {
       "id": 111,
       "type": "timeseries",
       "title": "Packet Loss % per Drain \u2014 by shuttle & kind",
       "description": "Per-drain blast loss (Phase-1 fire-and-forget). Spikes = WiFi contention or weak link.",
-      "datasource": { "type": "influxdb", "uid": "jetson-influx" },
+      "datasource": {
+        "type": "influxdb",
+        "uid": "jetson-influx"
+      },
       "targets": [
         {
           "refId": "A",
-          "datasource": { "type": "influxdb", "uid": "jetson-influx" },
-          "query": "from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"stm_mission\" and r._field == \"loss_pct\" and r.source == \"drain\") |> filter(fn: (r) => r.shuttle_id =~ /${shuttle:regex}/ and r.kind =~ /${kind:regex}/) |> group(columns: [\"shuttle_id\", \"kind\"])"
+          "datasource": {
+            "type": "influxdb",
+            "uid": "jetson-influx"
+          },
+          "query": "from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"stm_mission\" and r._field == \"loss_pct\" and r.source == \"drain\") |> filter(fn: (r) => r.shuttle_id =~ /${shuttle:regex}/ and r.kind =~ /${kind:regex}/) |> group(columns: [\"shuttle_id\", \"kind\"]) |> keep(columns: [\"_time\", \"_value\", \"shuttle_id\", \"kind\"])"
         }
       ],
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 10 },
-      "fieldConfig": { "defaults": { "unit": "percent", "min": 0, "custom": { "lineWidth": 1, "fillOpacity": 5, "drawStyle": "line", "showPoints": "always", "pointSize": 6, "spanNulls": true } } },
-      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } }
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 10
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "custom": {
+            "lineWidth": 0,
+            "fillOpacity": 0,
+            "drawStyle": "points",
+            "showPoints": "always",
+            "pointSize": 7,
+            "spanNulls": false
+          },
+          "displayName": "S${__field.labels.shuttle_id} ${__field.labels.kind}",
+          "color": {
+            "mode": "palette-classic"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
     },
     {
       "id": 112,
       "type": "timeseries",
       "title": "Samples per Drain \u2014 accel & gyro by shuttle",
       "description": "How many IMU samples each drain delivered. Low values = truncated capture or heavy loss.",
-      "datasource": { "type": "influxdb", "uid": "jetson-influx" },
+      "datasource": {
+        "type": "influxdb",
+        "uid": "jetson-influx"
+      },
       "targets": [
         {
           "refId": "A",
-          "datasource": { "type": "influxdb", "uid": "jetson-influx" },
-          "query": "from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"stm_mission\" and (r._field == \"accel_samples\" or r._field == \"gyro_samples\") and r.source == \"drain\") |> filter(fn: (r) => r.shuttle_id =~ /${shuttle:regex}/ and r.kind =~ /${kind:regex}/) |> group(columns: [\"shuttle_id\", \"_field\"])"
+          "datasource": {
+            "type": "influxdb",
+            "uid": "jetson-influx"
+          },
+          "query": "from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"stm_mission\" and (r._field == \"accel_samples\" or r._field == \"gyro_samples\") and r.source == \"drain\") |> filter(fn: (r) => r.shuttle_id =~ /${shuttle:regex}/ and r.kind =~ /${kind:regex}/) |> group(columns: [\"shuttle_id\", \"_field\"]) |> keep(columns: [\"_time\", \"_value\", \"shuttle_id\", \"_field\"])"
         }
       ],
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 10 },
-      "fieldConfig": { "defaults": { "unit": "short", "custom": { "lineWidth": 0, "fillOpacity": 70, "drawStyle": "bars", "showPoints": "never" } } },
-      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } }
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 10
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 0,
+            "fillOpacity": 70,
+            "drawStyle": "bars",
+            "showPoints": "never"
+          },
+          "displayName": "S${__field.labels.shuttle_id} ${__field.labels._field}",
+          "color": {
+            "mode": "palette-classic"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
     },
     {
       "id": 113,
       "type": "table",
       "title": "Recent Drains",
       "description": "Most recent filtered drains in the selected range.",
-      "datasource": { "type": "influxdb", "uid": "jetson-influx" },
+      "datasource": {
+        "type": "influxdb",
+        "uid": "jetson-influx"
+      },
       "targets": [
         {
           "refId": "A",
-          "datasource": { "type": "influxdb", "uid": "jetson-influx" },
+          "datasource": {
+            "type": "influxdb",
+            "uid": "jetson-influx"
+          },
           "query": "from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"stm_mission\" and r.source == \"drain\") |> filter(fn: (r) => r.shuttle_id =~ /${shuttle:regex}/ and r.kind =~ /${kind:regex}/) |> pivot(rowKey: [\"_time\", \"shuttle_id\", \"kind\"], columnKey: [\"_field\"], valueColumn: \"_value\") |> keep(columns: [\"_time\", \"shuttle_id\", \"kind\", \"packets_received\", \"packets_total\", \"loss_pct\", \"accel_samples\", \"gyro_samples\", \"recv_duration_ms\", \"write_duration_ms\", \"complete\"]) |> sort(columns: [\"_time\"], desc: true) |> limit(n: 200)"
         }
       ],
-      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 18 },
-      "options": { "footer": { "show": false }, "sortBy": [] },
+      "gridPos": {
+        "h": 10,
+        "w": 24,
+        "x": 0,
+        "y": 18
+      },
+      "options": {
+        "footer": {
+          "show": false
+        },
+        "sortBy": []
+      },
       "fieldConfig": {
         "defaults": {},
         "overrides": [
-          { "matcher": { "id": "byName", "options": "_time" }, "properties": [ { "id": "displayName", "value": "Time" }, { "id": "custom.width", "value": 190 } ] },
-          { "matcher": { "id": "byName", "options": "shuttle_id" }, "properties": [ { "id": "displayName", "value": "Shuttle" }, { "id": "custom.width", "value": 80 } ] },
-          { "matcher": { "id": "byName", "options": "kind" }, "properties": [ { "id": "displayName", "value": "Kind" }, { "id": "custom.width", "value": 130 } ] },
-          { "matcher": { "id": "byName", "options": "packets_received" }, "properties": [ { "id": "displayName", "value": "Recv" }, { "id": "decimals", "value": 0 }, { "id": "custom.width", "value": 80 } ] },
-          { "matcher": { "id": "byName", "options": "packets_total" }, "properties": [ { "id": "displayName", "value": "Total" }, { "id": "decimals", "value": 0 }, { "id": "custom.width", "value": 80 } ] },
-          { "matcher": { "id": "byName", "options": "loss_pct" }, "properties": [ { "id": "displayName", "value": "Loss %" }, { "id": "unit", "value": "percent" }, { "id": "decimals", "value": 1 }, { "id": "custom.width", "value": 90 }, { "id": "custom.cellOptions", "value": { "type": "color-background" } }, { "id": "thresholds", "value": { "mode": "absolute", "steps": [ { "value": 0, "color": "green" }, { "value": 2, "color": "yellow" }, { "value": 10, "color": "red" } ] } } ] },
-          { "matcher": { "id": "byName", "options": "accel_samples" }, "properties": [ { "id": "displayName", "value": "Accel" }, { "id": "decimals", "value": 0 } ] },
-          { "matcher": { "id": "byName", "options": "gyro_samples" }, "properties": [ { "id": "displayName", "value": "Gyro" }, { "id": "decimals", "value": 0 } ] },
-          { "matcher": { "id": "byName", "options": "complete" }, "properties": [ { "id": "displayName", "value": "Complete" }, { "id": "decimals", "value": 0 }, { "id": "custom.width", "value": 90 } ] }
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "_time"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Time"
+              },
+              {
+                "id": "custom.width",
+                "value": 190
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "shuttle_id"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Shuttle"
+              },
+              {
+                "id": "custom.width",
+                "value": 80
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "kind"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Kind"
+              },
+              {
+                "id": "custom.width",
+                "value": 130
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "packets_received"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Recv"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              },
+              {
+                "id": "custom.width",
+                "value": 80
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "packets_total"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Total"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              },
+              {
+                "id": "custom.width",
+                "value": 80
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "loss_pct"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Loss %"
+              },
+              {
+                "id": "unit",
+                "value": "percent"
+              },
+              {
+                "id": "decimals",
+                "value": 1
+              },
+              {
+                "id": "custom.width",
+                "value": 90
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background"
+                }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "value": 0,
+                      "color": "green"
+                    },
+                    {
+                      "value": 2,
+                      "color": "yellow"
+                    },
+                    {
+                      "value": 10,
+                      "color": "red"
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "accel_samples"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Accel"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "gyro_samples"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Gyro"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "recv_duration_ms"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Recv (ms)"
+              },
+              {
+                "id": "unit",
+                "value": "ms"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              },
+              {
+                "id": "custom.width",
+                "value": 100
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "complete"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Complete"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              },
+              {
+                "id": "custom.width",
+                "value": 90
+              }
+            ]
+          }
         ]
       }
     },
@@ -275,198 +945,838 @@
       "type": "row",
       "title": "\ud83d\udcc8 Vibration Signal",
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 28 }
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 28
+      }
     },
     {
       "id": 121,
       "type": "timeseries",
       "title": "Accel peak / rms per Drain \u2014 by shuttle",
       "description": "Per-drain accelerometer intensity. Grouped by shuttle so it scales to the whole fleet.",
-      "datasource": { "type": "influxdb", "uid": "jetson-influx" },
+      "datasource": {
+        "type": "influxdb",
+        "uid": "jetson-influx"
+      },
       "targets": [
         {
           "refId": "A",
-          "datasource": { "type": "influxdb", "uid": "jetson-influx" },
-          "query": "from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"stm_mission\" and (r._field == \"accel_peak_g\" or r._field == \"accel_rms_g\") and r.source == \"drain\") |> filter(fn: (r) => r.shuttle_id =~ /${shuttle:regex}/ and r.kind =~ /${kind:regex}/) |> group(columns: [\"shuttle_id\", \"_field\"])"
+          "datasource": {
+            "type": "influxdb",
+            "uid": "jetson-influx"
+          },
+          "query": "from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"stm_mission\" and (r._field == \"accel_peak_g\" or r._field == \"accel_rms_g\") and r.source == \"drain\") |> filter(fn: (r) => r.shuttle_id =~ /${shuttle:regex}/ and r.kind =~ /${kind:regex}/) |> group(columns: [\"shuttle_id\", \"_field\"]) |> keep(columns: [\"_time\", \"_value\", \"shuttle_id\", \"_field\"])"
         }
       ],
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 29 },
-      "fieldConfig": { "defaults": { "unit": "accG", "custom": { "drawStyle": "line", "lineWidth": 1, "showPoints": "auto", "pointSize": 5, "spanNulls": true } } },
-      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } }
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 29
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "accG",
+          "custom": {
+            "drawStyle": "points",
+            "lineWidth": 0,
+            "showPoints": "always",
+            "pointSize": 6,
+            "spanNulls": false,
+            "fillOpacity": 0
+          },
+          "displayName": "S${__field.labels.shuttle_id} ${__field.labels._field}",
+          "color": {
+            "mode": "palette-classic"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
     },
     {
       "id": 122,
       "type": "timeseries",
       "title": "Gyro peak per Drain \u2014 by shuttle",
       "description": "Per-drain peak angular rate.",
-      "datasource": { "type": "influxdb", "uid": "jetson-influx" },
+      "datasource": {
+        "type": "influxdb",
+        "uid": "jetson-influx"
+      },
       "targets": [
         {
           "refId": "A",
-          "datasource": { "type": "influxdb", "uid": "jetson-influx" },
-          "query": "from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"stm_mission\" and r._field == \"gyro_peak_dps\" and r.source == \"drain\") |> filter(fn: (r) => r.shuttle_id =~ /${shuttle:regex}/ and r.kind =~ /${kind:regex}/) |> group(columns: [\"shuttle_id\"])"
+          "datasource": {
+            "type": "influxdb",
+            "uid": "jetson-influx"
+          },
+          "query": "from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"stm_mission\" and r._field == \"gyro_peak_dps\" and r.source == \"drain\") |> filter(fn: (r) => r.shuttle_id =~ /${shuttle:regex}/ and r.kind =~ /${kind:regex}/) |> group(columns: [\"shuttle_id\"]) |> keep(columns: [\"_time\", \"_value\", \"shuttle_id\"])"
         }
       ],
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 29 },
-      "fieldConfig": { "defaults": { "unit": "none", "custom": { "drawStyle": "line", "lineWidth": 1, "showPoints": "auto", "pointSize": 5, "spanNulls": true } } },
-      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } }
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 29
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": {
+            "drawStyle": "points",
+            "lineWidth": 0,
+            "showPoints": "always",
+            "pointSize": 6,
+            "spanNulls": false,
+            "fillOpacity": 0
+          },
+          "displayName": "S${__field.labels.shuttle_id} gyro_peak_dps",
+          "color": {
+            "mode": "palette-classic"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
     },
     {
       "id": 123,
       "type": "timeseries",
       "title": "Idle Waveform \u2014 accel (g) by shuttle",
       "description": "Raw per-sample idle accel signature (ax/ay/az) from stm_idle_wave. Pick one shuttle in $shuttle for a clean trace.",
-      "datasource": { "type": "influxdb", "uid": "jetson-influx" },
+      "datasource": {
+        "type": "influxdb",
+        "uid": "jetson-influx"
+      },
       "targets": [
         {
           "refId": "A",
-          "datasource": { "type": "influxdb", "uid": "jetson-influx" },
-          "query": "from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"stm_idle_wave\" and (r._field == \"ax_g\" or r._field == \"ay_g\" or r._field == \"az_g\")) |> filter(fn: (r) => r.shuttle_id =~ /${shuttle:regex}/) |> group(columns: [\"shuttle_id\", \"_field\"])"
+          "datasource": {
+            "type": "influxdb",
+            "uid": "jetson-influx"
+          },
+          "query": "from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"stm_idle_wave\" and (r._field == \"ax_g\" or r._field == \"ay_g\" or r._field == \"az_g\")) |> filter(fn: (r) => r.shuttle_id =~ /${shuttle:regex}/) |> group(columns: [\"shuttle_id\", \"_field\"]) |> keep(columns: [\"_time\", \"_value\", \"shuttle_id\", \"_field\"])"
         }
       ],
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 37 },
-      "fieldConfig": { "defaults": { "unit": "accG", "custom": { "drawStyle": "line", "lineWidth": 1, "showPoints": "never", "spanNulls": true } } },
-      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } }
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 37
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "accG",
+          "custom": {
+            "drawStyle": "points",
+            "lineWidth": 0,
+            "showPoints": "always",
+            "spanNulls": false,
+            "pointSize": 3,
+            "fillOpacity": 0
+          },
+          "displayName": "S${__field.labels.shuttle_id} ${__field.labels._field}",
+          "color": {
+            "mode": "palette-classic"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
     },
     {
       "id": 124,
       "type": "timeseries",
       "title": "Idle Waveform \u2014 gyro (dps) by shuttle",
       "description": "Raw per-sample idle gyro signature (gx/gy/gz) from stm_idle_wave.",
-      "datasource": { "type": "influxdb", "uid": "jetson-influx" },
+      "datasource": {
+        "type": "influxdb",
+        "uid": "jetson-influx"
+      },
       "targets": [
         {
           "refId": "A",
-          "datasource": { "type": "influxdb", "uid": "jetson-influx" },
-          "query": "from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"stm_idle_wave\" and (r._field == \"gx_dps\" or r._field == \"gy_dps\" or r._field == \"gz_dps\")) |> filter(fn: (r) => r.shuttle_id =~ /${shuttle:regex}/) |> group(columns: [\"shuttle_id\", \"_field\"])"
+          "datasource": {
+            "type": "influxdb",
+            "uid": "jetson-influx"
+          },
+          "query": "from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"stm_idle_wave\" and (r._field == \"gx_dps\" or r._field == \"gy_dps\" or r._field == \"gz_dps\")) |> filter(fn: (r) => r.shuttle_id =~ /${shuttle:regex}/) |> group(columns: [\"shuttle_id\", \"_field\"]) |> keep(columns: [\"_time\", \"_value\", \"shuttle_id\", \"_field\"])"
         }
       ],
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 37 },
-      "fieldConfig": { "defaults": { "unit": "none", "custom": { "drawStyle": "line", "lineWidth": 1, "showPoints": "never", "spanNulls": true } } },
-      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } }
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 37
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": {
+            "drawStyle": "points",
+            "lineWidth": 0,
+            "showPoints": "always",
+            "spanNulls": false,
+            "pointSize": 3,
+            "fillOpacity": 0
+          },
+          "displayName": "S${__field.labels.shuttle_id} ${__field.labels._field}",
+          "color": {
+            "mode": "palette-classic"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 125,
+      "type": "timeseries",
+      "title": "Mission Waveform \u2014 accel (g) by shuttle",
+      "description": "Per-mission vibration envelope (decimated ~50 Hz peak-per-bin from the full 3332/416 Hz capture; full rate stays in Parquet).",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "jetson-influx"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "jetson-influx"
+          },
+          "query": "from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"stm_mission_wave\" and (r._field == \"ax_g\" or r._field == \"ay_g\" or r._field == \"az_g\")) |> filter(fn: (r) => r.shuttle_id =~ /${shuttle:regex}/) |> group(columns: [\"shuttle_id\", \"_field\"]) |> keep(columns: [\"_time\", \"_value\", \"shuttle_id\", \"_field\"])"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 45
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "accG",
+          "custom": {
+            "drawStyle": "points",
+            "lineWidth": 0,
+            "showPoints": "always",
+            "spanNulls": false,
+            "pointSize": 3,
+            "fillOpacity": 0
+          },
+          "displayName": "S${__field.labels.shuttle_id} ${__field.labels._field}",
+          "color": {
+            "mode": "palette-classic"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 126,
+      "type": "timeseries",
+      "title": "Mission Waveform \u2014 gyro (dps) by shuttle",
+      "description": "Per-mission vibration envelope (decimated ~50 Hz peak-per-bin from the full 3332/416 Hz capture; full rate stays in Parquet).",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "jetson-influx"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "jetson-influx"
+          },
+          "query": "from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"stm_mission_wave\" and (r._field == \"gx_dps\" or r._field == \"gy_dps\" or r._field == \"gz_dps\")) |> filter(fn: (r) => r.shuttle_id =~ /${shuttle:regex}/) |> group(columns: [\"shuttle_id\", \"_field\"]) |> keep(columns: [\"_time\", \"_value\", \"shuttle_id\", \"_field\"])"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 45
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": {
+            "drawStyle": "points",
+            "lineWidth": 0,
+            "showPoints": "always",
+            "spanNulls": false,
+            "pointSize": 3,
+            "fillOpacity": 0
+          },
+          "displayName": "S${__field.labels.shuttle_id} ${__field.labels._field}",
+          "color": {
+            "mode": "palette-classic"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
     },
     {
       "id": 130,
       "type": "row",
       "title": "\ud83c\udf21 Environment (STM32 on-board sensors)",
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 45 }
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 53
+      }
     },
     {
       "id": 131,
       "type": "timeseries",
       "title": "Temperature (\u00b0C) \u2014 per shuttle",
-      "datasource": { "type": "influxdb", "uid": "jetson-influx" },
+      "datasource": {
+        "type": "influxdb",
+        "uid": "jetson-influx"
+      },
       "targets": [
         {
           "refId": "A",
-          "datasource": { "type": "influxdb", "uid": "jetson-influx" },
-          "query": "from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"stm_mission\" and r._field == \"temp_c\" and r.source == \"drain\") |> filter(fn: (r) => r.shuttle_id =~ /${shuttle:regex}/ and r.kind =~ /${kind:regex}/) |> group(columns: [\"shuttle_id\"])"
+          "datasource": {
+            "type": "influxdb",
+            "uid": "jetson-influx"
+          },
+          "query": "from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"stm_mission\" and r._field == \"temp_c\" and r.source == \"drain\") |> filter(fn: (r) => r.shuttle_id =~ /${shuttle:regex}/ and r.kind =~ /${kind:regex}/) |> group(columns: [\"shuttle_id\"]) |> keep(columns: [\"_time\", \"_value\", \"shuttle_id\"])"
         }
       ],
-      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 46 },
-      "fieldConfig": { "defaults": { "unit": "celsius", "min": 15, "max": 50, "custom": { "lineWidth": 2, "fillOpacity": 10, "drawStyle": "line", "showPoints": "always", "pointSize": 6, "spanNulls": false } } },
-      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } }
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 54
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "celsius",
+          "min": 15,
+          "max": 50,
+          "custom": {
+            "lineWidth": 0,
+            "fillOpacity": 0,
+            "drawStyle": "points",
+            "showPoints": "always",
+            "pointSize": 7,
+            "spanNulls": false
+          },
+          "displayName": "S${__field.labels.shuttle_id} temp_c",
+          "color": {
+            "mode": "palette-classic"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
     },
     {
       "id": 132,
       "type": "timeseries",
       "title": "Pressure (hPa) \u2014 per shuttle",
-      "datasource": { "type": "influxdb", "uid": "jetson-influx" },
+      "datasource": {
+        "type": "influxdb",
+        "uid": "jetson-influx"
+      },
       "targets": [
         {
           "refId": "A",
-          "datasource": { "type": "influxdb", "uid": "jetson-influx" },
-          "query": "from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"stm_mission\" and r._field == \"pressure_hpa\" and r.source == \"drain\") |> filter(fn: (r) => r.shuttle_id =~ /${shuttle:regex}/ and r.kind =~ /${kind:regex}/) |> group(columns: [\"shuttle_id\"])"
+          "datasource": {
+            "type": "influxdb",
+            "uid": "jetson-influx"
+          },
+          "query": "from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"stm_mission\" and r._field == \"pressure_hpa\" and r.source == \"drain\") |> filter(fn: (r) => r.shuttle_id =~ /${shuttle:regex}/ and r.kind =~ /${kind:regex}/) |> group(columns: [\"shuttle_id\"]) |> keep(columns: [\"_time\", \"_value\", \"shuttle_id\"])"
         }
       ],
-      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 46 },
-      "fieldConfig": { "defaults": { "unit": "pressurehpa", "min": 970, "max": 1010, "custom": { "lineWidth": 2, "fillOpacity": 10, "drawStyle": "line", "showPoints": "always", "pointSize": 6, "spanNulls": false } } },
-      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } }
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 54
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "pressurehpa",
+          "min": 970,
+          "max": 1010,
+          "custom": {
+            "lineWidth": 0,
+            "fillOpacity": 0,
+            "drawStyle": "points",
+            "showPoints": "always",
+            "pointSize": 7,
+            "spanNulls": false
+          },
+          "displayName": "S${__field.labels.shuttle_id} pressure_hpa",
+          "color": {
+            "mode": "palette-classic"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
     },
     {
       "id": 140,
       "type": "row",
       "title": "\ud83d\udda5 Jetson Power \u2014 INA3221 via Alumet",
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 53 }
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 61
+      }
     },
     {
       "id": 141,
       "type": "timeseries",
       "title": "Board Input Power (W)",
       "description": "Power = input_current \u00d7 input_voltage, joined per time window.",
-      "datasource": { "type": "influxdb", "uid": "jetson-influx" },
+      "datasource": {
+        "type": "influxdb",
+        "uid": "jetson-influx"
+      },
       "targets": [
         {
           "refId": "A",
-          "datasource": { "type": "influxdb", "uid": "jetson-influx" },
-          "query": "cur = from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"input_current\" and r._field == \"value\") |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false) |> keep(columns: [\"_time\", \"_value\"]) |> rename(columns: {_value: \"i_ma\"}) volt = from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"input_voltage\" and r._field == \"value\") |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false) |> keep(columns: [\"_time\", \"_value\"]) |> rename(columns: {_value: \"u_mv\"}) join(tables: {c: cur, v: volt}, on: [\"_time\"]) |> map(fn: (r) => ({_time: r._time, _value: r.i_ma * r.u_mv / 1000000.0}))"
+          "datasource": {
+            "type": "influxdb",
+            "uid": "jetson-influx"
+          },
+          "query": "cur = from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"input_current\" and r._field == \"value\" and r.ina_channel_label == \"VDD_IN\") |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false) |> keep(columns: [\"_time\", \"_value\"]) |> rename(columns: {_value: \"i_ma\"}) volt = from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"input_voltage\" and r._field == \"value\" and r.ina_channel_label == \"VDD_IN\") |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false) |> keep(columns: [\"_time\", \"_value\"]) |> rename(columns: {_value: \"u_mv\"}) join(tables: {c: cur, v: volt}, on: [\"_time\"]) |> map(fn: (r) => ({_time: r._time, _value: r.i_ma * r.u_mv / 1000000.0}))"
         }
       ],
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 54 },
-      "fieldConfig": { "defaults": { "unit": "watt", "min": 0, "max": 25, "custom": { "lineWidth": 2, "fillOpacity": 20, "drawStyle": "line", "showPoints": "never", "spanNulls": false } } },
-      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single" } }
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 62
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "watt",
+          "min": 0,
+          "max": 25,
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 20,
+            "drawStyle": "line",
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "displayName": "VDD_IN board power",
+          "color": {
+            "mode": "palette-classic"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      }
     },
     {
       "id": 142,
       "type": "timeseries",
       "title": "Board Input Current (mA)",
-      "datasource": { "type": "influxdb", "uid": "jetson-influx" },
+      "datasource": {
+        "type": "influxdb",
+        "uid": "jetson-influx"
+      },
       "targets": [
         {
           "refId": "A",
-          "datasource": { "type": "influxdb", "uid": "jetson-influx" },
-          "query": "from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"input_current\" and r._field == \"value\") |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)"
+          "datasource": {
+            "type": "influxdb",
+            "uid": "jetson-influx"
+          },
+          "query": "from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"input_current\" and r._field == \"value\" and r.ina_channel_label == \"VDD_IN\") |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)"
         }
       ],
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 54 },
-      "fieldConfig": { "defaults": { "unit": "mamp", "min": 0, "custom": { "lineWidth": 2, "fillOpacity": 0, "drawStyle": "line", "showPoints": "never", "spanNulls": false } } },
-      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single" } }
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 62
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "mamp",
+          "min": 0,
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "drawStyle": "line",
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "displayName": "VDD_IN current",
+          "color": {
+            "mode": "palette-classic"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      }
     },
     {
       "id": 143,
       "type": "timeseries",
       "title": "Board Input Voltage (mV)",
-      "datasource": { "type": "influxdb", "uid": "jetson-influx" },
+      "datasource": {
+        "type": "influxdb",
+        "uid": "jetson-influx"
+      },
       "targets": [
         {
           "refId": "A",
-          "datasource": { "type": "influxdb", "uid": "jetson-influx" },
-          "query": "from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"input_voltage\" and r._field == \"value\") |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)"
+          "datasource": {
+            "type": "influxdb",
+            "uid": "jetson-influx"
+          },
+          "query": "from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"input_voltage\" and r._field == \"value\" and r.ina_channel_label == \"VDD_IN\") |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)"
         }
       ],
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 54 },
-      "fieldConfig": { "defaults": { "unit": "mvolt", "min": 4500, "max": 5500, "custom": { "lineWidth": 2, "fillOpacity": 0, "drawStyle": "line", "showPoints": "never", "spanNulls": false } } },
-      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single" } }
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 62
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "mvolt",
+          "min": 4500,
+          "max": 5500,
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "drawStyle": "line",
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "displayName": "VDD_IN voltage",
+          "color": {
+            "mode": "palette-classic"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      }
+    },
+    {
+      "id": 144,
+      "type": "timeseries",
+      "title": "Power by Rail (W)",
+      "description": "Per-rail power = current \u00d7 voltage for each INA3221 channel (VDD_IN = board total; VDD_SOC, VDD_CPU_GPU_CV, channel_4 are sub-rails). Joined per time window.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "jetson-influx"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "jetson-influx"
+          },
+          "query": "cur = from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"input_current\" and r._field == \"value\") |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false) |> keep(columns: [\"_time\", \"_value\", \"ina_channel_label\"]) |> rename(columns: {_value: \"i_ma\"}) volt = from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"input_voltage\" and r._field == \"value\") |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false) |> keep(columns: [\"_time\", \"_value\", \"ina_channel_label\"]) |> rename(columns: {_value: \"u_mv\"}) join(tables: {c: cur, v: volt}, on: [\"_time\", \"ina_channel_label\"]) |> map(fn: (r) => ({_time: r._time, ina_channel_label: r.ina_channel_label, _value: r.i_ma * r.u_mv / 1000000.0})) |> group(columns: [\"ina_channel_label\"])"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 16,
+        "x": 0,
+        "y": 70
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "watt",
+          "min": 0,
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "drawStyle": "line",
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "displayName": "${__field.labels.ina_channel_label}",
+          "color": {
+            "mode": "palette-classic"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 145,
+      "type": "stat",
+      "title": "Board Energy in View (J)",
+      "description": "VDD_IN board energy over the selected range = sum of 1 s-windowed board power (rectangle integral of real INA3221 samples, no modelling). 1 J = 1 W\u00b7s.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "jetson-influx"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "jetson-influx"
+          },
+          "query": "cur = from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"input_current\" and r._field == \"value\" and r.ina_channel_label == \"VDD_IN\") |> aggregateWindow(every: 1s, fn: mean, createEmpty: false) |> keep(columns: [\"_time\", \"_value\"]) |> rename(columns: {_value: \"i_ma\"}) volt = from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"input_voltage\" and r._field == \"value\" and r.ina_channel_label == \"VDD_IN\") |> aggregateWindow(every: 1s, fn: mean, createEmpty: false) |> keep(columns: [\"_time\", \"_value\"]) |> rename(columns: {_value: \"u_mv\"}) join(tables: {c: cur, v: volt}, on: [\"_time\"]) |> map(fn: (r) => ({_time: r._time, _value: r.i_ma * r.u_mv / 1000000.0})) |> sum()"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 70
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value",
+        "colorMode": "background",
+        "graphMode": "none"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "joule",
+          "decimals": 0,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "orange"
+          }
+        }
+      }
     },
     {
       "id": 146,
       "type": "table",
       "title": "Per-Drain Comms vs Storage Window (ms)",
-      "description": "recv_duration_ms = reception (comms) window; write_duration_ms = Parquet write (storage) window per drain. Integrate Board Input Power over each window for Joules; tools/energy_capture.py reports the exact per-drain J (real INA3221 samples, no modelling).",
-      "datasource": { "type": "influxdb", "uid": "jetson-influx" },
+      "description": "recv_duration_ms = reception (comms) window; write_duration_ms = Parquet write (storage) window per drain. Integrate Board Input Power (panel above) over each window for Joules; tools/energy_capture.py reports the exact per-drain J (real INA3221 samples, no modelling).",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "jetson-influx"
+      },
       "targets": [
         {
           "refId": "A",
-          "datasource": { "type": "influxdb", "uid": "jetson-influx" },
+          "datasource": {
+            "type": "influxdb",
+            "uid": "jetson-influx"
+          },
           "query": "from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"stm_mission\" and r.source == \"drain\") |> filter(fn: (r) => r.shuttle_id =~ /${shuttle:regex}/ and r.kind =~ /${kind:regex}/) |> pivot(rowKey: [\"_time\", \"shuttle_id\", \"kind\"], columnKey: [\"_field\"], valueColumn: \"_value\") |> keep(columns: [\"_time\", \"shuttle_id\", \"kind\", \"recv_duration_ms\", \"write_duration_ms\"]) |> sort(columns: [\"_time\"], desc: true) |> limit(n: 200)"
         }
       ],
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 62 },
-      "options": { "footer": { "show": false }, "sortBy": [] },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 78
+      },
+      "options": {
+        "footer": {
+          "show": false
+        },
+        "sortBy": []
+      },
       "fieldConfig": {
-        "defaults": { "unit": "ms" },
+        "defaults": {
+          "unit": "ms"
+        },
         "overrides": [
-          { "matcher": { "id": "byName", "options": "_time" }, "properties": [ { "id": "displayName", "value": "Time" }, { "id": "unit", "value": "time:YYYY-MM-DD HH:mm:ss" }, { "id": "custom.width", "value": 190 } ] },
-          { "matcher": { "id": "byName", "options": "shuttle_id" }, "properties": [ { "id": "displayName", "value": "Shuttle" }, { "id": "unit", "value": "none" } ] },
-          { "matcher": { "id": "byName", "options": "kind" }, "properties": [ { "id": "displayName", "value": "Kind" }, { "id": "unit", "value": "none" } ] },
-          { "matcher": { "id": "byName", "options": "recv_duration_ms" }, "properties": [ { "id": "displayName", "value": "Comms (recv)" }, { "id": "decimals", "value": 0 } ] },
-          { "matcher": { "id": "byName", "options": "write_duration_ms" }, "properties": [ { "id": "displayName", "value": "Storage (write)" }, { "id": "decimals", "value": 0 } ] }
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "_time"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Time"
+              },
+              {
+                "id": "unit",
+                "value": "time:YYYY-MM-DD HH:mm:ss"
+              },
+              {
+                "id": "custom.width",
+                "value": 190
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "shuttle_id"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Shuttle"
+              },
+              {
+                "id": "unit",
+                "value": "none"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "kind"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Kind"
+              },
+              {
+                "id": "unit",
+                "value": "none"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "recv_duration_ms"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Comms (recv)"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "write_duration_ms"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Storage (write)"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              }
+            ]
+          }
         ]
       }
     }
   ],
-  "time": { "from": "now-24h", "to": "now" },
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
   "timepicker": {}
 }
