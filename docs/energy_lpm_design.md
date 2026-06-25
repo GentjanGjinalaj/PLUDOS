@@ -1,9 +1,14 @@
 # Shuttle Low-Power Design — Idle Stop2 + ISM330 Wake-on-Motion
 
-**Status:** design spec only. Blocked on (a) a bench current measurement and (b) a
-CubeMX peripheral/clock change. No firmware is written yet. Closes the *design* half
-of DESIGN_COUNCIL item 1 (and the power half of item 6); the *measurement* and the
-*implementation* are follow-ups the project owner must unblock.
+**Status:** CubeMX change applied (C1–C3, confirmed in regenerated source) and the
+Stop2 + wake-on-motion firmware is **implemented** behind the `STOP2_IDLE_ENABLE`
+compile gate (`main.c`, `stm32u5xx_it.c`; see CHANGELOG "Phase 3"), and is safe to flash
+today: the device wakes every 14 s to kick the IWDG, so the `IWDG_STOP` option byte
+(Step C) is now only a power optimization, not a prerequisite. Remaining follow-ups:
+(a) a bench current measurement to quantify the saving, and (b) optionally Step C to let
+the wake period grow. B1 (free-running RTC time base) was found unnecessary — see §3
+note. Closes the *design* and *implementation* halves of DESIGN_COUNCIL item 1; the
+*measurement* remains a follow-up.
 
 This is the firmware counterpart to the gateway energy work (Alumet/INA3221 on the
 Jetson, ADR-011). The Jetson INA3221 measures the **gateway**; it says nothing about
@@ -74,8 +79,16 @@ Replace the busy-poll idle with a sleep that the IMU itself wakes from:
   change; if no suitable RTC clock is available, the snapshot cadence is the gating
   constraint on how deep idle sleep can go.
 - **On wake:** restore clocks (`SystemClock_Config` path), re-init only what Stop2
-  dropped, resume the FSM. The first post-wake samples must respect the existing
-  `ACCEL_SETTLE_MS` LPF2-settle guard.
+  dropped, resume the FSM. The accel ODR is left unchanged across sleep, so in the
+  implemented path the LPF2 does not reset and no `ACCEL_SETTLE_MS` blank is needed on
+  wake (the guard still applies on the ODR changes at snapshot entry/exit).
+
+> **B1 resolved — no free-running RTC time base needed.** The original concern was that
+> `HAL_GetTick` freezes in Stop2 and would corrupt capture timestamps. It does not: the
+> gateway reconstructs wall-clock from the *intra-capture* delta `tx_tick − t0_tick`, and
+> every capture runs fully awake (Stop2 only sleeps in the gap *between* captures, where
+> both ticks are re-stamped after wake). The RTC is therefore needed only as the
+> snapshot-cadence **wake source**, not as a clock.
 
 ### Energy intuition (qualitative — not a measured claim)
 
@@ -89,21 +102,63 @@ the §2 measurement must settle (this is the open question parked in DESIGN_COUN
 ## 4. Required CubeMX changes — OWNER ACTION (do not edit `.ioc` from code)
 
 Per the project hard rule, the following must be made in STM32CubeMX/CubeIDE by the
-owner, then regenerated; firmware logic resumes inside `USER CODE` guards afterward:
+owner, then regenerated; firmware logic resumes inside `USER CODE` guards afterward.
 
-1. **ISM330 INT1 pin → EXTI**, configured as a **Stop2 wake source** (rising edge).
-   Confirm which MCU pin the board routes ISM330 INT1 to (UM2839 schematic).
-2. **Low-power mode** entry/exit support for **Stop2** (PWR config); verify the clock
-   tree restores on exit.
-3. **RTC + RTC wake-up timer** for the 10-min snapshot cadence under Stop2 —
-   contingent on a usable RTC clock source (see no-crystal caveat above).
-4. Keep the existing **MXCHIP EXTI routing fix** (`stm32u5xx_it.c`) intact — adding
-   a second EXTI source must not disturb the WiFi SPI semaphore path.
+Pins/lines below are **confirmed from the current `PLUDOS_Edge_Node.ioc`**, not assumed:
+ISM330 INT1 is on **PE11** (`PE11.GPIO_Label=Mems.ISM330DLC_INT1`, currently
+`GPIO_Input`, `Locked=true`); the MXCHIP WiFi uses **EXTI14 (PD14)** and **EXTI15
+(PG15)**, so PE11→**EXTI11** does not collide. **LSE** is wired (PC14/PC15 =
+`LSE-External-Oscillator`) and **LSI** is enabled (32 kHz); **no RTC is configured yet**
+(0 references in the `.ioc`).
 
-Once (1)–(3) are regenerated, the sleep/wake state logic (Stop2 entry on confirmed
-idle, INT1/RTC wake handling, ISM330 wake-up register config) can be written in
-`USER CODE` in a follow-up — no further `.ioc` change needed for the register writes
-if the INT1 EXTI line is wired.
+### C1 — ISM330 INT1 (PE11) → EXTI11, rising edge
+
+1. Pinout: set **PE11** mode `GPIO_Input` → **`GPIO_EXTI11`** (keep the `Locked` pin and
+   the `Mems.ISM330DLC_INT1` label).
+2. System Core → GPIO → PE11: **External Interrupt Mode with Rising edge trigger**;
+   **Pull-down** (ISM330 INT1 is active-high push-pull → idles low, clean rising edge).
+3. System Core → NVIC: enable **`EXTI Line11 interrupt`** (`EXTI11_IRQn`), priority **5**
+   to match the MXCHIP EXTI14/15 lines. EXTI11 has its own IRQ on U5 → it does **not**
+   touch the WiFi SPI-semaphore path. Leave EXTI14/EXTI15 exactly as-is.
+
+EXTI lines 0–15 are valid Stop2 wake sources on STM32U5 — routing INT1→EXTI11 is enough,
+no extra "wake" checkbox.
+
+### C2 — Stop2 / PWR
+
+**No new `.ioc` change.** `MX_PWR_Init` is already in the init list, and Stop2 entry/exit
+is a runtime HAL call (`HAL_PWREx_EnterSTOP2Mode`) written in `USER CODE` — not a CubeMX
+checkbox. Just keep PWR enabled. Clock restore on wake = re-call the regenerated
+`SystemClock_Config()` in code.
+
+### C3 — RTC + wake-up timer (10-min snapshot cadence)
+
+**Clock-source decision: LSE (decided).** LSE is already enabled in the running firmware
+(PC14/PC15 = `LSE-External-Oscillator`) and the board boots past `SystemClock_Config`
+without hitting `Error_Handler`, so the crystal is present and locking. LSE gives an
+accurate time base while `HAL_GetTick` is frozen in Stop2 (solves blocker B1). After
+regeneration, confirm telemetry still streams (sanity that LSE still locks). LSI (32 kHz,
+±~5%) is the fallback only if LSE ever fails to lock.
+
+**Steps:**
+1. Timers → RTC → Mode: check **`Activate Clock Source`** + **`Activate Calendar`**.
+2. Clock Configuration tab: set **RTC/wakeup clock mux → LSE** (or LSI per the decision).
+3. RTC → NVIC Settings: enable **`RTC wake-up interrupt through EXTI line`** (`RTC_IRQn`),
+   priority 5. The wake-up *period* is **not** a CubeMX field — it is started in `USER
+   CODE` via `HAL_RTCEx_SetWakeUpTimer_IT(...)` for `CAP_IDLE_SNAP_PERIOD_MS`.
+
+### C4 — Keep the MXCHIP EXTI routing fix intact
+
+Adding EXTI11 must not disturb the `stm32u5xx_it.c::HAL_GPIO_EXTI_Rising_Callback` path
+for EXTI14/15 (WiFi SPI semaphore). Different IRQ lines, so safe — but re-check after
+regeneration.
+
+Once C1–C3 are regenerated, the sleep/wake state logic (Stop2 entry on confirmed idle,
+EXTI11/RTC wake handling, ISM330 wake-up register config — `INT1_CTRL`, `WAKE_UP_THS`,
+`WAKE_UP_DUR`, `MD1_CFG`, all pure I2C) is written in `USER CODE` in a follow-up — no
+further `.ioc` change needed if the INT1 EXTI line is wired. The ISM330 wake threshold is
+set below `MOVEMENT_THRESHOLD_G2` so the FSM still makes the authoritative IDLE→MOVING
+decision after wake.
 
 ---
 
@@ -112,9 +167,10 @@ if the INT1 EXTI line is wired.
 | Sub-task | Who | Blocker |
 |----------|-----|---------|
 | Idle-current baseline | owner (bench) | UM2839 IDD point / external ammeter |
-| Stop2 + INT1 EXTI + RTC wake config | owner (CubeMX) | `.ioc` regeneration |
-| Sleep/wake firmware logic | agent (follow-up) | depends on the CubeMX regen |
-| Idle snapshot rate decision (§4.4) | owner | depends on the measured number |
+| C1 PE11→EXTI11 + C3 RTC/wake config (RTC mux = **LSE**) | owner (CubeMX) | **DONE** — confirmed in `.ioc` + regenerated source |
+| `IWDG_STOP` option byte = Freeze in Stop (decision D2=a) | owner (CubeProgrammer) | **optional power win** — firmware wakes every 14 s to kick the dog, so safe without it; setting Freeze lets the wake period grow to ~10 min (Option Bytes → User Config → IWDG_STOP → Freeze) |
+| Sleep/wake firmware logic | agent | **DONE** — behind `STOP2_IDLE_ENABLE` (CHANGELOG Phase 3) |
+| Idle snapshot rate decision (§4.4) | owner | kept at 10 s / 10 min (D3); revisit after bench number |
 
 References: RM0456 (low-power modes, RTC), UM2839 (board schematic + current
 measurement), ISM330DHCX datasheet (wake-up/activity interrupt registers).

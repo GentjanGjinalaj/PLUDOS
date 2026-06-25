@@ -61,11 +61,19 @@ _WATCHDOG_PERIOD_S = 1.0
 
 # Idle-snapshot settling trim: the ISM330 LPF2 resets on ODR change, so the first
 # samples after the sensor is enabled clip at the ±2g rail before the filter settles.
-# At the idle 12.5 Hz ODR this lasts ~1 s (~12 samples); at the mission 3332 Hz ODR it
-# is gone by sample 0, so the trim is applied to IDLE snapshots ONLY — a mission's
-# onset transient is real signal we must keep. Drop this many ms off the head and shift
-# t0_wall forward by the same amount so timestamps stay honest. Set 0 to disable.
+# LPF2 resets on every CTRL1_XL ODR change, so the head of each capture carries
+# filter-settling samples (clip toward the rail / read ~0 g) that are not real signal.
+# Both trims drop this many ms off the stream head and shift t0_wall forward by the same
+# amount so timestamps stay honest. The drop is a sample count (trim_ms * odr / 1000),
+# so each stream is cropped by its own ODR — equal time, different sample counts.
+#
+# IDLE: 104->12.5 Hz settles slowly, ~1 s of garbage (~12 samples). Set 0 to disable.
 IDLE_TRIM_MS = float(os.getenv("IDLE_TRIM_MS", "1000"))
+# MOVING: 104->3332 Hz settles in well under a ms, but the ODR-switch / FIFO BYPASS->STREAM
+# toggle can still leave a few glitched words at the very head. A small head crop guarantees
+# a clean onset for the vibration stats / ML without losing meaningful motion (a mission runs
+# ~30 s, so dropping the first few tens of ms is negligible). Set 0 to disable.
+MOVING_TRIM_MS = float(os.getenv("MOVING_TRIM_MS", "30"))
 
 # Recently-finalised dedup window. Late duplicate packets of a just-finalised
 # drain arrive within ~seconds; a firmware reset re-using the same mission_id
@@ -418,17 +426,18 @@ def _mag_stats(samples: list[tuple[int, int, int]], unit_per_lsb: float) -> tupl
     return (float(np.sqrt((mag * mag).mean())), float(mag.max()))
 
 
-# Drop IDLE_TRIM_MS of LPF2 rail-clip settling off the head of an idle-snapshot stream.
-# Returns (trimmed_samples, dropped_n); never empties the stream. Applied once per drain
-# so Parquet, the InfluxDB summary, and the vibration stats all share the same trim.
-def _trim_idle_settling(
-    samples: list[tuple[int, int, int]], odr_hz: float
+# Drop trim_ms of LPF2 settling off the head of a stream (idle or moving). The drop is
+# converted to a sample count from this stream's own ODR. Returns (trimmed_samples,
+# dropped_n); never empties the stream. Applied once per drain so Parquet, the InfluxDB
+# summary, and the vibration stats all share the same trim.
+def _trim_settling(
+    samples: list[tuple[int, int, int]], odr_hz: float, trim_ms: float
 ) -> tuple[list[tuple[int, int, int]], int]:
-    if not samples or IDLE_TRIM_MS <= 0 or odr_hz <= 0:
+    if not samples or trim_ms <= 0 or odr_hz <= 0:
         return samples, 0
     step_ms = 1000.0 / odr_hz
-    trim_n = int(IDLE_TRIM_MS / step_ms)
-    # Never trim away the whole snapshot — keep at least one sample.
+    trim_n = int(trim_ms / step_ms)
+    # Never trim away the whole stream — keep at least one sample.
     trim_n = min(trim_n, max(0, len(samples) - 1))
     if trim_n <= 0:
         return samples, 0
@@ -449,17 +458,17 @@ def _finalise_mission(re: MissionReassembler, reason: str) -> None:
     # Anchor once; idempotent, so both parquet writers + the summary share one mission t0.
     t0_wall = re.t0_wall_ms()
 
-    # Idle-only settling trim, applied ONCE here so Parquet, the InfluxDB summary, and the
-    # vibration stats (_mag_stats below) all use identical trimmed samples and t0. MOVING
-    # missions keep their onset transient (real signal). Both idle axes run at
-    # IDLE_SNAP_ODR_HZ, so the accel/gyro trim counts match and the shared t0 advance is
-    # unambiguous and keeps the per-sample waveform's accel[i]/gyro[i] pairing aligned.
+    # Head settling trim, applied ONCE here so Parquet, the InfluxDB summary, and the
+    # vibration stats (_mag_stats below) all use identical trimmed samples and t0. Each
+    # stream is trimmed by its own ODR for the same time span, so t0 advances unambiguously.
+    # Idle uses the long IDLE_TRIM_MS (~1 s of slow 12.5 Hz settle); moving uses the short
+    # MOVING_TRIM_MS to drop the ODR-switch glitch at the onset while keeping the run.
     accel_trim = gyro_trim = 0
-    if re.is_idle_snapshot:
-        accel, accel_trim = _trim_idle_settling(accel, re.odr_accel_hz)
-        gyro,  gyro_trim  = _trim_idle_settling(gyro,  re.odr_gyro_hz)
-        if accel_trim > 0 and re.odr_accel_hz > 0:
-            t0_wall += int(round(accel_trim * 1000.0 / re.odr_accel_hz))
+    trim_ms = IDLE_TRIM_MS if re.is_idle_snapshot else MOVING_TRIM_MS
+    accel, accel_trim = _trim_settling(accel, re.odr_accel_hz, trim_ms)
+    gyro,  gyro_trim  = _trim_settling(gyro,  re.odr_gyro_hz, trim_ms)
+    if accel_trim > 0 and re.odr_accel_hz > 0:
+        t0_wall += int(round(accel_trim * 1000.0 / re.odr_accel_hz))
 
     paths = []
     # Storage write-window: bracket the sync Parquet writes so INA3221 board power can be

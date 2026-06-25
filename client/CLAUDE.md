@@ -108,11 +108,14 @@ files. Key behaviours:
   `BEGIN_arrival - capture_age`. The old per-shuttle NTP-offset / boot-anchor
   machinery was removed — volatile PSRAM means both ticks are same-boot, so
   there is no reboot ambiguity.
-- **IDLE-only settling trim** (`IDLE_TRIM_MS`, default 1000): the ISM330 LPF2
-  resets on ODR change, so the first ~1 s of an idle snapshot clips at the
-  ±2 g rail; those samples are dropped off the head and `t0` advanced to keep
-  timestamps honest. MOVING streams are *not* trimmed — their onset transient
-  is real signal.
+- **Head settling trim** (`IDLE_TRIM_MS`, default 1000; `MOVING_TRIM_MS`,
+  default 30): the ISM330 LPF2 resets on every ODR change, so the first samples
+  of a capture are filter-settling garbage (an idle snapshot clips at the ±2 g
+  rail for ~1 s). The trim is sample-based (`trim_ms * odr / 1000`): idle
+  snapshots drop ~1 s off the head, MOVING captures drop a short ~30 ms onset
+  transient (settling at 3332 Hz accel is sub-ms, so the crop is small and the
+  real motion onset is preserved). In both cases the dropped head advances `t0`
+  so timestamps stay honest. Set `MOVING_TRIM_MS=0` to disable the moving trim.
 - **`[STORAGE]` write log:** each drain Parquet write logs filename,
   shuttle/mission tag, sample count (and any settling-trim count), and file
   size — a separate write from the `[INFLUXDB]` summary line, so both are

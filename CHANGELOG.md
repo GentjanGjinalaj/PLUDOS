@@ -6,6 +6,147 @@ order. Each entry maps to one or more ADRs or resolved backlog items
 
 ---
 
+## [Unreleased] — Phase 3: Stop2 Idle Sleep + ISM330 Wake-on-Motion (firmware)
+
+**Goal:** Replace the full-clock busy-poll idle (O3) with Stop2 deep sleep between idle
+snapshots, woken by the ISM330 itself on motion (INT1→PE11/EXTI11) or by an RTC wake-up
+timer at the snapshot cadence. STM32 firmware only — written entirely inside `USER CODE`
+guards on top of the owner's CubeMX change (PE11→EXTI11 rising, RTC on LSE + wake-up timer,
+NVIC; see `docs/energy_lpm_design.md` C1–C3, all confirmed in the regenerated source).
+Behind a compile gate (`STOP2_IDLE_ENABLE`) so the busy-idle baseline is one `#undef` away.
+No wire-format, FL, or gateway change. **No measured energy claim** — the shuttle is not
+power-instrumented; this lands the mechanism, the saving is `unknown` until the bench
+measurement (`energy_lpm_design.md` §2).
+
+### Added
+- **Stop2 idle sleep (`main.c`, PHASE 6).** When IDLE with nothing in flight (no active
+  snapshot, no pending safety-flush drain, radio already off per ADR-021), the superloop
+  enters `HAL_PWREx_EnterSTOP2Mode` instead of `WIFI_DelayWithYield`. On wake it rebuilds
+  the 160 MHz tree (`SystemClock_Config`), resumes SysTick, and logs the wake cause
+  (`[LPM] Stop2 wake (motion|rtc-snapshot)`). Accel ODR is untouched across sleep, so no
+  `ACCEL_SETTLE_MS` blank is needed on wake.
+- **ISM330 wake-on-motion (`main.c`, `ISM330_ArmWakeOnMotion`).** Arms `WAKE_UP_THS`/
+  `WAKE_UP_DUR`/`MD1_CFG`(INT1_WU)/`TAP_CFG2`(INTERRUPTS_ENABLE) over I2C once at boot.
+  Threshold `WK_THS=1 LSB` (~31 mg at ±2 g) — most sensitive step at this FS, at/just-below
+  the FSM's ~30 mg motion floor so the IMU never sleeps through motion the FSM would call
+  MOVING. Wake only opens the eyes; the 500 ms-dwell FSM still makes the authoritative
+  IDLE→MOVING call. Threshold tunable on bench.
+- **RTC snapshot-cadence wake (`main.c`, `RTC_ArmSnapshotWake`).** `MX_RTC_Init` leaves the
+  wake-up timer at ~2048 Hz (period 0, RTCCLK/16); re-armed at boot to `CK_SPRE_16BITS`
+  (1 Hz) with a **14 s** period (`STOP2_WAKE_PERIOD_S`) — deliberately below the ~16.4 s IWDG
+  window so every wake returns to the superloop and kicks the dog (see B2 note). The 10-min
+  snapshot cadence is counted in wakes (`STOP2_WAKES_PER_SNAP` ≈ 42), since `HAL_GetTick` is
+  frozen across Stop2. The `HAL_RTCEx_WakeUpTimerEventCallback` increments `g_rtc_wake_count`;
+  PHASE 2c fires the snapshot when the count reaches the cadence.
+- **EXTI11 motion routing (`stm32u5xx_it.c`).** `HAL_GPIO_EXTI_Rising_Callback` adds a
+  `GPIO_PIN_11` case that sets `g_motion_wake`. Separate IRQ line from the MXCHIP WiFi SPI
+  semaphores (EXTI14/15) — the WiFi path is untouched.
+
+### Fixed
+- **Stop2 must not sleep mid-dwell (bench-found).** First flash showed the shuttle waking on
+  motion (`[LPM] Stop2 wake (motion)`) and starting the IDLE→MOVING dwell, but never promoting
+  to MOVING — it re-entered Stop2 between FSM samples, and the 500 ms dwell is timed in
+  `HAL_GetTick`, which freezes in Stop2, so the timer never accumulated. The Stop2 gate now also
+  requires `continuous_movement_start_tick == 0` (no dwell in progress); while a dwell is active
+  the loop stays awake and polls at the idle rate so `HAL_GetTick` advances and the dwell
+  completes (or resets after debounce).
+- **Stop2 must not sleep during the LPF2 filter-settle window (bench-found).** After an idle
+  snapshot, `Capture_EnterIdle()` restores the 104 Hz ODR and arms the `fsm_settle_until_tick`
+  guard (`ACCEL_SETTLE_MS` = 1000 ms), during which the FSM skips ALL motion evaluation. The
+  device slept inside that window, and because the guard is `HAL_GetTick`-timed and the tick
+  freezes in Stop2, the settle window never expired — leaving the FSM permanently "settling"
+  and deaf to motion (the shuttle could no longer be promoted to MOVING after the first idle
+  snapshot). The Stop2 gate now also requires the settle window to be already expired
+  (`(int32_t)(HAL_GetTick() - fsm_settle_until_tick) >= 0`); once expired before sleep it stays
+  expired across Stop2, since the frozen tick keeps the signed diff ≥ 0.
+- **Heap raised to 16 KB so the WiFi drain can't IWDG-reset after a Stop2 idle period
+  (bench-found, A/B-confirmed).** With Stop2 enabled, the post-mission drain hung in the MXCHIP
+  SPI BSP and the IWDG rebooted before any `[NETWORK]` log — the mission survived in PSRAM but
+  never shipped. Root cause: the BSP allocates 2.5 KB net buffers with `malloc`
+  (`MX_WIFI_BUFFER_SIZE` = 2500, `MX_WIFI_MALLOC` = newlib `malloc`) from the linker heap, which
+  was only 4 KB (`_Min_Heap_Size = 0x1000`) and is shared with `printf`. Two 2.5 KB buffers
+  cannot coexist in 4 KB, so when a buffer from the pre-Stop2 path is still held at drain time,
+  the bring-up's allocation returns `NULL` and `process_txrx_poll` spins forever in its only
+  no-timeout path (`while (netb == NULL)`, `mx_wifi_spi.c`), never kicking the watchdog →
+  ~16.4 s → reset. A/B test (compiling out `STOP2_IDLE_ENABLE`) confirmed the dependence: the
+  drain succeeded every time with the busy-poll idle. Fix: `_Min_Heap_Size` 0x1000 → 0x4000 in
+  `STM32U585AIIXQ_FLASH.ld` (786 KB SRAM total, so 12 KB extra is negligible) so the bring-up's
+  buffer always fits alongside any held buffer and `printf`. This is a pre-existing heap
+  fragility that Stop2 exposed, not a defect in the Stop2 logic itself. A follow-up could route
+  `MX_WIFI_MALLOC` to a static pool to drop the heap dependence entirely (project "no malloc"
+  rule), but the heap bump is the minimal, low-risk cure.
+
+### Notes
+- **B1 dropped — RTC time base NOT needed.** The gateway reconstructs capture wall-clock from
+  the intra-capture delta `tx_tick − t0_tick`, and every capture (MOVING mission or 10 s idle
+  snapshot) runs fully awake; Stop2 sleeps only in the gap *between* captures, where both
+  ticks are re-stamped after wake. So `HAL_GetTick` freezing in Stop2 never corrupts a
+  timestamp — the RTC is needed only as the wake source, not as a clock.
+- **Step C (B2) is now a power optimization, not a correctness gate.** The hand-rolled IWDG
+  (~16.4 s, LSI) keeps counting in Stop2 unless the `IWDG_STOP` option byte is set to *Freeze*
+  in STM32CubeProgrammer (Option Bytes → User Configuration → IWDG_STOP → Freeze). The firmware
+  no longer depends on it: the 14 s `STOP2_WAKE_PERIOD_S` wakes the M33 before the dog expires
+  and kicks it, so the device is safe to flash and sleep **today, without the option byte**.
+  Setting it later lets `STOP2_WAKE_PERIOD_S` be raised toward 600 s so the MCU wakes ~42× less
+  often (a power win to confirm on the bench, not a claim).
+- Build verified syntax-only on the CLI toolchain; full link runs in STM32CubeIDE (same
+  makefile caveat as below).
+
+---
+
+## [Unreleased] — FSM Audit: Settling-Trim + Capture/FSM Robustness
+
+**Goal:** Firmware FSM audit follow-up. Improve captured-data quality by cropping
+filter-settling samples off the head of every drain, and close three correctness
+gaps found in the idle/moving FSM and the PSRAM capture path. STM32 + Jetson only —
+no wire-format change, no FL/server change, no CubeMX (`.ioc`) change. Phases map to
+the audit plan: Phase 0 = gateway crop, Phase 1 = FSM/capture fixes, Phase 2 = FSM
+liveness. Phase 3 (Stop2 low-power + non-blocking drain) is deferred and unblocked
+only by an owner CubeMX change (see `docs/energy_lpm_design.md`).
+
+### Added
+- **MOVING head settling-trim on the gateway (Phase 0a, `drain_receiver.py`).** The
+  ISM330 LPF2 resets on every ODR change, so the first samples of a capture are
+  settling garbage. The existing idle-snapshot trim was generalized: `_trim_idle_settling`
+  → `_trim_settling(samples, odr_hz, trim_ms)`, and a new `MOVING_TRIM_MS` (default
+  30 ms, env-overridable; `0` disables) now crops the MOVING onset transient too.
+  Trim is sample-based (`trim_ms * odr / 1000`); the dropped head advances `t0` so
+  timestamps stay honest. Idle stays at `IDLE_TRIM_MS` (1000 ms). Doc synced
+  (`client/CLAUDE.md`).
+
+### Fixed
+- **F3 — wrap-safe filter-settle compare (`main.c`).** `HAL_GetTick() < fsm_settle_until_tick`
+  → signed `(int32_t)(HAL_GetTick() - fsm_settle_until_tick) < 0`, correct across the
+  49.7-day `HAL_GetTick` rollover (matches the watermark back-off pattern).
+- **O1 — PSRAM ring overwrite guard (`main.c`, `Capture_Service`).** New
+  `CAP_RING_FULL_BYTES` (~97% of usable PSRAM) guard at the top of the burst loop: when
+  the un-drained backlog nears the ring size, stop pulling new FIFO words (newest samples
+  lost in hardware) so a ring wrap can no longer clobber still-un-drained missions —
+  oldest data preserved. One-shot `[CAPTURE] ring near-full` warning; reset when the
+  watermark clears. Only reachable after a long gateway outage.
+- **O4 — gyro read skipped in IDLE (`main.c`).** The OUTX_L_G I2C read now runs only in
+  `STATE_MOVING`. The FSM uses accel alone, the live stream is off in IDLE, and idle
+  snapshots pull gyro from the FIFO — so polling gyro in IDLE was pure I2C traffic. In
+  IDLE `gyro_*` keep their last value (used only in cosmetic heartbeat logs).
+- **F1 — FSM liveness on accel I2C failure (Phase 2, `main.c`).** The MOVING→IDLE timeout
+  lived inside the `HAL_I2C_Mem_Read == HAL_OK` branch, so a persistent accel I2C fault
+  while MOVING froze the FSM in MOVING forever — the mission never sealed or drained and
+  the PSRAM ring kept filling. The timeout now also evaluates in the read-failure branch
+  (same 20 s `NO_MOVEMENT_TIMEOUT_MS`, wrap-safe), sealing and draining the stalled mission.
+
+### Notes
+- Build verified syntax-only on the CLI toolchain (`arm-none-eabi-gcc 13.2.1`); the full
+  link must run in STM32CubeIDE — the `Debug/` makefile carries machine-specific absolute
+  include paths and a CubeIDE-only `-fcyclomatic-complexity` flag, and its default `make`
+  goal is `clean` (CLI must call `make all`).
+- Deferred to Phase 3 (need owner CubeMX change first): F2 (motion onset lost during the
+  blocking drain; needs non-blocking/interleaved drain) and O3 (full-clock I2C busy-poll
+  in IDLE; resolved by Stop2 + ISM330 INT1 wake-on-motion). Blockers B1 (free-running RTC
+  time base — `HAL_GetTick` freezes in Stop2), B2 (IWDG behaviour in Stop2), B3 (clock/
+  sensor restore on wake) tracked in `docs/energy_lpm_design.md`.
+
+---
+
 ## [Unreleased] — DrainBegin v2 Wire Bump + Drain Energy/Provenance
 
 **Goal:** Coordinated drain-protocol generation bump so each `DrainBegin` carries

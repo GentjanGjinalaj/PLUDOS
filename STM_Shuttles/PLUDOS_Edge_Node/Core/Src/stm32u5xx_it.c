@@ -58,17 +58,26 @@
    (see docs/WIFI_FIX_AND_BUILD.md). */
 extern void mxchip_WIFI_ISR(uint16_t isr_source);
 
+/* ISM330 INT1 wake-on-motion flag, owned by main.c (Stop2 idle path). */
+extern volatile uint8_t g_motion_wake;
+
 void HAL_GPIO_EXTI_Rising_Callback(uint16_t GPIO_Pin)
 {
   if ((GPIO_Pin == WRLS_NOTIFY_Pin) || (GPIO_Pin == WRLS_FLOW_Pin))
   {
     mxchip_WIFI_ISR(GPIO_Pin);
   }
+  /* ISM330 INT1 on PE11/EXTI11 — wake-on-motion. Flag only; being awake lets the FSM
+   * re-evaluate. Separate from the WiFi SPI-semaphore path above (different line). */
+  else if (GPIO_Pin == GPIO_PIN_11)
+  {
+    g_motion_wake = 1U;
+  }
 }
 /* USER CODE END 0 */
 
 /* External variables --------------------------------------------------------*/
-
+extern RTC_HandleTypeDef hrtc;
 /* USER CODE BEGIN EV */
 
 /* USER CODE END EV */
@@ -210,6 +219,34 @@ void SysTick_Handler(void)
 /* For the available peripheral interrupt handler names,                      */
 /* please refer to the startup file (startup_stm32u5xx.s).                    */
 /******************************************************************************/
+
+/**
+  * @brief This function handles RTC non-secure interrupt.
+  */
+void RTC_IRQHandler(void)
+{
+  /* USER CODE BEGIN RTC_IRQn 0 */
+
+  /* USER CODE END RTC_IRQn 0 */
+  HAL_RTCEx_WakeUpTimerIRQHandler(&hrtc);
+  /* USER CODE BEGIN RTC_IRQn 1 */
+
+  /* USER CODE END RTC_IRQn 1 */
+}
+
+/**
+  * @brief This function handles EXTI Line11 interrupt.
+  */
+void EXTI11_IRQHandler(void)
+{
+  /* USER CODE BEGIN EXTI11_IRQn 0 */
+
+  /* USER CODE END EXTI11_IRQn 0 */
+  HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_11);
+  /* USER CODE BEGIN EXTI11_IRQn 1 */
+
+  /* USER CODE END EXTI11_IRQn 1 */
+}
 
 /**
   * @brief This function handles EXTI Line14 interrupt.

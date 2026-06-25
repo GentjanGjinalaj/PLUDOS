@@ -98,6 +98,8 @@ I2C_HandleTypeDef hi2c2;
 OSPI_HandleTypeDef hospi1;
 OSPI_HandleTypeDef hospi2;
 
+RTC_HandleTypeDef hrtc;
+
 SPI_HandleTypeDef hspi2;
 
 UART_HandleTypeDef huart4;
@@ -117,6 +119,11 @@ static uint32_t last_movement_tick = 0U;        /* tick of the most recent above
 static uint32_t last_above_threshold_tick = 0U; /* same value, separate name for debounce clarity */
 static uint32_t continuous_movement_start_tick = 0U; /* tick when the current dwell began */
 static uint32_t fsm_settle_until_tick = 0U; /* suppress motion trigger until this tick: OUTX is filter-settling after a CTRL1_XL ODR change */
+
+/* Stop2 wake flags — set in ISR context, consumed in the superloop. Global (not static) so
+ * the EXTI11 callback in stm32u5xx_it.c can set g_motion_wake. */
+volatile uint8_t  g_motion_wake    = 0U;  /* ISM330 INT1 (EXTI11) fired — shuttle moved while asleep */
+volatile uint16_t g_rtc_wake_count = 0U;  /* RTC wake ticks since the last idle snapshot (cadence)   */
 
 /* TEMP calibration flag (item K): 1 = stream |mag²-1g²| each IDLE cycle over UART
    for rest-floor capture; 0 = normal operation. Leave at 0 in shipped builds. */
@@ -269,6 +276,43 @@ static uint32_t tx_window_start_tick = 0U;
 #define LIVE_CTRL8_XL         0x20U   /* LPF2 cutoff ODR/10 ≈ 10.4 Hz */
 #define LIVE_CTRL2_G          0x40U   /* gyro 104Hz, ±250 dps */
 
+/* --- ADR (energy_lpm_design.md): Stop2 idle sleep + ISM330 wake-on-motion ---------------
+ * Compile gate so the deep-sleep path is reversible: undefine to fall back to the
+ * busy-idle WIFI_DelayWithYield loop (today's behaviour) for an A/B flash.
+ * NOTE: with this enabled the device sleeps in Stop2 between idle snapshots; the IWDG
+ * keeps counting in Stop unless the FZ_IWDG_STOP option byte is programmed to freeze
+ * (Step C, RM0456). Until then keep sleeps short — the RTC wake fires every 10 min, but a
+ * motion-quiet 10 min sleep would IWDG-reset at ~16 s without the option byte. */
+#define STOP2_IDLE_ENABLE
+
+/* RTC wake cadence while asleep. Kept BELOW the ~16.4 s IWDG period so each wake returns to
+ * the superloop and kicks the dog — the device is safe to sleep even before the IWDG_STOP
+ * option byte is set (Step C). The 10-min snapshot cadence is then counted in wakes, not in
+ * frozen HAL_GetTick. After Step C freezes the IWDG in Stop, this may be raised toward
+ * CAP_IDLE_SNAP_PERIOD_MS/1000 to wake (and burn) far less often. */
+#define STOP2_WAKE_PERIOD_S   14U
+/* Wakes per idle snapshot = snapshot period / wake period (≥1). At 14 s wake / 10 min snap ≈ 42. */
+#define STOP2_WAKES_PER_SNAP  (((CAP_IDLE_SNAP_PERIOD_MS / 1000U) / STOP2_WAKE_PERIOD_S) > 0U \
+                               ? ((CAP_IDLE_SNAP_PERIOD_MS / 1000U) / STOP2_WAKE_PERIOD_S) : 1U)
+
+/* ISM330DHCX wake-on-motion (datasheet register map). The IMU samples accel autonomously
+ * off its own rail while the MCU sleeps; on motion it pulses INT1 → PE11 → EXTI11, waking
+ * Stop2. Plain I2C register writes, no HAL sensor driver. */
+#define ISM330_TAP_CFG2     0x58U  /* bit7 INTERRUPTS_ENABLE — global enable for embedded funcs */
+#define ISM330_WAKE_UP_THS  0x5BU  /* bits5:0 WK_THS, LSB = FS_XL/2^6 (= 31.25 mg at ±2g)      */
+#define ISM330_WAKE_UP_DUR  0x5CU  /* bits6:5 WAKE_DUR — over-threshold events before wake      */
+#define ISM330_MD1_CFG      0x5EU  /* bit5 INT1_WU — route the wake-up interrupt to INT1        */
+#define ISM330_WAKE_UP_SRC  0x1BU  /* read to clear the wake-up event after a motion wake       */
+
+/* WK_THS = 1 LSB ≈ 31 mg at FS=±2g — the most sensitive step the part offers at this FS,
+ * sat at/just-below the FSM's ~30 mg linear motion floor (MOVEMENT_THRESHOLD_G2 = 0.06 g²)
+ * so the IMU never sleeps through motion the FSM would call MOVING. The wake only opens the
+ * eyes; the 500 ms-dwell FSM still makes the authoritative IDLE→MOVING decision. TUNE on bench. */
+#define ISM330_WK_THS_VAL   0x01U
+#define ISM330_WK_DUR_VAL   0x00U   /* wake on the first over-threshold sample (no debounce) */
+#define ISM330_MD1_INT1_WU  0x20U   /* MD1_CFG: route wake-up to INT1                        */
+#define ISM330_INT_EN       0x80U   /* TAP_CFG2: INTERRUPTS_ENABLE                           */
+
 #define CAP_FIFO_WORD_BYTES   7U      /* 1 tag byte + 6 data bytes per FIFO word */
 #define CAP_FIFO_READ_WORDS   96U     /* max words per Service burst (~672 B ≈ 15 ms I²C @400 kHz) */
 #define CAP_MAX_BURSTS_PER_SVC 12U    /* 12×96=1152 > 1023 FIFO depth — drains full snapshot per call */
@@ -278,6 +322,7 @@ static uint32_t tx_window_start_tick = 0U;
                                        * many captures survive a long radio-dark idle (most-recent-N kept).
                                        * 256 × sizeof(CaptureMission_t) ≈ 8 KB SRAM. */
 #define CAP_RING_WTM_BYTES    (PSRAM_USABLE_BYTES - (PSRAM_USABLE_BYTES / 4U)) /* 75% of usable ring = drain trigger */
+#define CAP_RING_FULL_BYTES   (PSRAM_USABLE_BYTES - (PSRAM_USABLE_BYTES / 32U)) /* ~97% = overwrite guard: stop appending past here so the wrap can't clobber still-un-drained data (O1) */
 #define CAP_WTM_COOLDOWN_MS   600000U /* 10 min back-off after a failed watermark safety-flush drain (gateway down) — stops the radio spinning at max duty overnight (opposite of ADR-021 intent) */
 
 /* Per-mission bookkeeping; the sample bytes themselves live in the PSRAM ring. */
@@ -332,6 +377,7 @@ static uint32_t cap_ring_wptr     = 0U;  /* next PSRAM write offset [0, PSRAM_US
 static uint16_t cap_next_id       = 1U;
 static uint8_t  cap_initialized   = 0U;
 static uint8_t  cap_wtm_hit       = 0U;  /* set when total un-drained bytes cross 75% (safety-flush trigger) */
+static uint8_t  cap_ring_full_warned = 0U; /* one-shot UART warn latch for the ~97% overwrite guard (O1) */
 static uint32_t cap_undrained_bytes = 0U; /* cross-mission accumulator: bytes captured but not yet drained */
 static uint8_t  cap_snapshot_active    = 0U;  /* 1 while an idle snapshot is capturing */
 static uint32_t cap_last_snapshot_tick = 0U;  /* HAL_GetTick() of the last snapshot start */
@@ -414,7 +460,13 @@ static void MX_UART4_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_UCPD1_Init(void);
 static void MX_USB_OTG_FS_PCD_Init(void);
+static void MX_RTC_Init(void);
 /* USER CODE BEGIN PFP */
+#ifdef STOP2_IDLE_ENABLE
+static void ISM330_ArmWakeOnMotion(void);
+static void RTC_ArmSnapshotWake(void);
+static void Enter_Stop2_Idle(void);
+#endif
 static void WIFI_SPI_ApplySafeTiming(void);
 static void WIFI_StatusCallback(uint8_t cate, uint8_t event, void *arg);
 static uint8_t WIFI_IsIPv4Valid(const uint8_t ip_addr[4]);
@@ -1222,6 +1274,23 @@ static uint16_t Capture_Service(void)
 
   for (burst = 0U; burst < CAP_MAX_BURSTS_PER_SVC; burst++)
   {
+    /* Overwrite guard (O1): when the un-drained backlog has nearly filled the ring, stop
+     * pulling new words. The FIFO then overruns in hardware (newest samples lost), but the
+     * PSRAM wrap can no longer clobber still-un-drained missions — oldest data is preserved.
+     * Only reachable after a long gateway outage; the 75% watermark flush normally relieves
+     * pressure long before this. */
+    if (cap_undrained_bytes >= CAP_RING_FULL_BYTES)
+    {
+      if (cap_ring_full_warned == 0U)
+      {
+        cap_ring_full_warned = 1U;
+        sprintf(uart_buf, "[CAPTURE] ring near-full (%luB un-drained) — dropping new words to protect backlog\r\n",
+                (unsigned long)cap_undrained_bytes);
+        HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+      }
+      break;
+    }
+
     if (HAL_I2C_Mem_Read(&hi2c2, ISM330_ADDR, ISM330_FIFO_STATUS1, 1, &s1, 1, 100) != HAL_OK)
     {
       break;
@@ -1256,10 +1325,10 @@ static uint16_t Capture_Service(void)
      * Tags are preserved so the gateway demuxes accel (0x02) vs gyro (0x01) and rebuilds
      * each stream's timeline as t0 + index/ODR (sampling_strategy.md §12). */
     bytes = (uint32_t)n * CAP_FIFO_WORD_BYTES;
-    /* DEFER (known limitation): cap_ring_wptr wraps with no live-mission collision check
-     * and m->byte_count is uncapped, so a wrap during repeated drain failures can overwrite
-     * still-undrained data. Unreachable in normal ops (missions ~1.3 MB << 8 MB ring); only
-     * bites after many consecutive failed drains. Not fixed here — tracked separately. */
+    /* cap_ring_wptr wraps at the 8 MB boundary with no live-mission collision check, so a
+     * wrap during repeated drain failures could overwrite still-un-drained data. The
+     * CAP_RING_FULL_BYTES guard at the top of this loop stops appending before the backlog
+     * can reach that point, so by here the write is safe. */
     for (i = 0U; i < bytes; i++)
     {
       ring[cap_ring_wptr] = cap_fifo_buf[i];
@@ -1641,6 +1710,7 @@ static void Drain_Mission(int16_t idx)
   if (cap_undrained_bytes < CAP_RING_WTM_BYTES)
   {
     cap_wtm_hit = 0U;
+    cap_ring_full_warned = 0U;  /* backlog relieved — re-arm the overwrite-guard warning */
   }
 
   /* Persist the drained flag so a reset later in this batch doesn't re-send an
@@ -1829,6 +1899,7 @@ int main(void)
   MX_USART1_UART_Init();
   MX_UCPD1_Init();
   MX_USB_OTG_FS_PCD_Init();
+  MX_RTC_Init();
   /* USER CODE BEGIN 2 */
 
   // -----------------------------------------------------------------
@@ -2039,6 +2110,16 @@ int main(void)
    * hang in the on-demand drain re-init (the observed field failure) stops the kicks
    * and the chip self-resets into a clean boot instead of freezing. */
   IWDG_Arm();
+
+#ifdef STOP2_IDLE_ENABLE
+  /* Arm wake-on-motion + re-arm the RTC wake timer to the 10-min snapshot cadence (MX_RTC_Init
+   * left it at ~2048 Hz). Clear any stale wake flag the 2048 Hz window may have raised before
+   * the re-arm. From here the idle path can drop into Stop2 and wake on motion or cadence. */
+  ISM330_ArmWakeOnMotion();
+  RTC_ArmSnapshotWake();
+  g_rtc_wake_count = 0U;
+  g_motion_wake    = 0U;
+#endif
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -2087,7 +2168,12 @@ int main(void)
         vib_y = (raw_y * 0.061f) / 1000.0f;
         vib_z = (raw_z * 0.061f) / 1000.0f;
 
-        /* Gyro: same ISM330 chip, OUTX_L_G registers, identical 6-byte little-endian layout. */
+        /* Gyro OUTX read only while MOVING (O4): the FSM uses accel alone, the live stream
+         * is off in IDLE, and the high-rate capture pulls gyro from the FIFO — so polling
+         * gyro here in IDLE is pure I2C traffic. In IDLE gyro_* keep their last value (used
+         * only in cosmetic heartbeat logs). Gyro: same chip, OUTX_L_G, 6-byte little-endian. */
+        if (current_state == STATE_MOVING)
+        {
         uint8_t raw_g[6] = {0};
         if (HAL_I2C_Mem_Read(&hi2c2, ISM330_ADDR, OUTX_L_G, 1, raw_g, 6, 100) == HAL_OK)
         {
@@ -2105,6 +2191,7 @@ int main(void)
           sprintf(uart_buf, "[SENSOR] ERROR: I2C gyro read failed\r\n");
           HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
         }
+        } /* end MOVING-only gyro read (O4) */
 
         a_mag_g2 = (vib_x * vib_x) + (vib_y * vib_y) + (vib_z * vib_z);
         deviation = fabsf(a_mag_g2 - 1.0f);
@@ -2130,9 +2217,10 @@ int main(void)
          * and OUTX briefly reads ~0g (|mag²-1g²|≈1.0). Skip the whole trigger evaluation
          * during the window so that transient cannot phantom-complete a MOVING dwell, and
          * so it neither advances the dwell nor trips the MOVING→IDLE timeout. */
-        if (HAL_GetTick() < fsm_settle_until_tick)
+        if ((int32_t)(HAL_GetTick() - fsm_settle_until_tick) < 0)
         {
-          /* settling — leave FSM state untouched this cycle */
+          /* settling — leave FSM state untouched this cycle. Signed diff is wrap-safe
+           * across the 49.7-day HAL_GetTick rollover (same pattern as the wtm back-off). */
         }
         else
         {
@@ -2207,6 +2295,22 @@ int main(void)
         ism330_gyro_ok = 0U;
         sprintf(uart_buf, "[SENSOR] ERROR: I2C accel read failed\r\n");
         HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+
+        /* F1 liveness: the MOVING→IDLE timeout normally lives in the read-OK branch, so a
+         * persistent accel I2C fault would freeze the FSM in MOVING forever — the mission
+         * never seals or drains and the PSRAM ring keeps filling. last_movement_tick is not
+         * refreshed on a failed read, so the same 20 s timeout still applies here. Signed
+         * tick diff is wrap-safe across the 49.7-day HAL_GetTick rollover. */
+        if ((current_state == STATE_MOVING) &&
+            ((int32_t)(HAL_GetTick() - last_movement_tick) > (int32_t)NO_MOVEMENT_TIMEOUT_MS))
+        {
+          current_state = STATE_IDLE;
+          sprintf(uart_buf, "[FSM] MOVING -> IDLE  (accel read failing, %us no movement)\r\n",
+                  (unsigned)(NO_MOVEMENT_TIMEOUT_MS / 1000U));
+          HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+          Capture_EnterIdle();   /* seal + restore live config so the stalled mission can drain */
+          Drain_AllPending();
+        }
       }
       (void)a_mag_g2; /* suppress unused-warning when FSM branches don't read it directly */
     }
@@ -2228,7 +2332,13 @@ int main(void)
     {
       if (cap_snapshot_active == 0U)
       {
-        if ((HAL_GetTick() - cap_last_snapshot_tick) >= CAP_IDLE_SNAP_PERIOD_MS)
+        /* Trigger on the RTC wake flag (Stop2 path — HAL_GetTick froze during sleep so the
+         * tick test below can't fire) OR the awake tick cadence (STOP2 disabled / never slept). */
+        uint8_t snap_due = 0U;
+#ifdef STOP2_IDLE_ENABLE
+        if (g_rtc_wake_count >= STOP2_WAKES_PER_SNAP) { g_rtc_wake_count = 0U; snap_due = 1U; }
+#endif
+        if (snap_due || ((HAL_GetTick() - cap_last_snapshot_tick) >= CAP_IDLE_SNAP_PERIOD_MS))
         {
           Capture_EnterIdleSnapshot();
           cap_snapshot_active     = 1U;
@@ -2420,11 +2530,51 @@ int main(void)
     }
 
     /* -----------------------------------------------------------------
-     * PHASE 6: state-appropriate loop delay
+     * PHASE 6: state-appropriate loop delay — or Stop2 when truly idle
      * --------------------------------------------------------------- */
-    WIFI_DelayWithYield(current_state == STATE_MOVING
-                        ? SAMPLE_PERIOD_MOVING_MS
-                        : SAMPLE_PERIOD_IDLE_MS);
+#ifdef STOP2_IDLE_ENABLE
+    /* Deep-sleep only when nothing is in flight: IDLE, no active snapshot, no pending
+     * safety-flush drain (cap_wtm_hit), and the radio already off (ADR-021 idle is dark).
+     * The ISM330 watches for motion in hardware and the RTC fires the snapshot cadence, so
+     * the M33 has nothing to poll until one of them wakes it.
+     *
+     * CRITICAL #1: never sleep while a motion dwell is in progress
+     * (continuous_movement_start_tick != 0). The IDLE→MOVING dwell is timed in HAL_GetTick,
+     * which FREEZES in Stop2 — re-sleeping mid-dwell stalls the 500 ms timer forever and the
+     * shuttle can never promote to MOVING. Staying awake here lets the loop poll at the idle
+     * rate so HAL_GetTick advances and the dwell completes (or resets after debounce).
+     *
+     * CRITICAL #2: never sleep while the LPF2 filter-settle guard is active
+     * (HAL_GetTick < fsm_settle_until_tick). During settle the FSM skips ALL motion
+     * evaluation; since the guard is HAL_GetTick-timed and the tick freezes in Stop2, sleeping
+     * inside the window leaves the FSM permanently "settling" and deaf to motion — the exact
+     * post-idle-snapshot lock-up. Staying awake the ~1 s lets the tick advance and the guard
+     * expire; once expired before sleep it STAYS expired across Stop2 (frozen tick keeps the
+     * signed diff ≥ 0). */
+    if ((current_state == STATE_IDLE) &&
+        (continuous_movement_start_tick == 0U) &&
+        ((int32_t)(HAL_GetTick() - fsm_settle_until_tick) >= 0) &&
+        (cap_snapshot_active == 0U) &&
+        (cap_wtm_hit == 0U) &&
+        (wifi_driver_initialized == 0U))
+    {
+      Enter_Stop2_Idle();
+      /* Woken. Log only motion wakes — RTC cadence ticks fire every ~14 s and would spam the
+       * UART; the snapshot they drive logs itself via [CAPTURE]/[DRAIN]. Motion lets the FSM
+       * re-evaluate on the next iteration (authoritative IDLE→MOVING decision). */
+      if (g_motion_wake != 0U)
+      {
+        HAL_UART_Transmit(&huart1, (uint8_t *)"[LPM] Stop2 wake (motion)\r\n", 27, 1000);
+        g_motion_wake = 0U;
+      }
+    }
+    else
+#endif
+    {
+      WIFI_DelayWithYield(current_state == STATE_MOVING
+                          ? SAMPLE_PERIOD_MOVING_MS
+                          : SAMPLE_PERIOD_IDLE_MS);
+    }
   }
   /* USER CODE END 3 */
 }
@@ -2445,10 +2595,16 @@ void SystemClock_Config(void)
     Error_Handler();
   }
 
+  /** Configure LSE Drive Capability
+  */
+  HAL_PWR_EnableBkUpAccess();
+  __HAL_RCC_LSEDRIVE_CONFIG(RCC_LSEDRIVE_LOW);
+
   /** Initializes the CPU, AHB and APB buses clocks
   */
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI48|RCC_OSCILLATORTYPE_HSI
-                              |RCC_OSCILLATORTYPE_MSI;
+                              |RCC_OSCILLATORTYPE_LSE|RCC_OSCILLATORTYPE_MSI;
+  RCC_OscInitStruct.LSEState = RCC_LSE_ON;
   RCC_OscInitStruct.HSIState = RCC_HSI_ON;
   RCC_OscInitStruct.HSI48State = RCC_HSI48_ON;
   RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
@@ -2809,6 +2965,88 @@ static void MX_OCTOSPI2_Init(void)
 }
 
 /**
+  * @brief RTC Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_RTC_Init(void)
+{
+
+  /* USER CODE BEGIN RTC_Init 0 */
+
+  /* USER CODE END RTC_Init 0 */
+
+  RTC_PrivilegeStateTypeDef privilegeState = {0};
+  RTC_TimeTypeDef sTime = {0};
+  RTC_DateTypeDef sDate = {0};
+
+  /* USER CODE BEGIN RTC_Init 1 */
+
+  /* USER CODE END RTC_Init 1 */
+
+  /** Initialize RTC Only
+  */
+  hrtc.Instance = RTC;
+  hrtc.Init.HourFormat = RTC_HOURFORMAT_24;
+  hrtc.Init.AsynchPrediv = 127;
+  hrtc.Init.SynchPrediv = 255;
+  hrtc.Init.OutPut = RTC_OUTPUT_DISABLE;
+  hrtc.Init.OutPutRemap = RTC_OUTPUT_REMAP_NONE;
+  hrtc.Init.OutPutPolarity = RTC_OUTPUT_POLARITY_HIGH;
+  hrtc.Init.OutPutType = RTC_OUTPUT_TYPE_OPENDRAIN;
+  hrtc.Init.OutPutPullUp = RTC_OUTPUT_PULLUP_NONE;
+  hrtc.Init.BinMode = RTC_BINARY_NONE;
+  if (HAL_RTC_Init(&hrtc) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  privilegeState.rtcPrivilegeFull = RTC_PRIVILEGE_FULL_NO;
+  privilegeState.backupRegisterPrivZone = RTC_PRIVILEGE_BKUP_ZONE_NONE;
+  privilegeState.backupRegisterStartZone2 = RTC_BKP_DR0;
+  privilegeState.backupRegisterStartZone3 = RTC_BKP_DR0;
+  if (HAL_RTCEx_PrivilegeModeSet(&hrtc, &privilegeState) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /* USER CODE BEGIN Check_RTC_BKUP */
+
+  /* USER CODE END Check_RTC_BKUP */
+
+  /** Initialize RTC and set the Time and Date
+  */
+  sTime.Hours = 0x0;
+  sTime.Minutes = 0x0;
+  sTime.Seconds = 0x0;
+  sTime.DayLightSaving = RTC_DAYLIGHTSAVING_NONE;
+  sTime.StoreOperation = RTC_STOREOPERATION_RESET;
+  if (HAL_RTC_SetTime(&hrtc, &sTime, RTC_FORMAT_BCD) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sDate.WeekDay = RTC_WEEKDAY_MONDAY;
+  sDate.Month = RTC_MONTH_JANUARY;
+  sDate.Date = 0x1;
+  sDate.Year = 0x0;
+
+  if (HAL_RTC_SetDate(&hrtc, &sDate, RTC_FORMAT_BCD) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Enable the WakeUp
+  */
+  if (HAL_RTCEx_SetWakeUpTimer_IT(&hrtc, 0, RTC_WAKEUPCLOCK_RTCCLK_DIV16, 0) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN RTC_Init 2 */
+
+  /* USER CODE END RTC_Init 2 */
+
+}
+
+/**
   * @brief SPI2 Initialization Function
   * @param None
   * @retval None
@@ -3136,11 +3374,11 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(WRLS_NOTIFY_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : USB_UCPD_FLT_Pin Mems_ISM330DLC_INT1_Pin */
-  GPIO_InitStruct.Pin = USB_UCPD_FLT_Pin|Mems_ISM330DLC_INT1_Pin;
+  /*Configure GPIO pin : USB_UCPD_FLT_Pin */
+  GPIO_InitStruct.Pin = USB_UCPD_FLT_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
+  HAL_GPIO_Init(USB_UCPD_FLT_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pins : Mems_INT_IIS2MDC_Pin USB_IANA_Pin */
   GPIO_InitStruct.Pin = Mems_INT_IIS2MDC_Pin|USB_IANA_Pin;
@@ -3168,6 +3406,12 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOF, &GPIO_InitStruct);
 
+  /*Configure GPIO pin : PE11 */
+  GPIO_InitStruct.Pin = GPIO_PIN_11;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+  HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
+
   /*Configure GPIO pin : MIC_SDIN0_Pin */
   GPIO_InitStruct.Pin = MIC_SDIN0_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
@@ -3177,6 +3421,9 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_Init(MIC_SDIN0_GPIO_Port, &GPIO_InitStruct);
 
   /* EXTI interrupt init*/
+  HAL_NVIC_SetPriority(EXTI11_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(EXTI11_IRQn);
+
   HAL_NVIC_SetPriority(EXTI14_IRQn, 5, 0);
   HAL_NVIC_EnableIRQ(EXTI14_IRQn);
 
@@ -3193,7 +3440,54 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+#ifdef STOP2_IDLE_ENABLE
 
+/* Arm the ISM330 wake-on-motion interrupt on INT1. Accel must already be running at any
+ * ODR>0; the idle path leaves it at LIVE 104 Hz, so WoM works with no ODR change (and thus
+ * no LPF2 re-settle on wake). Pure I2C register writes — call once after sensor bring-up. */
+static void ISM330_ArmWakeOnMotion(void)
+{
+  uint8_t v;
+  v = ISM330_INT_EN;      (void)HAL_I2C_Mem_Write(&hi2c2, ISM330_ADDR, ISM330_TAP_CFG2,    1, &v, 1, 100);
+  v = ISM330_WK_THS_VAL;  (void)HAL_I2C_Mem_Write(&hi2c2, ISM330_ADDR, ISM330_WAKE_UP_THS, 1, &v, 1, 100);
+  v = ISM330_WK_DUR_VAL;  (void)HAL_I2C_Mem_Write(&hi2c2, ISM330_ADDR, ISM330_WAKE_UP_DUR, 1, &v, 1, 100);
+  v = ISM330_MD1_INT1_WU; (void)HAL_I2C_Mem_Write(&hi2c2, ISM330_ADDR, ISM330_MD1_CFG,     1, &v, 1, 100);
+}
+
+/* Re-arm the RTC wake-up timer to the idle-snapshot cadence. MX_RTC_Init() leaves it at
+ * ~2048 Hz (period 0, RTCCLK/16) which is useless here; switch to the 1 Hz ck_spre clock so
+ * the 16-bit counter can reach the 10-min period. Counter N → wake after (N+1) seconds. */
+static void RTC_ArmSnapshotWake(void)
+{
+  HAL_RTCEx_DeactivateWakeUpTimer(&hrtc);
+  (void)HAL_RTCEx_SetWakeUpTimer_IT(&hrtc,
+                                    STOP2_WAKE_PERIOD_S - 1U,
+                                    RTC_WAKEUPCLOCK_CK_SPRE_16BITS, 0);
+}
+
+/* Enter Stop2 between idle snapshots. Wakes on EXTI11 (motion) or the RTC cadence timer.
+ * Stop2 retains SRAM + peripheral registers but drops the PLL, so the 160 MHz clock tree is
+ * rebuilt via SystemClock_Config() before anything else runs. The accel ODR is untouched
+ * across sleep, so no ACCEL_SETTLE_MS blank is needed on wake. */
+static void Enter_Stop2_Idle(void)
+{
+  /* Suspend SysTick so its IRQ can't immediately wake us the moment Stop2 is armed. */
+  HAL_SuspendTick();
+  HAL_PWREx_EnterSTOP2Mode(PWR_STOPENTRY_WFI);
+  /* --- halted here until EXTI11 or RTC wake-up --- */
+  SystemClock_Config();
+  HAL_ResumeTick();
+}
+
+/* RTC wake-up timer fired. Each tick is one STOP2_WAKE_PERIOD_S slice; the superloop counts
+ * them to the snapshot cadence (HAL_GetTick is frozen across Stop2, so it can't time this). */
+void HAL_RTCEx_WakeUpTimerEventCallback(RTC_HandleTypeDef *hrtc_cb)
+{
+  (void)hrtc_cb;
+  g_rtc_wake_count++;
+}
+
+#endif /* STOP2_IDLE_ENABLE */
 /* USER CODE END 4 */
 
 /**
