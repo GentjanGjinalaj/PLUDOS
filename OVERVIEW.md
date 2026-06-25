@@ -38,6 +38,7 @@ docs/                committed reference docs (architecture, ADRs, wire protocol
 ```
 
 Quick links to the per-folder guides:
+`docs/OVERVIEW.md` (documentation map) ·
 `STM_Shuttles/PLUDOS_Edge_Node/OVERVIEW.md` ·
 `client/OVERVIEW.md` · `client/alumet-relay/OVERVIEW.md` ·
 `server/OVERVIEW.md` · `server/trigger/OVERVIEW.md` ·
