@@ -19,14 +19,14 @@ The `grafana` service in `server/compose.yaml` mounts this folder read-only.
 |------|----------------|--------|
 | `provisioning/datasources/influxdb.yaml` | Tells Grafana, on boot, to wire up the **InfluxDB datasource** (Flux query language, org `pludos`, bucket `alumet_energy`, token from `.env`). Fixed `uid` so dashboards can reference it. | Core (without it, panels have no data source) |
 | `provisioning/dashboards/pludos.yaml` | A **file provider** that tells Grafana to load every dashboard JSON it finds under `/dashboards` and re-scan every 30 s. | Core (loader) |
-| `dashboards/pludos_system_monitor.json` | The actual **"PLUDOS System Monitor" dashboard** (~680 lines): live-status KPIs, environment, drain quality/packet-loss, vibration, idle waveforms, Jetson power, federated-learning, and mission-history panels. | Core artifact — the **single hand-maintained source of truth** |
+| `dashboards/pludos_system_monitor.json` | The actual **"PLUDOS System Monitor" dashboard** (~680 lines): live-status KPIs, environment, drain quality/packet-loss, vibration, idle + mission waveforms, Jetson power, federated-learning, and mission-history panels. | Core artifact — the **single hand-maintained source of truth** |
 
 ## How the dashboard is maintained
 
 `dashboards/pludos_system_monitor.json` is the **single source of truth** and is
 edited by hand (or exported from the Grafana UI). Every panel query targets the
 measurements actually written today (ADR-021 drain path): `stm_mission`
-(`source == "drain"`), `stm_idle_wave`, `input_current` / `input_voltage`,
+(`source == "drain"`), `stm_idle_wave`, `stm_mission_wave`, `input_current` / `input_voltage`,
 `fl_phases`, and `fl_train_metrics`.
 
 ```

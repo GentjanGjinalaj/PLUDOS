@@ -458,11 +458,95 @@
       "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } }
     },
     {
+      "id": 43,
+      "type": "row",
+      "title": "\u3030 Mission Waveforms \u2014 per-sample (decimated envelope)",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 39 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 44,
+      "type": "timeseries",
+      "title": "Shuttle 1 \u2014 Mission Waveform (accel g / gyro dps)",
+      "datasource": { "type": "influxdb", "uid": "efmtstss6rcw0d" },
+      "targets": [
+        {
+          "refId": "A",
+          "query": "from(bucket:\"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"stm_mission_wave\" and r.shuttle_id == \"1\" and (r._field == \"ax_g\" or r._field == \"ay_g\" or r._field == \"az_g\")) |> yield(name: \"A\")",
+          "datasource": { "type": "influxdb", "uid": "efmtstss6rcw0d" }
+        },
+        {
+          "refId": "B",
+          "query": "from(bucket:\"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"stm_mission_wave\" and r.shuttle_id == \"1\" and (r._field == \"gx_dps\" or r._field == \"gy_dps\" or r._field == \"gz_dps\")) |> yield(name: \"B\")",
+          "datasource": { "type": "influxdb", "uid": "efmtstss6rcw0d" }
+        }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 40 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "accG",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "showPoints": "auto",
+            "pointSize": 5,
+            "spanNulls": true,
+            "axisPlacement": "left"
+          }
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "gx_dps" }, "properties": [ { "id": "custom.axisPlacement", "value": "right" }, { "id": "unit", "value": "none" } ] },
+          { "matcher": { "id": "byName", "options": "gy_dps" }, "properties": [ { "id": "custom.axisPlacement", "value": "right" }, { "id": "unit", "value": "none" } ] },
+          { "matcher": { "id": "byName", "options": "gz_dps" }, "properties": [ { "id": "custom.axisPlacement", "value": "right" }, { "id": "unit", "value": "none" } ] }
+        ]
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } }
+    },
+    {
+      "id": 45,
+      "type": "timeseries",
+      "title": "Shuttle 2 \u2014 Mission Waveform (accel g / gyro dps)",
+      "datasource": { "type": "influxdb", "uid": "efmtstss6rcw0d" },
+      "targets": [
+        {
+          "refId": "A",
+          "query": "from(bucket:\"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"stm_mission_wave\" and r.shuttle_id == \"2\" and (r._field == \"ax_g\" or r._field == \"ay_g\" or r._field == \"az_g\")) |> yield(name: \"A\")",
+          "datasource": { "type": "influxdb", "uid": "efmtstss6rcw0d" }
+        },
+        {
+          "refId": "B",
+          "query": "from(bucket:\"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"stm_mission_wave\" and r.shuttle_id == \"2\" and (r._field == \"gx_dps\" or r._field == \"gy_dps\" or r._field == \"gz_dps\")) |> yield(name: \"B\")",
+          "datasource": { "type": "influxdb", "uid": "efmtstss6rcw0d" }
+        }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 40 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "accG",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "showPoints": "auto",
+            "pointSize": 5,
+            "spanNulls": true,
+            "axisPlacement": "left"
+          }
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "gx_dps" }, "properties": [ { "id": "custom.axisPlacement", "value": "right" }, { "id": "unit", "value": "none" } ] },
+          { "matcher": { "id": "byName", "options": "gy_dps" }, "properties": [ { "id": "custom.axisPlacement", "value": "right" }, { "id": "unit", "value": "none" } ] },
+          { "matcher": { "id": "byName", "options": "gz_dps" }, "properties": [ { "id": "custom.axisPlacement", "value": "right" }, { "id": "unit", "value": "none" } ] }
+        ]
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } }
+    },
+    {
       "id": 19,
       "type": "row",
       "title": "\ud83d\udda5 Jetson Power \u2014 INA3221 via Alumet",
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 39 }
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 48 }
     },
     {
       "id": 20,
@@ -477,7 +561,7 @@
           "datasource": { "type": "influxdb", "uid": "efmtstss6rcw0d" }
         }
       ],
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 40 },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 49 },
       "fieldConfig": {
         "defaults": {
           "unit": "watt",
@@ -507,7 +591,7 @@
           "datasource": { "type": "influxdb", "uid": "efmtstss6rcw0d" }
         }
       ],
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 40 },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 49 },
       "fieldConfig": {
         "defaults": {
           "unit": "mamp",
@@ -536,7 +620,7 @@
           "datasource": { "type": "influxdb", "uid": "efmtstss6rcw0d" }
         }
       ],
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 40 },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 49 },
       "fieldConfig": {
         "defaults": {
           "unit": "mvolt",
@@ -559,7 +643,7 @@
       "type": "row",
       "title": "\u26a1 Federated Learning \u2014 Energy & Training",
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 48 }
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 57 }
     },
     {
       "id": 24,
@@ -573,7 +657,7 @@
           "datasource": { "type": "influxdb", "uid": "efmtstss6rcw0d" }
         }
       ],
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 49 },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 58 },
       "options": {
         "xField": "fl_round",
         "groupWidth": 0.7,
@@ -594,7 +678,7 @@
           "datasource": { "type": "influxdb", "uid": "efmtstss6rcw0d" }
         }
       ],
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 49 },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 58 },
       "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } },
       "fieldConfig": {
         "defaults": {
@@ -617,7 +701,7 @@
           "datasource": { "type": "influxdb", "uid": "efmtstss6rcw0d" }
         }
       ],
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 49 },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 58 },
       "fieldConfig": {
         "defaults": {
           "unit": "none",
@@ -640,7 +724,7 @@
       "type": "row",
       "title": "\ud83d\udccb Mission History",
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 57 }
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 66 }
     },
     {
       "id": 27,
@@ -654,7 +738,7 @@
           "datasource": { "type": "influxdb", "uid": "efmtstss6rcw0d" }
         }
       ],
-      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 58 },
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 67 },
       "options": { "footer": { "show": false }, "sortBy": [] },
       "fieldConfig": {
         "defaults": {},
