@@ -205,8 +205,9 @@ See ADR-011 in `decisions.md` for full decision history.
    `FW_VERSION` is older requests the image on `udp://<gateway>:5685`; the gateway
    (`ota_server.py`) blasts `OTA_BEGIN`/chunks/`OTA_END`, the shuttle stages to PSRAM
    and NAK-recovers any losses, gates on a whole-image CRC32, then flashes the
-   inactive bank and BFB2-swaps with confirm-or-revert anti-brick. Jetson side
-   implemented; STM32 side pending the dual-bank enable. Never runs during MOVING.
+   inactive bank and SWAP_BANK-swaps with confirm-or-revert anti-brick. Jetson side
+   implemented + software-tested; STM32 side not yet written (dual-bank facts resolved,
+   U585 2 MB is hardwired dual-bank — no enable needed). Never runs during MOVING.
 5. Out of band (manual or scheduled), `flwr run .` starts an FL round; the
    server signals each gateway-side `ai-worker`, which loads the most
    recent `MAX_PARQUET_FILES` files, fits XGBoost, returns booster bytes.

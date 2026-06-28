@@ -584,9 +584,11 @@ around it. Standalone mode imports `anomaly.py` directly. Verify with:
 
 ## ADR-019 — Remote firmware update (OTA) for the STM32 shuttle
 **Status:** In progress — test/bench tier. Jetson side implemented and bench-tested
-(`client/ota_server.py`, UDP :5685, beacon `:fw=` token); STM32 receiver/flash side
-pending the dual-bank enable (see "Implemented design" below). Production tier
-(SBSFU/MCUboot) still deferred.
+(`client/ota_server.py`, UDP :5685, beacon `:fw=` token) and software-tested via
+`tools/mock_ota_stm.py` (full NAK ARQ + CRC gate, incl. 50%-loss recovery and a
+corrupt-image rejection). STM32 receiver/flash side not yet written, but the dual-bank
+facts that gated it are resolved (see "Dual-bank facts" below) — no CubeMX/option-byte
+action needed. Production tier (SBSFU/MCUboot) still deferred.
 
 **Context:** Once shuttles are deployed in a warehouse, physical access for an
 ST-Link reflash becomes impractical — the whole point of the fleet is that it
@@ -650,11 +652,11 @@ user's request:
   verified. This is mandatory from day one (drain's *planned* Phase-2 ARQ), since
   one dropped chunk otherwise bricks the board.
 - **Anti-brick via confirm-or-revert.** The new image flashes to the inactive bank,
-  is read-back-CRC-verified, then BFB2-swapped. On boot it must self-confirm within
-  `OTA_TRIAL_LIMIT` boots (writes a `CONFIRMED` state record in a reserved flash
-  page); otherwise IWDG reset + auto-revert of the BFB2 swap restores the
-  known-good bank — real rollback without an ST-Link trip. This closes the "no
-  rollback" trade-off listed above for the test tier. (Residual brick risk: an
+  is read-back-CRC-verified, then bank-swapped (see SWAP_BANK note below). On boot it
+  must self-confirm within `OTA_TRIAL_LIMIT` boots (writes a `CONFIRMED` state record
+  in a reserved flash page); otherwise IWDG reset + auto-revert of the bank swap
+  restores the known-good bank — real rollback without an ST-Link trip. This closes
+  the "no rollback" trade-off listed above for the test tier. (Residual brick risk: an
   image that hangs in the pre-`USER CODE BEGIN 2` CubeMX init, before the
   confirm-or-revert check, still needs an ST-Link — near-impossible since both
   images share identical generated init. Keep an ST-Link on the bench.)
@@ -665,13 +667,36 @@ Wire frames (magic `"PLDO"` = `0x4F44_4C50`, distinct from drain's `"PLDR"`):
 served from a `./firmware` bind-mount (`firmware.bin` + `manifest.json`), announced
 to shuttles by a `:fw=<version>` token on the discovery beacon.
 
-**Prerequisite for the firmware side (user/CubeMX territory):** the bank-swap scheme
-needs the U585 in **dual-bank** mode (linker `.ld` 2048K→1024K so the same `.bin`
-boots from either bank, plus the `DBANK` option bit if not fixed-on for the 2 MB
-part). The current firmware footprint (~97 KB) fits one 1 MB bank with margin.
-RM0456 (Flash chapter) must be cited for DBANK behaviour, BFB2 swap semantics,
-active-bank remap to `0x08000000`, RWW across banks, and page erase timing (sets the
-`IWDG_Kick()` cadence in the erase loop) before the flash driver is written.
+**Dual-bank facts (resolved 2026-06-28 — RM0456 + in-tree HAL, no longer "open"):**
+- **No DBANK/DUALBANK enable needed.** The STM32U585AII6Q is a 2 MB part, and 2 MB
+  U5 devices are **hardwired dual-bank** (DUALBANK fixed = 1; CubeProgrammer even hides
+  the option byte for 2 MB parts). Only ≤1 MB U5 variants expose a settable DUALBANK.
+  So the earlier "enable DBANK" task does not exist for this silicon. (RM0456 Table 52;
+  ST community "Dual bank flash organization on STM32U5".)
+- **Bank geometry:** `FLASH_PAGE_SIZE = 0x2000` (8 KB), `FLASH_BANK_SIZE = FLASH_SIZE>>1`
+  (1 MB), `FLASH_PAGE_NB = 128` pages/bank (`stm32u585xx.h`). Bank 1 @ `0x0800_0000`,
+  bank 2 @ `0x0810_0000`; the booted bank is aliased to `0x0800_0000` after reset.
+  Erase/program must target the **physical** inactive-bank address, not the alias.
+- **Swap is SWAP_BANK, not BFB2.** U5 uses the `SWAP_BANK` user option bit
+  (`OB_USER_SWAP_BANK = 0x200`, `OB_SWAP_BANK_DISABLE`/`OB_SWAP_BANK_ENABLE` in
+  `stm32u5xx_hal_flash.h`), programmed via `HAL_FLASHEx_OBProgram(OPTIONBYTE_USER, …)`
+  + `HAL_FLASH_OB_Launch()`. BFB2 is the older F4/L4 name — earlier plan text was wrong.
+- **HAL is in-tree and ready:** `HAL_FLASHEx_Erase(FLASH_TYPEERASE_PAGES, Banks=FLASH_BANK_2,
+  Page, NbPages)`, `HAL_FLASH_Program` (quad-word, 16 B aligned), `HAL_FLASHEx_OBProgram`,
+  `HAL_FLASH_OB_Launch`, `HAL_FLASHEx_OBGetConfig` (to read the active bank). App is
+  TrustZone-**non-secure**, so `FLASH_TYPEERASE_PAGES` resolves to the NS controller.
+- **IWDG cadence:** kick once per 8 KB page erase in the loop (128 kicks for a full
+  bank); page-erase time is well under the ~16.4 s IWDG window, so per-page is ample.
+
+**Remaining setup (small):** (1) linker `STM32U585AIIXQ_FLASH.ld` `LENGTH 2048K → 1024K`
+so the image is confined to one bank and the same `.bin` is bank-agnostic post-swap
+(footprint ~97 KB, fits with huge margin) — editable file, *not* `.ioc`, but coordinate
+with CubeIDE regeneration. (2) Reserve one 8 KB flash page (e.g. last page of bank 1) for
+the OTA state record (`{magic, version, state, trial_boots, previous_bank, crc32}`) and
+exclude it from both image regions. No option-byte pre-setting is required — SWAP_BANK
+defaults to DISABLE (bank 1 active) and the firmware drives it. Toolchain
+(`arm-none-eabi-gcc`) is present, so `ota.c` can be compile-checked against these HAL
+headers before any hardware flash.
 
 **Flash-driver provenance (don't green-field it):** a 2026-06-28 search confirmed no
 off-the-shelf package fits our transport (ST SBSFU = TrustZone + signing, too heavy;
