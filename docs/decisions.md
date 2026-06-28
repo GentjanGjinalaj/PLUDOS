@@ -673,6 +673,16 @@ RM0456 (Flash chapter) must be cited for DBANK behaviour, BFB2 swap semantics,
 active-bank remap to `0x08000000`, RWW across banks, and page erase timing (sets the
 `IWDG_Kick()` cadence in the erase loop) before the flash driver is written.
 
+**Flash-driver provenance (don't green-field it):** a 2026-06-28 search confirmed no
+off-the-shelf package fits our transport (ST SBSFU = TrustZone + signing, too heavy;
+FreeRTOS `iot-reference-stm32u5` = AWS/MQTT-coupled; AN5247 = STM32WB only). The
+*transport* (Jetson→STM raw UDP reverse-drain) is genuinely ours. But the *flash /
+bank-swap mechanics* of `ota.c` (erase inactive bank, quad-word program, BFB2 option-
+byte program + `HAL_FLASH_OB_Launch`, RWW live update) are a solved problem — adapt
+them from **AN4767** ("On-the-fly firmware update for dual-bank STM32") and the
+**STM32CubeU5** HAL FLASH example projects, not from scratch. (`X-CUBE-DBFU` is the
+same mechanics packaged for EVAL boards; community ref: `barafael/g4-dual-bank-example`.)
+
 ## ADR-020 — High-rate vibration capture: PSRAM mission buffer + burst drain
 **Status:** Open (proposed). EMW3080 benchmark **resolved 2026-06-01**; now gated
 on one `.ioc` change (I²C2 → Fast mode) plus implementation. Adds a new capture
