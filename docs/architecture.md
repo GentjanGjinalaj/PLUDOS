@@ -199,6 +199,14 @@ See ADR-011 in `decisions.md` for full decision history.
    `stm_mission` summary (`source="drain"`: loss %, sample counts, vibration
    stats) and, for idle snapshots, per-sample `stm_idle_wave` points are
    pushed to InfluxDB on a daemon thread.
+4b. (OTA, ADR-019, test/bench tier.) When a firmware image is staged on the
+   gateway (`./firmware/firmware.bin` + `manifest.json`), the beacon gains a
+   `:fw=<version>` token. In IDLE, after draining, a shuttle whose compiled
+   `FW_VERSION` is older requests the image on `udp://<gateway>:5685`; the gateway
+   (`ota_server.py`) blasts `OTA_BEGIN`/chunks/`OTA_END`, the shuttle stages to PSRAM
+   and NAK-recovers any losses, gates on a whole-image CRC32, then flashes the
+   inactive bank and BFB2-swaps with confirm-or-revert anti-brick. Jetson side
+   implemented; STM32 side pending the dual-bank enable. Never runs during MOVING.
 5. Out of band (manual or scheduled), `flwr run .` starts an FL round; the
    server signals each gateway-side `ai-worker`, which loads the most
    recent `MAX_PARQUET_FILES` files, fits XGBoost, returns booster bytes.

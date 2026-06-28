@@ -1,0 +1,4 @@
+{
+  "fw_version": 2,
+  "_note": "Copy to manifest.json beside firmware.bin. fw_version is the only required key; the server derives image_size, chunk count and CRC32 from firmware.bin itself. Bump fw_version above the shuttle's compiled FW_VERSION to trigger an OTA. The .bin is gitignored (built artifact)."
+}

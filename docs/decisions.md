@@ -583,7 +583,10 @@ around it. Standalone mode imports `anomaly.py` directly. Verify with:
 ---
 
 ## ADR-019 — Remote firmware update (OTA) for the STM32 shuttle
-**Status:** Open (not implemented; physical ST-Link flash is the only path today)
+**Status:** In progress — test/bench tier. Jetson side implemented and bench-tested
+(`client/ota_server.py`, UDP :5685, beacon `:fw=` token); STM32 receiver/flash side
+pending the dual-bank enable (see "Implemented design" below). Production tier
+(SBSFU/MCUboot) still deferred.
 
 **Context:** Once shuttles are deployed in a warehouse, physical access for an
 ST-Link reflash becomes impractical — the whole point of the fleet is that it
@@ -633,6 +636,42 @@ write. Trigger via a CoAP CON control message (ADR-001's reserved use).
   this with ECDSA signing.
 - SBSFU integration (TrustZone flash layout, signing toolchain) is a multi-week
   effort — hence the phase split rather than jumping straight to secure OTA.
+
+**Implemented design (test/bench tier, supersedes the sketch above):**
+The test-phase path was built as the *reverse* of the high-rate capture drain
+(ADR-020/021): raw UDP + app-layer ARQ, not CoAP/TFTP (consistent with ADR-015
+killing CoAP). Two refinements were added beyond the original sketch, both at the
+user's request:
+- **Integrity via NAK selective-repeat ARQ.** The receiver (STM) owns the truth of
+  what it has and drives retransmission; the Jetson is a near-stateless chunk
+  server. The STM stages every chunk in PSRAM, tracks a received-bitmap, NAKs the
+  missing `chunk_seq` ranges, and only computes the whole-image CRC32 gate once the
+  bitmap is full — flash is never touched until the entire image is present and
+  verified. This is mandatory from day one (drain's *planned* Phase-2 ARQ), since
+  one dropped chunk otherwise bricks the board.
+- **Anti-brick via confirm-or-revert.** The new image flashes to the inactive bank,
+  is read-back-CRC-verified, then BFB2-swapped. On boot it must self-confirm within
+  `OTA_TRIAL_LIMIT` boots (writes a `CONFIRMED` state record in a reserved flash
+  page); otherwise IWDG reset + auto-revert of the BFB2 swap restores the
+  known-good bank — real rollback without an ST-Link trip. This closes the "no
+  rollback" trade-off listed above for the test tier. (Residual brick risk: an
+  image that hangs in the pre-`USER CODE BEGIN 2` CubeMX init, before the
+  confirm-or-revert check, still needs an ST-Link — near-impossible since both
+  images share identical generated init. Keep an ST-Link on the bench.)
+
+Wire frames (magic `"PLDO"` = `0x4F44_4C50`, distinct from drain's `"PLDR"`):
+`OTA_BEGIN`/`OTA_CHUNK`/`OTA_END` (Jetson→STM), `OTA_REQUEST`/`OTA_NAK`/
+`OTA_ACK_COMPLETE` (STM→Jetson). Byte layouts in `wire_protocol.md`. Firmware is
+served from a `./firmware` bind-mount (`firmware.bin` + `manifest.json`), announced
+to shuttles by a `:fw=<version>` token on the discovery beacon.
+
+**Prerequisite for the firmware side (user/CubeMX territory):** the bank-swap scheme
+needs the U585 in **dual-bank** mode (linker `.ld` 2048K→1024K so the same `.bin`
+boots from either bank, plus the `DBANK` option bit if not fixed-on for the 2 MB
+part). The current firmware footprint (~97 KB) fits one 1 MB bank with margin.
+RM0456 (Flash chapter) must be cited for DBANK behaviour, BFB2 swap semantics,
+active-bank remap to `0x08000000`, RWW across banks, and page erase timing (sets the
+`IWDG_Kick()` cadence in the erase loop) before the flash driver is written.
 
 ## ADR-020 — High-rate vibration capture: PSRAM mission buffer + burst drain
 **Status:** Open (proposed). EMW3080 benchmark **resolved 2026-06-01**; now gated

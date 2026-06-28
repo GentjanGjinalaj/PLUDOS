@@ -260,6 +260,110 @@ implementation; the drain runs during IDLE where the CPU cost is free.
 
 ---
 
+## 2b. OTA firmware update (Jetson → STM32, UDP 5685)
+
+ADR-019, test/bench tier. The **reverse** of the §2 drain: here the Jetson serves a
+new firmware image and the STM32 reassembles it into its inactive flash bank. Runs
+in IDLE only (shares the drain's radio-on window), never during MOVING. Reliability
+is **NAK selective-repeat ARQ** — the STM owns the truth of what it has and drives
+retransmission; the Jetson (`client/ota_server.py`) is a near-stateless chunk server.
+Security (signing/auth/encryption) is **out of scope** for this tier (trusted bench
+LAN); the production path is SBSFU/MCUboot (ADR-019).
+
+All frames are little-endian, packed, one datagram per frame. Every frame starts with
+`u32 magic = 0x4F44_4C50` (ASCII `"PLDO"` in memory order P,L,D,O) — distinct from the
+drain's `"PLDR"` so the two paths never alias. `type` (u8) follows the magic: types
+1–3 are Jetson→STM (server-sent), 4–6 are STM→Jetson. Chunk payload ≤ 1400 B so the
+datagram (16 B header + payload = 1416 B) stays under the 1472 B non-fragment UDP
+limit (§1), matching the drain chunk sizing.
+
+```c
+/* type=1 OTA_BEGIN — Jetson → STM, the manifest / integrity gate. 22 bytes. */
+typedef struct __attribute__((packed)) {
+  uint32_t magic;        /* 0x4F44_4C50 ("PLDO")                          */
+  uint8_t  type;         /* 1                                             */
+  uint8_t  shuttle_id;
+  uint32_t fw_version;   /* offered build id                              */
+  uint32_t image_size;   /* total image bytes                            */
+  uint16_t total_chunks;
+  uint16_t chunk_size;   /* nominal payload size (last chunk may be shorter) */
+  uint32_t image_crc32;  /* whole-image CRC32 — the integrity gate        */
+} OtaBegin_t;
+
+/* type=2 OTA_CHUNK — Jetson → STM, data. 16-byte header + payload[payload_len]. */
+typedef struct __attribute__((packed)) {
+  uint32_t magic;        /* 0x4F44_4C50                                   */
+  uint8_t  type;         /* 2                                             */
+  uint8_t  shuttle_id;
+  uint16_t chunk_seq;    /* 0-based; image offset = chunk_seq * chunk_size */
+  uint16_t total_chunks;
+  uint16_t payload_len;
+  uint32_t crc32;        /* per-chunk CRC32 of payload only               */
+  /* uint8_t payload[payload_len]; */
+} OtaChunkHdr_t;
+
+/* type=3 OTA_END — Jetson → STM, end marker, sent x3. 12 bytes. */
+typedef struct __attribute__((packed)) {
+  uint32_t magic;        /* 0x4F44_4C50                                   */
+  uint8_t  type;         /* 3                                             */
+  uint8_t  shuttle_id;
+  uint16_t total_chunks;
+  uint32_t image_crc32;
+} OtaEnd_t;
+
+/* type=4 OTA_REQUEST — STM → Jetson, start/resume a session. 10 bytes. */
+typedef struct __attribute__((packed)) {
+  uint32_t magic;        /* 0x4F44_4C50                                   */
+  uint8_t  type;         /* 4                                             */
+  uint8_t  shuttle_id;
+  uint32_t current_fw_version;  /* the STM's compiled FW_VERSION          */
+} OtaRequest_t;
+
+/* type=5 OTA_NAK — STM → Jetson, RLE list of missing chunk_seq ranges.
+ * 8-byte header + n_ranges x { u16 start; u16 end; } (end inclusive).
+ * n_ranges is bounded so the whole NAK fits one datagram. */
+typedef struct __attribute__((packed)) {
+  uint32_t magic;        /* 0x4F44_4C50                                   */
+  uint8_t  type;         /* 5                                             */
+  uint8_t  shuttle_id;
+  uint16_t n_ranges;
+  /* struct { uint16_t start, end; } ranges[n_ranges]; */
+} OtaNakHdr_t;
+
+/* type=6 OTA_ACK_COMPLETE — STM → Jetson, image whole + CRC-verified, committing. 10 bytes. */
+typedef struct __attribute__((packed)) {
+  uint32_t magic;        /* 0x4F44_4C50                                   */
+  uint8_t  type;         /* 6                                             */
+  uint8_t  shuttle_id;
+  uint32_t fw_version;
+} OtaAckComplete_t;
+```
+
+### Flow
+1. **Discover.** The gateway beacon (UDP :5000, §ADR-019) gains a `:fw=<version>`
+   token (`PLUDOS-GW:<ip>[:csv-ids]:fw=<version>`) when an image is offered. In IDLE,
+   after draining, if the advertised version exceeds the compiled `FW_VERSION` the STM
+   sends `OTA_REQUEST`.
+2. **Blast.** The Jetson replies `OTA_BEGIN` (×3) → all `OTA_CHUNK`s (lightly paced for
+   the EMW3080 RX) → `OTA_END` (×3).
+3. **Stage + track.** The STM validates each chunk's CRC32, writes it into a PSRAM
+   staging region at `chunk_seq * chunk_size`, and sets a bit in a static
+   received-bitmap. Corrupt/duplicate chunks are dropped.
+4. **NAK loop.** After `OTA_END` (or a quiet timeout) the STM scans the bitmap and sends
+   `OTA_NAK` with the missing ranges; the Jetson resends only those + `OTA_END`. Bounded
+   by `OTA_MAX_ROUNDS` and a total deadline.
+5. **Integrity gate.** When the bitmap is full, the STM computes CRC32 over the whole
+   staged image and compares to `image_crc32`. **Mismatch → abort; flash is never
+   touched, the old firmware keeps running.**
+6. **Commit.** Match → `OTA_ACK_COMPLETE`, then flash the inactive bank, read-back-verify,
+   BFB2-swap, reset. Confirm-or-revert on boot guards against a wedging image (ADR-019).
+
+### CRC32
+Identical to the drain: zlib/IEEE (reflected, poly `0xEDB88320`, init/final-XOR
+`0xFFFFFFFF`) — Python `zlib.crc32`. Used both per-chunk and over the whole image.
+
+---
+
 ## 3. Energy metrics → InfluxDB
 
 Written by `AlumetProfiler` in `client.py` (Jetson) and the `alumet` container

@@ -37,6 +37,9 @@ services:
       - .env
     volumes:
       - ./ram_buffer:/app/ram_buffer
+      # OTA firmware store (ADR-019): firmware.bin + manifest.json served on UDP 5685.
+      # Drop a new pair here (or bump manifest fw_version) — picked up live, no restart.
+      - ./firmware:/app/firmware:ro
       - /etc/localtime:/etc/localtime:ro
       - /etc/timezone:/etc/timezone:ro
     restart: unless-stopped

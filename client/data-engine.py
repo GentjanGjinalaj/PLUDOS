@@ -48,6 +48,7 @@ from influxdb_client import InfluxDBClient, Point, WritePrecision  # type: ignor
 from influxdb_client.client.write_api import SYNCHRONOUS           # type: ignore
 
 import drain_receiver  # high-rate capture drain receiver (ADR-020, UDP 5684)
+import ota_server       # OTA firmware-update server (ADR-019, UDP 5685)
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -989,10 +990,10 @@ async def _broadcast_beacon() -> None:
     ip = GATEWAY_IP or _detect_local_ip()
     if SHUTTLE_GROUP:
         suffix = ",".join(str(i) for i in sorted(SHUTTLE_GROUP))
-        payload = f"PLUDOS-GW:{ip}:{suffix}".encode()
+        base = f"PLUDOS-GW:{ip}:{suffix}"
         group_log = f"group={suffix}"
     else:
-        payload = f"PLUDOS-GW:{ip}".encode()
+        base = f"PLUDOS-GW:{ip}"
         group_log = "group=any"
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
@@ -1003,6 +1004,10 @@ async def _broadcast_beacon() -> None:
     )
     try:
         while True:
+            # Append ":fw=<version>" when an OTA image is offered so shuttles know an
+            # update exists. Rebuilt each tick — firmware can be dropped in at runtime.
+            fw = ota_server.offered_version()
+            payload = (f"{base}:fw={fw}" if fw is not None else base).encode()
             try:
                 await loop.run_in_executor(
                     None, sock.sendto, payload, ("255.255.255.255", BEACON_PORT)
@@ -1228,6 +1233,10 @@ async def main() -> None:
     # High-rate capture drain receiver on UDP 5684 (ADR-020). Separate path from
     # the 5683 live hot loop; drain t0 is self-timed via the STM tx_tick - t0_tick age.
     await drain_receiver.start_drain_receiver(BUFFER_DIR, _write_drain_summary)
+
+    # OTA firmware-update server on UDP 5685 (ADR-019). Reverse of the drain: the
+    # Jetson serves a new STM32 image; shuttles request/NAK and stage to flash.
+    await ota_server.start_ota_server()
 
     # Consolidate any mission files from days before today (handles Jetson restarts / downtime).
     _consolidate_stale()
