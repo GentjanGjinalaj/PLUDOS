@@ -20,6 +20,7 @@ RUN echo "$CODE_VERSION" > /app/.code_version
 # Copy your Python scripts into the container
 COPY data-engine.py .
 COPY drain_receiver.py .
+COPY ota_server.py .
 COPY client.py .
 COPY anomaly.py .
 COPY anomaly_cnn.py .
