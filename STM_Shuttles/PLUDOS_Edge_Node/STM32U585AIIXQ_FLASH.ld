@@ -46,7 +46,11 @@ MEMORY
 {
   RAM	(xrw)	: ORIGIN = 0x20000000,	LENGTH = 768K
   SRAM4	(xrw)	: ORIGIN = 0x28000000,	LENGTH = 16K
-  FLASH	(rx)	: ORIGIN = 0x08000000,	LENGTH = 2048K
+  /* ADR-019 OTA: image must fit ONE 1 MB bank so the same .bin boots from either
+   * bank after a SWAP_BANK swap (no per-bank relink). Last 8 KB page is reserved
+   * for the OTA confirm-or-revert state record (ota.h OTA_STATE_*), so the code
+   * region is 1024K - 8K = 1016K. */
+  FLASH	(rx)	: ORIGIN = 0x08000000,	LENGTH = 1016K
 }
 
 /* Sections */

@@ -22,8 +22,17 @@
  * volatile SRAM bookkeeping. The capture data ring uses only PSRAM_USABLE_BYTES
  * and never writes into the reserved region. */
 #define PSRAM_PERSIST_BYTES  0x00004000UL                              /* 16 KB reserved index region */
-#define PSRAM_USABLE_BYTES   (PSRAM_SIZE_BYTES - PSRAM_PERSIST_BYTES)  /* capture ring size */
-#define PSRAM_PERSIST_ADDR   (PSRAM_BASE_ADDR + PSRAM_USABLE_BYTES)    /* index region base address */
+
+/* ADR-019 OTA staging: carve a fixed window below the persist index where a
+ * downloaded firmware image is assembled and CRC-gated before any flash is
+ * touched. OTA runs only in IDLE (ring quiescent), but the carve-out is explicit
+ * so the capture ring write path can never wrap into it. 512 KB >> current .bin
+ * (~100 KB); shrinks the usable ring from 8 MB to ~7.5 MB. */
+#define PSRAM_OTA_STAGE_BYTES 0x00080000UL                             /* 512 KB OTA image staging */
+
+#define PSRAM_USABLE_BYTES   (PSRAM_SIZE_BYTES - PSRAM_PERSIST_BYTES - PSRAM_OTA_STAGE_BYTES)  /* capture ring size */
+#define PSRAM_OTA_STAGE_ADDR (PSRAM_BASE_ADDR + PSRAM_USABLE_BYTES)    /* OTA staging base, just below persist index */
+#define PSRAM_PERSIST_ADDR   (PSRAM_OTA_STAGE_ADDR + PSRAM_OTA_STAGE_BYTES) /* index region base address (top of PSRAM) */
 
 /* Configure APS6408 mode registers and switch OCTOSPI1 to memory-mapped mode.
  * Must be called after MX_OCTOSPI1_Init(). Returns 0 on success, -1 on error. */

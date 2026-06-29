@@ -24,6 +24,7 @@
 #include "wifi_credentials.h"
 #include "sensors.h"
 #include "psram.h"
+#include "ota.h"             /* ADR-019 OTA firmware update (download/flash/confirm-revert) */
 #include <stdio.h>
 #include <string.h>
 #include <stddef.h>          /* offsetof() for the PSRAM persist-index CRC span */
@@ -80,6 +81,11 @@ typedef struct {
 #define BEACON_MAX_RETRIES      10U    /* 10 x 3 s = 30 s max; gateway beacons every 10 s */
 #define BEACON_RETRY_TIMEOUT_MS  500   /* per-attempt timeout for in-loop quick checks */
 #define BEACON_RETRY_PERIOD_MS  30000U /* how often the main loop re-checks for a beacon */
+
+/* ADR-019 OTA: this build's firmware version. The gateway advertises the image it
+ * offers via the beacon ":fw=<n>" token; an offered version greater than this
+ * triggers an OTA download in the IDLE drain window. Bump on every shipped build. */
+#define FW_VERSION              4U
 
 /* USER CODE END PD */
 
@@ -207,6 +213,7 @@ static volatile uint8_t wifi_station_ready = 0;
 
 static char     jetson_ip[16]      = {0};   /* populated from JETSON_IP define at init */
 static uint8_t  stm32_ip[4]        = {0};   /* STM32's own DHCP address; used for beacon subnet filter */
+static uint32_t g_offered_fw       = 0U;    /* ADR-019: fw version from the beacon ":fw=" token (0 = none) */
 static uint8_t  hts221_initialized  = 0U;    /* SENSOR_Humidity_Init succeeded */
 static uint8_t  lps22hh_initialized = 0U;    /* SENSOR_Pressure_Init succeeded */
 /* Environmental sensor cache (refreshed every ENV_READ_PERIOD_MS so the I²C bus
@@ -490,7 +497,7 @@ static uint16_t Capture_Service(void);
 /* ADR-020/021 mission drain to the gateway (UDP 5684, blast-first) */
 static uint32_t Drain_CRC32(const uint8_t *data, uint32_t len);
 static void     Drain_Mission(int16_t idx);
-static void     Drain_AllPending(void);
+static void     Drain_AllPending(uint8_t force_ota_check);
 
 /* USER CODE END PFP */
 
@@ -731,7 +738,7 @@ static uint8_t BEACON_Run(uint8_t retries, int32_t timeout_ms)
   struct mx_sockaddr_in baddr  = {0};
   struct mx_sockaddr_in sender = {0};
   uint32_t              fromlen;
-  uint8_t               buf[40] = {0};
+  uint8_t               buf[64] = {0};  /* fits "PLUDOS-GW:<ip>:<csv-ids>:fw=<n>" without truncating the trailing OTA token */
   int32_t               n;
   uint8_t               attempt;
 
@@ -777,7 +784,21 @@ static uint8_t BEACON_Run(uint8_t retries, int32_t timeout_ms)
       char    *id_sep;
       uint8_t  group_match;
 
-      buf[n] = 0U; /* safe: buf is 40 B and recvfrom is capped at sizeof(buf)-1 */
+      buf[n] = 0U; /* safe: buf is 64 B and recvfrom is capped at sizeof(buf)-1 */
+
+      /* ADR-019: extract the optional ":fw=<n>" OTA token before the IP/csv split
+       * mutates the buffer. Gateway-wide offer; the IDLE drain window compares it
+       * to FW_VERSION to decide whether to pull an update. */
+      {
+        const char *fwp = strstr((char *)buf, ":fw=");
+        if (fwp != NULL)
+        {
+          uint32_t v = 0U;
+          const char *c = fwp + 4;
+          while ((*c >= '0') && (*c <= '9')) { v = (v * 10U) + (uint32_t)(*c - '0'); c++; }
+          g_offered_fw = v;
+        }
+      }
 
       /* Split optional ":<csv-ids>" suffix from the IP. The first ':' belongs
        * to "PLUDOS-GW:" (already past); the next one, if present, starts the
@@ -1791,7 +1812,7 @@ static void Drain_JitterDelay(void)
   WIFI_DelayWithYield(wait_ms);
 }
 
-static void Drain_AllPending(void)
+static void Drain_AllPending(uint8_t force_ota_check)
 {
   uint16_t i;
   uint8_t any = 0U;
@@ -1805,9 +1826,17 @@ static void Drain_AllPending(void)
       break;
     }
   }
-  if (any == 0U)
+  /* ADR-019: an offered OTA image also justifies waking the radio, even with no
+   * missions pending — the same power-on window serves the update. */
+  uint8_t ota_pending = (uint8_t)(g_offered_fw > FW_VERSION);
+  /* force_ota_check (set on the idle-snapshot poll) overrides the early return:
+   * g_offered_fw is stale (0) until a beacon is read, but the radio must be powered
+   * to read the beacon — so a parked board that never drains must still open the
+   * radio once per poll to discover an offer. The poll also drains the idle snapshot
+   * that just sealed, so it is not wasted work when no update is pending. */
+  if ((any == 0U) && (ota_pending == 0U) && (force_ota_check == 0U))
   {
-    return; /* nothing pending — keep the radio dark */
+    return; /* nothing pending and no update — keep the radio dark */
   }
 
   Drain_JitterDelay();  /* decorrelate concurrent shuttles before the radio comes up */
@@ -1844,6 +1873,28 @@ static void Drain_AllPending(void)
           ip_refreshed = 1U;
         }
       }
+    }
+
+    /* ADR-019: the OTA gate reads g_offered_fw, which is refreshed only by a beacon
+     * RX. When every mission drained cleanly the stale-IP self-heal above never ran,
+     * so g_offered_fw still holds its boot value (0 if no image was offered then) and
+     * a freshly staged firmware is never seen. Read the beacon once here (radio is
+     * already up) with the boot-grade budget so the 10 s beacon is reliably caught
+     * before evaluating the offer. ip_refreshed avoids a redundant read on the rare
+     * drain-failure path that already probed above. */
+    if (ip_refreshed == 0U)
+    {
+      (void)BEACON_Run(BEACON_MAX_RETRIES, BEACON_TIMEOUT_MS);
+      ip_refreshed = 1U;
+    }
+
+    /* Same radio-on window — if the beacon advertised a newer firmware, pull and
+     * flash it now. On success Ota_TryUpdate swaps banks and resets into the new
+     * image (never returns); on failure the old image keeps running. */
+    if ((g_offered_fw > FW_VERSION) && (socket_id >= 0))
+    {
+      (void)Ota_TryUpdate(wifi_obj, socket_id, jetson_ip,
+                          (uint8_t)SHUTTLE_ID, FW_VERSION, g_offered_fw);
     }
   }
   else
@@ -1902,6 +1953,11 @@ int main(void)
   MX_RTC_Init();
   /* USER CODE BEGIN 2 */
 
+  /* ADR-019 OTA confirm-or-revert: run FIRST, before WiFi/sensors, so a freshly
+   * swapped image that fails to self-confirm within its boot budget rolls the bank
+   * swap back here on (essentially) every boot. Pure flash; no peripheral deps. */
+  Ota_BootCheck();
+
   // -----------------------------------------------------------------
   // BOOT RESET-CAUSE REPORT — diagnose the unexpected reboots that reset the
   // mission counter and drop any undrained PSRAM. Read the RCC reset flags once,
@@ -1921,6 +1977,11 @@ int main(void)
     HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
     __HAL_RCC_CLEAR_RESET_FLAGS();
   }
+
+  /* OTA visible marker: prints the running build's FW_VERSION on every boot so
+     a successful bank-swap into a new image is observable on the serial console. */
+  sprintf(uart_buf, "[BOOT] firmware FW_VERSION=%u\r\n", (unsigned)FW_VERSION);
+  HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
 
   // -----------------------------------------------------------------
   // PSRAM BRING-UP (APS6408 on OCTOSPI1) — ADR-020 capture buffer
@@ -2132,6 +2193,19 @@ int main(void)
 
     IWDG_Kick();  /* steady-state heartbeat; each loop iteration is well under the ~16 s period */
 
+    /* ADR-019 OTA: a trial image that has reached the steady loop and survived
+     * OTA_CONFIRM_UPTIME_MS is healthy — self-confirm so it becomes the known-good
+     * image and the next OTA ping-pongs to the other bank. One-shot; no-op unless
+     * the current state is TRIAL. */
+    {
+      static uint8_t ota_confirm_done = 0U;
+      if ((ota_confirm_done == 0U) && (HAL_GetTick() > OTA_CONFIRM_UPTIME_MS))
+      {
+        Ota_Confirm();
+        ota_confirm_done = 1U;
+      }
+    }
+
     /* Drive MXCHIP IO so async events (STA_UP / STA_DOWN / IP changes) are processed. */
     if ((wifi_obj != NULL) && (wifi_driver_initialized != 0U))
     {
@@ -2283,7 +2357,7 @@ int main(void)
                * snapshots queued since the last wake, then power it back down. The
                * ~4 s power-on cost is paid in IDLE where latency is free; jetson_ip
                * is cached so the beacon wait is skipped. */
-              Drain_AllPending();
+              Drain_AllPending(0U);
             }
           }
         }
@@ -2309,7 +2383,7 @@ int main(void)
                   (unsigned)(NO_MOVEMENT_TIMEOUT_MS / 1000U));
           HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
           Capture_EnterIdle();   /* seal + restore live config so the stalled mission can drain */
-          Drain_AllPending();
+          Drain_AllPending(0U);
         }
       }
       (void)a_mag_g2; /* suppress unused-warning when FSM branches don't read it directly */
@@ -2353,6 +2427,12 @@ int main(void)
           Capture_EnterIdle();          /* stamps env + seals; data waits for next drain */
           cap_snapshot_active    = 0U;
           cap_last_snapshot_tick = HAL_GetTick();
+          /* Defer-to-mission: a sealed idle snapshot is NOT drained here. The board stays
+           * asleep and ships nothing until a real mission ends — idle snapshots accumulate
+           * in the PSRAM ring and leave on the next MOVING->IDLE drain (radio window above)
+           * or, for a long-parked board, the Phase-2d 75% safety flush. The OTA firmware
+           * poll rides those same drain windows (Drain_AllPending reads the beacon and runs
+           * Ota_TryUpdate whenever the radio is up), so no idle-only radio wake is needed. */
         }
       }
     }
@@ -2380,7 +2460,7 @@ int main(void)
         sprintf(uart_buf, "[DRAIN] safety flush — undrained %luB >= 75%%\r\n",
                 (unsigned long)cap_undrained_bytes);
         HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
-        Drain_AllPending();
+        Drain_AllPending(0U);
         /* Still hot ⇒ the drain failed to relieve pressure (gateway down). Back off. */
         if (cap_wtm_hit != 0U)
         {
