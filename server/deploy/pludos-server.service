@@ -1,0 +1,41 @@
+# PLUDOS central-server boot unit (rootless Podman, systemd --user scope).
+#
+# Brings the whole server stack up at boot / after a power cut:
+#   influxdb, grafana, alumet, fl-trigger.
+#
+# Mirror of client/deploy/pludos.service (the Jetson gateway unit). The
+# server compose.yaml has no compose profiles, so a plain `podman compose
+# up -d` starts every service -- no --profile flag is needed here (unlike
+# the Jetson, where influxdb-local/grafana-local sit behind the standalone
+# profile). Each service already has `restart: unless-stopped`, which only
+# covers crash recovery while Podman is already running; this unit is what
+# brings the stack up at boot, and linger is what lets a --user unit start
+# without an interactive login.
+#
+# Note: this host uses the `podman compose` subcommand (Docker Compose
+# v5.x driver), not the standalone `podman-compose` binary the Jetson uses.
+#
+# Install (replace 'ggjinalaj' with the server user if different):
+#   mkdir -p ~/.config/systemd/user
+#   cp ~/PLUDOS/server/deploy/pludos-server.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now pludos-server.service
+#   loginctl enable-linger $(whoami)   # start at boot without an interactive login
+#
+# See server/deploy/README.md for the full rationale and verification.
+
+[Unit]
+Description=PLUDOS Central Server Auto-Start (full stack)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/home/ggjinalaj/PLUDOS/server
+ExecStart=/usr/bin/podman compose up -d
+ExecStop=/usr/bin/podman compose down
+TimeoutStartSec=0
+
+[Install]
+WantedBy=default.target
