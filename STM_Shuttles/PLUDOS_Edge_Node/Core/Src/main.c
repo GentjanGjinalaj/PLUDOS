@@ -85,7 +85,7 @@ typedef struct {
 /* ADR-019 OTA: this build's firmware version. The gateway advertises the image it
  * offers via the beacon ":fw=<n>" token; an offered version greater than this
  * triggers an OTA download in the IDLE drain window. Bump on every shipped build. */
-#define FW_VERSION              7U
+#define FW_VERSION              1U
 
 /* USER CODE END PD */
 

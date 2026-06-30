@@ -272,6 +272,11 @@ static uint16_t ota_recv_burst(MX_WIFIObject_t *wifi, int32_t sock, OtaManifest_
     {
       OtaBegin_t b;
       memcpy(&b, ota_rx, sizeof(b));
+      /* Reject a manifest that would overrun the static bitmap or stage buffer:
+       * a huge total_chunks with a tiny chunk_size slips past the per-chunk
+       * off+plen guard but lets bm_set(chunk_seq) write past ota_bitmap[]. */
+      if (b.total_chunks == 0U || b.total_chunks > OTA_MAX_CHUNKS ||
+          b.chunk_size == 0U || b.chunk_size > OTA_CHUNK_SIZE) { continue; }
       man->valid = 1U;
       man->fw_version = b.fw_version;
       man->image_size = b.image_size;

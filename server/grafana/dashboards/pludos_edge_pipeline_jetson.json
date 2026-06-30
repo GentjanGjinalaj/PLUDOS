@@ -625,7 +625,7 @@
           },
           "displayName": "S${__field.labels.shuttle_id} ${__field.labels.kind}",
           "color": {
-            "mode": "palette-classic"
+            "mode": "palette-classic-by-name"
           }
         }
       },
@@ -675,7 +675,7 @@
           },
           "displayName": "S${__field.labels.shuttle_id} ${__field.labels._field}",
           "color": {
-            "mode": "palette-classic"
+            "mode": "palette-classic-by-name"
           }
         }
       },
@@ -990,7 +990,7 @@
           },
           "displayName": "S${__field.labels.shuttle_id} ${__field.labels._field}",
           "color": {
-            "mode": "palette-classic"
+            "mode": "palette-classic-by-name"
           }
         }
       },
@@ -1042,7 +1042,7 @@
           },
           "displayName": "S${__field.labels.shuttle_id} gyro_peak_dps",
           "color": {
-            "mode": "palette-classic"
+            "mode": "palette-classic-by-name"
           }
         }
       },
@@ -1094,7 +1094,7 @@
           },
           "displayName": "S${__field.labels.shuttle_id} ${__field.labels._field}",
           "color": {
-            "mode": "palette-classic"
+            "mode": "palette-classic-by-name"
           }
         }
       },
@@ -1146,7 +1146,7 @@
           },
           "displayName": "S${__field.labels.shuttle_id} ${__field.labels._field}",
           "color": {
-            "mode": "palette-classic"
+            "mode": "palette-classic-by-name"
           }
         }
       },
@@ -1198,7 +1198,7 @@
           },
           "displayName": "S${__field.labels.shuttle_id} ${__field.labels._field}",
           "color": {
-            "mode": "palette-classic"
+            "mode": "palette-classic-by-name"
           }
         }
       },
@@ -1250,7 +1250,7 @@
           },
           "displayName": "S${__field.labels.shuttle_id} ${__field.labels._field}",
           "color": {
-            "mode": "palette-classic"
+            "mode": "palette-classic-by-name"
           }
         }
       },
@@ -1315,7 +1315,7 @@
           },
           "displayName": "S${__field.labels.shuttle_id} temp_c",
           "color": {
-            "mode": "palette-classic"
+            "mode": "palette-classic-by-name"
           }
         }
       },
@@ -1368,7 +1368,7 @@
           },
           "displayName": "S${__field.labels.shuttle_id} pressure_hpa",
           "color": {
-            "mode": "palette-classic"
+            "mode": "palette-classic-by-name"
           }
         }
       },
@@ -1433,7 +1433,7 @@
           },
           "displayName": "VDD_IN board power",
           "color": {
-            "mode": "palette-classic"
+            "mode": "palette-classic-by-name"
           }
         }
       },
@@ -1484,7 +1484,7 @@
           },
           "displayName": "VDD_IN current",
           "color": {
-            "mode": "palette-classic"
+            "mode": "palette-classic-by-name"
           }
         }
       },
@@ -1536,7 +1536,7 @@
           },
           "displayName": "VDD_IN voltage",
           "color": {
-            "mode": "palette-classic"
+            "mode": "palette-classic-by-name"
           }
         }
       },
@@ -1588,7 +1588,7 @@
           },
           "displayName": "${__field.labels.ina_channel_label}",
           "color": {
-            "mode": "palette-classic"
+            "mode": "palette-classic-by-name"
           }
         }
       },
