@@ -69,3 +69,6 @@ docs/DESIGN_COUNCIL.md
 
 
 
+
+# STM32CubeIDE per-machine indexer hashes — churns on every IDE open, not project config
+STM_Shuttles/PLUDOS_Edge_Node/.settings/stm32cubeide.project.prefs
