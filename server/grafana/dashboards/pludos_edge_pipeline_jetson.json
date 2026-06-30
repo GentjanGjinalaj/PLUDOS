@@ -766,7 +766,7 @@
             "showPoints": "always",
             "pointSize": 6
           },
-          "displayName": "S${__field.labels.shuttle_id} ${__field.labels._field}",
+          "displayName": "S${__field.labels.shuttle_id} ${__field.name}",
           "color": {
             "mode": "palette-classic"
           }
@@ -1191,7 +1191,7 @@
             "spanNulls": false,
             "fillOpacity": 0
           },
-          "displayName": "S${__field.labels.shuttle_id} ${__field.labels._field}",
+          "displayName": "S${__field.labels.shuttle_id} ${__field.name}",
           "color": {
             "mode": "palette-classic"
           }
@@ -1497,7 +1497,7 @@
             "pointSize": 3,
             "fillOpacity": 0
           },
-          "displayName": "S${__field.labels.shuttle_id} ${__field.labels._field}",
+          "displayName": "S${__field.labels.shuttle_id} ${__field.name}",
           "color": {
             "mode": "palette-classic"
           }
@@ -1677,7 +1677,7 @@
             "pointSize": 3,
             "fillOpacity": 0
           },
-          "displayName": "S${__field.labels.shuttle_id} ${__field.labels._field}",
+          "displayName": "S${__field.labels.shuttle_id} ${__field.name}",
           "color": {
             "mode": "palette-classic"
           }
@@ -1857,7 +1857,7 @@
             "pointSize": 3,
             "fillOpacity": 0
           },
-          "displayName": "S${__field.labels.shuttle_id} ${__field.labels._field}",
+          "displayName": "S${__field.labels.shuttle_id} ${__field.name}",
           "color": {
             "mode": "palette-classic"
           }
@@ -2037,7 +2037,7 @@
             "pointSize": 3,
             "fillOpacity": 0
           },
-          "displayName": "S${__field.labels.shuttle_id} ${__field.labels._field}",
+          "displayName": "S${__field.labels.shuttle_id} ${__field.name}",
           "color": {
             "mode": "palette-classic"
           }
