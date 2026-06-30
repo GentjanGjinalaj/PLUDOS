@@ -1,0 +1,34 @@
+# PLUDOS gateway boot unit (rootless Podman, systemd --user scope).
+#
+# Brings the whole standalone stack up at boot / after a power cut:
+#   data-engine, alumet-relay, influxdb-local, grafana-local, ai-worker.
+#
+# The --profile standalone flag is load-bearing: influxdb-local and
+# grafana-local (and ai-worker) are gated behind the "standalone" compose
+# profile, so a plain `podman-compose up -d` starts only data-engine +
+# alumet-relay and InfluxDB/Grafana never recover after a reboot.
+#
+# Install (replace 'warehouse1' with the Jetson user if different):
+#   mkdir -p ~/.config/systemd/user
+#   cp ~/PLUDOS/client/deploy/pludos.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now pludos.service
+#   loginctl enable-linger $(whoami)   # start at boot without an interactive login
+#
+# See client/deploy/README.md for the full rationale and verification.
+
+[Unit]
+Description=PLUDOS Gateway Auto-Start (standalone profile)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/home/warehouse1/PLUDOS/client
+ExecStart=/home/warehouse1/.local/bin/podman-compose --profile standalone up -d
+ExecStop=/home/warehouse1/.local/bin/podman-compose --profile standalone down
+TimeoutStartSec=0
+
+[Install]
+WantedBy=default.target
