@@ -105,7 +105,7 @@
 
 ## 11. Status
 
-- **Working:** FSM idle/moving, PSRAM capture + drain (0%-loss missions on bench), Stop2 + wake-on-motion, reassembly→Parquet, InfluxDB+Grafana (incl. idle **and** mission waveform panels), real gateway energy, FL tree-set union, **fleet OTA firmware update** (hardware-validated end-to-end on a 2-shuttle bench, v1→v7, one image, ids preserved via factory UID).
+- **Working:** FSM idle/moving, PSRAM capture + drain (0%-loss missions on bench), Stop2 + wake-on-motion, reassembly→Parquet, InfluxDB+Grafana (incl. idle **and** mission waveform panels), real gateway energy, FL tree-set union, **fleet OTA firmware update** (hardware-validated end-to-end on a 2-shuttle bench across several update cycles, one image, ids preserved via factory UID).
 - **Bench-blocked (code done):** shuttle idle-power number (`unmeasured`), `MOVEMENT_THRESHOLD_G2` calibration (harness ready).
 - **Parked:** FL/ML rework (CNN-vs-XGBoost), full energy-feedback adaptation loop.
 
