@@ -79,8 +79,11 @@ val / 10.0   # humidity (%RH)
 
 ### Field notes
 
-- `shuttle_id` — 1-based integer. Set via `SHUTTLE_ID` in
-  `wifi_credentials.h`. Gateway maps to a name via `SHUTTLE_NAMES` env var.
+- `shuttle_id` — 1-based integer. Resolved at boot from the factory MCU UID
+  (`UID → id` table, ADR-019), so one OTA image serves the whole fleet while each
+  board keeps its own id; `SHUTTLE_ID` in `wifi_credentials.h` is only the fallback
+  default if the UID is not in the table. Gateway maps to a name via `SHUTTLE_NAMES`
+  env var.
 - `sequence_id` — `uint16` counter, wraps 65535 → 0. Gateway unwraps to
   `seq = sequence_id + wrap_count × 65536` for Parquet sort key (ADR-009).
 - `tick_ms` — `HAL_GetTick()`, ms since STM32 boot. Gateway anchors to wall

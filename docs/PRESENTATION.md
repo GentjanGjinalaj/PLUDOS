@@ -43,6 +43,7 @@
 - **Capture → PSRAM ring → drain:** high-rate runs buffered in external PSRAM, transmitted *after* the run (radio off during motion → ADR-021).
 - **Energy:** idle now enters **Stop2 deep sleep**, woken by **IMU motion (hardware INT)** or an **RTC timer** — MCU sleeps instead of polling at 160 MHz.
 - **Reliability:** hardware **IWDG watchdog**, CRC-validated PSRAM index → survives resets, ARQ retransmit on the drain.
+- **Remote firmware update (OTA, ADR-019):** dual-bank self-flash over WiFi — gateway is a dumb chunk server, the STM **pulls** on a mission wake, **NAK ARQ + whole-image CRC32 gate + confirm-or-revert** anti-brick. **One image updates the whole fleet**: identity is read from the **factory UID** (not compiled in), so every board keeps its `shuttle_id` across updates.
 
 ## 5. Gateway — highlights
 
@@ -104,7 +105,7 @@
 
 ## 11. Status
 
-- **Working:** FSM idle/moving, PSRAM capture + drain (0%-loss missions on bench), Stop2 + wake-on-motion, reassembly→Parquet, InfluxDB+Grafana (incl. idle **and** mission waveform panels), real gateway energy, FL tree-set union.
+- **Working:** FSM idle/moving, PSRAM capture + drain (0%-loss missions on bench), Stop2 + wake-on-motion, reassembly→Parquet, InfluxDB+Grafana (incl. idle **and** mission waveform panels), real gateway energy, FL tree-set union, **fleet OTA firmware update** (hardware-validated end-to-end on a 2-shuttle bench, v1→v7, one image, ids preserved via factory UID).
 - **Bench-blocked (code done):** shuttle idle-power number (`unmeasured`), `MOVEMENT_THRESHOLD_G2` calibration (harness ready).
 - **Parked:** FL/ML rework (CNN-vs-XGBoost), full energy-feedback adaptation loop.
 

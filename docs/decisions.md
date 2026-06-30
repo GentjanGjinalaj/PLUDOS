@@ -583,12 +583,15 @@ around it. Standalone mode imports `anomaly.py` directly. Verify with:
 ---
 
 ## ADR-019 — Remote firmware update (OTA) for the STM32 shuttle
-**Status:** In progress — test/bench tier. Jetson side implemented and bench-tested
-(`client/ota_server.py`, UDP :5685, beacon `:fw=` token) and software-tested via
-`tools/mock_ota_stm.py` (full NAK ARQ + CRC gate, incl. 50%-loss recovery and a
-corrupt-image rejection). STM32 receiver/flash side not yet written, but the dual-bank
-facts that gated it are resolved (see "Dual-bank facts" below) — no CubeMX/option-byte
-action needed. Production tier (SBSFU/MCUboot) still deferred.
+**Status:** Implemented (test/bench tier) and **hardware-validated end-to-end** on a
+two-shuttle bench (2026-06-30). Both sides shipped: Jetson chunk server
+(`client/ota_server.py`, UDP :5685, beacon `:fw=` token) and the STM32 receiver/flash
+driver (`Core/Src/ota.c`). Validated over real OTA cycles (v1→v7): defer-to-mission
+trigger, NAK selective-repeat ARQ recovering induced loss, whole-image CRC32 gate,
+inactive-bank self-flash + read-back verify, `SWAP_BANK` + reboot, and confirm-or-revert
+anti-brick. **Fleet identity is now decoupled from the image** (UID-based, see below), so
+one `firmware.bin` updates the whole fleet while each board keeps its distinct
+`shuttle_id`. Production tier (SBSFU/MCUboot, signing + encryption) still deferred.
 
 **Context:** Once shuttles are deployed in a warehouse, physical access for an
 ST-Link reflash becomes impractical — the whole point of the fleet is that it
@@ -666,6 +669,19 @@ Wire frames (magic `"PLDO"` = `0x4F44_4C50`, distinct from drain's `"PLDR"`):
 `OTA_ACK_COMPLETE` (STM→Jetson). Byte layouts in `wire_protocol.md`. Firmware is
 served from a `./firmware` bind-mount (`firmware.bin` + `manifest.json`), announced
 to shuttles by a `:fw=<version>` token on the discovery beacon.
+
+**Fleet identity via factory UID (added 2026-06-30).** `SHUTTLE_ID` was originally a
+compile-time `#define`, which meant each board needed its own `.bin` — fatal for a
+single fleet-wide OTA image (serving one image to two boards would collide their ids).
+The id is now resolved at boot from the MCU's 96-bit factory UID (`UID_BASE` =
+`0x0BFA0700`) via a small `UID → shuttle_id` table in `main.c` (`Shuttle_ResolveId`,
+`SHUTTLE_UID_TABLE`). The UID is laser-burned silicon — no flash erase or OTA can change
+it — so one `firmware.bin` serves the whole fleet and every board keeps its id across
+every update. To add or rebind a board, add a table row and rebuild; an unlisted UID
+falls back to the `wifi_credentials.h` `SHUTTLE_ID` default and logs a warning. This is
+strictly more permanent than a flash-page config (which a full ST-Link `-e all` erase
+would wipe). The `shuttle_id` byte on the wire is unchanged — purely a firmware-side
+change to *where the id comes from*; the gateway sees the same value as before.
 
 **Dual-bank facts (resolved 2026-06-28 — RM0456 + in-tree HAL, no longer "open"):**
 - **No DBANK/DUALBANK enable needed.** The STM32U585AII6Q is a 2 MB part, and 2 MB

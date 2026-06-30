@@ -85,7 +85,7 @@ typedef struct {
 /* ADR-019 OTA: this build's firmware version. The gateway advertises the image it
  * offers via the beacon ":fw=<n>" token; an offered version greater than this
  * triggers an OTA download in the IDLE drain window. Bump on every shipped build. */
-#define FW_VERSION              4U
+#define FW_VERSION              7U
 
 /* USER CODE END PD */
 
@@ -214,6 +214,7 @@ static volatile uint8_t wifi_station_ready = 0;
 static char     jetson_ip[16]      = {0};   /* populated from JETSON_IP define at init */
 static uint8_t  stm32_ip[4]        = {0};   /* STM32's own DHCP address; used for beacon subnet filter */
 static uint32_t g_offered_fw       = 0U;    /* ADR-019: fw version from the beacon ":fw=" token (0 = none) */
+static uint8_t  g_shuttle_id       = (uint8_t)SHUTTLE_ID; /* ADR-019: resolved from factory UID at boot; default is the credentials value */
 static uint8_t  hts221_initialized  = 0U;    /* SENSOR_Humidity_Init succeeded */
 static uint8_t  lps22hh_initialized = 0U;    /* SENSOR_Pressure_Init succeeded */
 /* Environmental sensor cache (refreshed every ENV_READ_PERIOD_MS so the I²C bus
@@ -474,6 +475,7 @@ static void ISM330_ArmWakeOnMotion(void);
 static void RTC_ArmSnapshotWake(void);
 static void Enter_Stop2_Idle(void);
 #endif
+static void Shuttle_ResolveId(void);
 static void WIFI_SPI_ApplySafeTiming(void);
 static void WIFI_StatusCallback(uint8_t cate, uint8_t event, void *arg);
 static uint8_t WIFI_IsIPv4Valid(const uint8_t ip_addr[4]);
@@ -570,7 +572,7 @@ static void WIFI_LogStationEvent(uint8_t event)
     event_name = "STA_GOT_IP";
   }
 
-  sprintf(uart_buf, "[NETWORK] WiFi event: %s\r\n", event_name);
+  sprintf(uart_buf, "[NETWORK s%u] WiFi event: %s\r\n", (unsigned)g_shuttle_id, event_name);
   HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
 }
 
@@ -637,7 +639,7 @@ static MX_WIFI_STATUS_T WIFI_WaitForStationIP(uint8_t ip_addr[4], uint32_t timeo
     if ((HAL_GetTick() - last_progress_log) >= 1000U)
     {
       last_progress_log = HAL_GetTick();
-      sprintf(uart_buf, "[NETWORK] Waiting for DHCP lease...\r\n");
+      sprintf(uart_buf, "[NETWORK s%u] Waiting for DHCP lease...\r\n", (unsigned)g_shuttle_id);
       HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
     }
   }
@@ -766,8 +768,8 @@ static uint8_t BEACON_Run(uint8_t retries, int32_t timeout_ms)
   (void)MX_WIFI_Socket_setsockopt(wifi_obj, bsock, MX_SOL_SOCKET, MX_SO_RCVTIMEO,
                                   &timeout_ms, sizeof(timeout_ms));
 
-  sprintf(uart_buf, "[BEACON] Listening on UDP %u (%u x %ld ms)...\r\n",
-          (unsigned)BEACON_PORT, (unsigned)retries, (long)timeout_ms);
+  sprintf(uart_buf, "[BEACON s%u] Listening on UDP %u (%u x %ld ms)...\r\n",
+          (unsigned)g_shuttle_id, (unsigned)BEACON_PORT, (unsigned)retries, (long)timeout_ms);
   HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
 
   for (attempt = 0U; attempt < retries; attempt++)
@@ -816,7 +818,7 @@ static uint8_t BEACON_Run(uint8_t retries, int32_t timeout_ms)
         group_match = 0U;
         while (*cursor != 0)
         {
-          if (BEACON_ParseUint8(cursor) == (uint8_t)SHUTTLE_ID)
+          if (BEACON_ParseUint8(cursor) == g_shuttle_id)
           {
             group_match = 1U;
             break;
@@ -865,7 +867,7 @@ static uint8_t BEACON_Run(uint8_t retries, int32_t timeout_ms)
 
       strncpy(jetson_ip, ip_start, sizeof(jetson_ip) - 1U);
       jetson_ip[sizeof(jetson_ip) - 1U] = 0;
-      sprintf(uart_buf, "[BEACON] Gateway found: %s\r\n", jetson_ip);
+      sprintf(uart_buf, "[BEACON s%u] Gateway found: %s\r\n", (unsigned)g_shuttle_id, jetson_ip);
       HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
       (void)MX_WIFI_Socket_close(wifi_obj, bsock);
       return 1U;
@@ -873,8 +875,8 @@ static uint8_t BEACON_Run(uint8_t retries, int32_t timeout_ms)
 
     if (retries > 1U) /* suppress noisy log on single-shot quick checks */
     {
-      sprintf(uart_buf, "[BEACON] No beacon yet (attempt %u/%u)\r\n",
-              (unsigned)(attempt + 1U), (unsigned)retries);
+      sprintf(uart_buf, "[BEACON s%u] No beacon yet (attempt %u/%u)\r\n",
+              (unsigned)g_shuttle_id, (unsigned)(attempt + 1U), (unsigned)retries);
       HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
     }
   }
@@ -896,7 +898,7 @@ static int32_t TELEMETRY_Send(void)
     return -1;
   }
 
-  pkt.shuttle_id   = SHUTTLE_ID;
+  pkt.shuttle_id   = g_shuttle_id;
   pkt.sequence_id  = current_packet_num;
   pkt.tick_ms      = HAL_GetTick();
   pkt.state        = (uint8_t)current_state;
@@ -1057,8 +1059,8 @@ static int8_t WIFI_PowerOn(void)
     HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
     return -1;
   }
-  sprintf(uart_buf, "[NETWORK] SUCCESS! Station IP: %d.%d.%d.%d\r\n",
-          ip_addr[0], ip_addr[1], ip_addr[2], ip_addr[3]);
+  sprintf(uart_buf, "[NETWORK s%u] SUCCESS! Station IP: %d.%d.%d.%d\r\n",
+          (unsigned)g_shuttle_id, ip_addr[0], ip_addr[1], ip_addr[2], ip_addr[3]);
   HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
   (void)memcpy(stm32_ip, ip_addr, 4U);
 
@@ -1082,8 +1084,8 @@ static int8_t WIFI_PowerOn(void)
     HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
     return -1;
   }
-  sprintf(uart_buf, "[NETWORK] PludosTelemetry stream armed → udp://%s:%u\r\n",
-          jetson_ip, (unsigned)TELEMETRY_PORT);
+  sprintf(uart_buf, "[NETWORK s%u] PludosTelemetry stream armed → udp://%s:%u\r\n",
+          (unsigned)g_shuttle_id, jetson_ip, (unsigned)TELEMETRY_PORT);
   HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
 
   /* Bind the local port so the gateway's DrainAck reaches Drain_WaitForAck. */
@@ -1122,7 +1124,7 @@ static void WIFI_PowerOff(void)
   wifi_station_ready      = 0U;
   wifi_station_event      = 0xFF;
 
-  sprintf(uart_buf, "[NETWORK] WiFi powered off (module held in reset)\r\n");
+  sprintf(uart_buf, "[NETWORK s%u] WiFi powered off (module held in reset)\r\n", (unsigned)g_shuttle_id);
   HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
 }
 
@@ -1567,7 +1569,7 @@ static uint8_t Drain_WaitForAck(uint16_t mid)
     n = MX_WIFI_Socket_recvfrom(wifi_obj, socket_id, (uint8_t *)&ack, (int32_t)sizeof(ack),
                                 0, (struct mx_sockaddr *)&from, &fromlen);
     if ((n == (int32_t)sizeof(ack)) && (ack.magic == DRAIN_MAGIC) &&
-        (ack.type == DRAIN_TYPE_ACK) && (ack.shuttle_id == (uint8_t)SHUTTLE_ID) &&
+        (ack.type == DRAIN_TYPE_ACK) && (ack.shuttle_id == g_shuttle_id) &&
         (ack.mission_id == mid))
     {
       return 1U;
@@ -1618,7 +1620,7 @@ static void Drain_Mission(int16_t idx)
   /* BEGIN — repeated so a single control-packet loss doesn't strand the mission. */
   beg.magic        = DRAIN_MAGIC;
   beg.type         = DRAIN_TYPE_BEGIN;
-  beg.shuttle_id   = (uint8_t)SHUTTLE_ID;
+  beg.shuttle_id   = g_shuttle_id;
   beg.mission_id   = m->mission_id;
   beg.total_chunks = (uint16_t)total_chunks;
   /* ODR depends on the capture mode so the gateway rebuilds each stream's timeline
@@ -1681,7 +1683,7 @@ static void Drain_Mission(int16_t idx)
 
     hdr->magic        = DRAIN_MAGIC;
     hdr->type         = DRAIN_TYPE_CHUNK;
-    hdr->shuttle_id   = (uint8_t)SHUTTLE_ID;
+    hdr->shuttle_id   = g_shuttle_id;
     hdr->mission_id   = m->mission_id;
     hdr->chunk_seq    = (uint16_t)chunk;
     hdr->total_chunks = (uint16_t)total_chunks;
@@ -1705,7 +1707,7 @@ static void Drain_Mission(int16_t idx)
   /* END — carries the whole-mission CRC so the gateway can validate completeness. */
   end.magic        = DRAIN_MAGIC;
   end.type         = DRAIN_TYPE_END;
-  end.shuttle_id   = (uint8_t)SHUTTLE_ID;
+  end.shuttle_id   = g_shuttle_id;
   end.mission_id   = m->mission_id;
   end.total_chunks = (uint16_t)total_chunks;
   end.crc32_all    = crc_all;
@@ -1715,8 +1717,8 @@ static void Drain_Mission(int16_t idx)
                                 0, (struct mx_sockaddr *)&dest, sizeof(dest));
   }
 
-  sprintf(uart_buf, "[DRAIN] mission %u sent: %lu chunks, %lu B, crc=%08lX\r\n",
-          (unsigned)m->mission_id, (unsigned long)total_chunks,
+  sprintf(uart_buf, "[DRAIN] shuttle %u mission %u sent: %lu chunks, %lu B, crc=%08lX\r\n",
+          (unsigned)g_shuttle_id, (unsigned)m->mission_id, (unsigned long)total_chunks,
           (unsigned long)m->byte_count, (unsigned long)crc_all);
   HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
 
@@ -1777,6 +1779,48 @@ static void Drain_WarmupBurst(void)
 
   sprintf(uart_buf, "[DRAIN] warm-up burst sent: %u x %u B @ %u ms gap (sacrificial)\r\n",
           (unsigned)DRAIN_WARMUP_PACKETS, (unsigned)sizeof(warm), (unsigned)DRAIN_WARMUP_GAP_MS);
+  HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+}
+
+/* ADR-019 fleet OTA: a shuttle's identity is bound to the MCU's 96-bit factory UID,
+ * not a compile-time #define. This lets one OTA image serve the whole fleet while every
+ * board keeps its distinct id across updates — the UID is laser-burned silicon that no
+ * flash erase or OTA can change. To add or rebind a board, add a row here and rebuild.
+ * Read a board's UID over SWD with:
+ *   STM32_Programmer_CLI -c port=SWD mode=UR -r32 0x0BFA0700 0xC */
+typedef struct { uint32_t uid0; uint32_t uid1; uint32_t uid2; uint8_t shuttle_id; } ShuttleUidMap_t;
+
+static const ShuttleUidMap_t SHUTTLE_UID_TABLE[] = {
+  { 0x00210034U, 0x4731500EU, 0x20383451U, 1U },  /* shuttle 1, ST-LINK SN 002700293432511430343838 */
+  { 0x001D003DU, 0x4731500EU, 0x20383451U, 2U },  /* shuttle 2, ST-LINK SN 003100233432511630343838 */
+};
+
+/* Bind g_shuttle_id from this board's factory UID via SHUTTLE_UID_TABLE. If the UID
+ * isn't listed, keep the wifi_credentials.h SHUTTLE_ID default and flag it loudly, so
+ * an unprovisioned board still runs instead of silently taking a wrong id. */
+static void Shuttle_ResolveId(void)
+{
+  const uint32_t *uid = (const uint32_t *)UID_BASE;  /* CMSIS: 96-bit unique device ID */
+
+  for (uint32_t i = 0U; i < (sizeof(SHUTTLE_UID_TABLE) / sizeof(SHUTTLE_UID_TABLE[0])); i++)
+  {
+    if ((SHUTTLE_UID_TABLE[i].uid0 == uid[0]) &&
+        (SHUTTLE_UID_TABLE[i].uid1 == uid[1]) &&
+        (SHUTTLE_UID_TABLE[i].uid2 == uid[2]))
+    {
+      g_shuttle_id = SHUTTLE_UID_TABLE[i].shuttle_id;
+      sprintf(uart_buf, "[BOOT] shuttle id %u (UID %08lX%08lX%08lX)\r\n",
+              (unsigned)g_shuttle_id,
+              (unsigned long)uid[2], (unsigned long)uid[1], (unsigned long)uid[0]);
+      HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+      return;
+    }
+  }
+
+  sprintf(uart_buf,
+          "[BOOT] WARN: UID %08lX%08lX%08lX not in table — defaulting to shuttle id %u\r\n",
+          (unsigned long)uid[2], (unsigned long)uid[1], (unsigned long)uid[0],
+          (unsigned)g_shuttle_id);
   HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
 }
 
@@ -1894,7 +1938,7 @@ static void Drain_AllPending(uint8_t force_ota_check)
     if ((g_offered_fw > FW_VERSION) && (socket_id >= 0))
     {
       (void)Ota_TryUpdate(wifi_obj, socket_id, jetson_ip,
-                          (uint8_t)SHUTTLE_ID, FW_VERSION, g_offered_fw);
+                          g_shuttle_id, FW_VERSION, g_offered_fw);
     }
   }
   else
@@ -1982,6 +2026,10 @@ int main(void)
      a successful bank-swap into a new image is observable on the serial console. */
   sprintf(uart_buf, "[BOOT] firmware FW_VERSION=%u\r\n", (unsigned)FW_VERSION);
   HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
+
+  /* ADR-019: bind this board's shuttle id from its factory UID before any frame is
+     tagged or any beacon group-filtered, so one fleet-wide OTA image keeps distinct ids. */
+  Shuttle_ResolveId();
 
   // -----------------------------------------------------------------
   // PSRAM BRING-UP (APS6408 on OCTOSPI1) — ADR-020 capture buffer
@@ -2120,7 +2168,7 @@ int main(void)
   }
   HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, strlen(uart_buf), 1000);
 
-  sprintf(uart_buf, "[NETWORK] WiFi init sequence starting...\r\n");
+  sprintf(uart_buf, "[NETWORK s%u] WiFi init sequence starting...\r\n", (unsigned)g_shuttle_id);
   HAL_UART_Transmit(&huart1, (uint8_t*)uart_buf, strlen(uart_buf), 1000);
 
   /* Bring the radio fully online (probe + reset + init + connect + DHCP + socket).

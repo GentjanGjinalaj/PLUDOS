@@ -78,6 +78,42 @@ You do nothing on the shuttle. It updates itself on its own schedule.
 
 ---
 
+## One image, every shuttle (fleet identity via factory UID)
+
+You ship **one** `firmware.bin` to the whole fleet — the same bytes flash onto every
+board. A shuttle's identity (`shuttle_id` = 1, 2, 3…) is **not** compiled into the image;
+it is resolved at boot from the MCU's 96-bit factory UID via a lookup table in
+`Core/Src/main.c` (`SHUTTLE_UID_TABLE` / `Shuttle_ResolveId`). The UID is laser-burned
+silicon, so each board keeps its id across every OTA — no per-board build, no collision.
+
+Each board prints its resolved id at boot and on network/drain logs, e.g.:
+
+```
+[BOOT] shuttle id 2 (UID 203834514731500E001D003D)
+[NETWORK s2] SUCCESS! Station IP: 192.168.0.163
+[DRAIN] shuttle 2 mission 1 sent: 447 chunks, ...
+```
+
+**Provisioning a new board** (one-time, on the bench with an ST-Link):
+
+1. Read its UID over SWD:
+   ```bash
+   STM32_Programmer_CLI -c port=SWD mode=UR -r32 0x0BFA0700 0xC
+   # 0x0BFA0700 : 001D003D 4731500E 20383451   ← three 32-bit words, low address first
+   ```
+2. Add a row to `SHUTTLE_UID_TABLE` in `main.c` (words in the same low→high order):
+   ```c
+   { 0x001D003DU, 0x4731500EU, 0x20383451U, 2U },  /* shuttle 2 */
+   ```
+3. Rebuild and flash. From then on that board self-identifies as that `shuttle_id`
+   no matter which firmware it runs. An unlisted UID falls back to the
+   `wifi_credentials.h` `SHUTTLE_ID` default and logs a `[BOOT] WARN`.
+
+This is firmware-side only: the `shuttle_id` byte on the wire and everything the
+gateway sees are unchanged.
+
+---
+
 ## Step 1 — build the image on your PC
 
 The firmware version is a single compile-time constant. Bump it so shuttles
