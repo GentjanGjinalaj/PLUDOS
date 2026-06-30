@@ -1477,7 +1477,7 @@
             "type": "influxdb",
             "uid": "efmtstss6rcw0d"
           },
-          "query": "from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"stm_idle_wave\" and (r._field == \"ax_g\" or r._field == \"ay_g\" or r._field == \"az_g\")) |> filter(fn: (r) => r.shuttle_id =~ /${shuttle:regex}/) |> group(columns: [\"shuttle_id\", \"_field\"]) |> keep(columns: [\"_time\", \"_value\", \"shuttle_id\", \"_field\"])"
+          "query": "from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"stm_idle_wave\" and (r._field == \"ax_g\" or r._field == \"ay_g\" or r._field == \"az_g\")) |> filter(fn: (r) => r.shuttle_id =~ /${shuttle:regex}/) |> map(fn: (r) => ({ r with _field: if r._field == \"ax_g\" or r._field == \"gx_dps\" then \"axis_x\" else if r._field == \"ay_g\" or r._field == \"gy_dps\" then \"axis_y\" else \"axis_z\" })) |> group(columns: [\"shuttle_id\", \"_field\"]) |> keep(columns: [\"_time\", \"_value\", \"shuttle_id\", \"_field\"])"
         }
       ],
       "gridPos": {
@@ -1506,37 +1506,7 @@
           {
             "matcher": {
               "id": "byRegexp",
-              "options": "ax_g$"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "red"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": "ay_g$"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "green"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": "az_g$"
+              "options": "^S1 "
             },
             "properties": [
               {
@@ -1551,14 +1521,14 @@
           {
             "matcher": {
               "id": "byRegexp",
-              "options": "gx_dps$"
+              "options": "^S2 "
             },
             "properties": [
               {
                 "id": "color",
                 "value": {
                   "mode": "fixed",
-                  "fixedColor": "red"
+                  "fixedColor": "orange"
                 }
               }
             ]
@@ -1566,7 +1536,7 @@
           {
             "matcher": {
               "id": "byRegexp",
-              "options": "gy_dps$"
+              "options": "^S3 "
             },
             "properties": [
               {
@@ -1581,14 +1551,80 @@
           {
             "matcher": {
               "id": "byRegexp",
-              "options": "gz_dps$"
+              "options": "^S4 "
             },
             "properties": [
               {
                 "id": "color",
                 "value": {
                   "mode": "fixed",
-                  "fixedColor": "blue"
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^S5 "
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "purple"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^S6 "
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "yellow"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "axis_y$"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    10
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "axis_z$"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    2,
+                    6
+                  ]
                 }
               }
             ]
@@ -1621,7 +1657,7 @@
             "type": "influxdb",
             "uid": "efmtstss6rcw0d"
           },
-          "query": "from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"stm_idle_wave\" and (r._field == \"gx_dps\" or r._field == \"gy_dps\" or r._field == \"gz_dps\")) |> filter(fn: (r) => r.shuttle_id =~ /${shuttle:regex}/) |> group(columns: [\"shuttle_id\", \"_field\"]) |> keep(columns: [\"_time\", \"_value\", \"shuttle_id\", \"_field\"])"
+          "query": "from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"stm_idle_wave\" and (r._field == \"gx_dps\" or r._field == \"gy_dps\" or r._field == \"gz_dps\")) |> filter(fn: (r) => r.shuttle_id =~ /${shuttle:regex}/) |> map(fn: (r) => ({ r with _field: if r._field == \"ax_g\" or r._field == \"gx_dps\" then \"axis_x\" else if r._field == \"ay_g\" or r._field == \"gy_dps\" then \"axis_y\" else \"axis_z\" })) |> group(columns: [\"shuttle_id\", \"_field\"]) |> keep(columns: [\"_time\", \"_value\", \"shuttle_id\", \"_field\"])"
         }
       ],
       "gridPos": {
@@ -1650,37 +1686,7 @@
           {
             "matcher": {
               "id": "byRegexp",
-              "options": "ax_g$"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "red"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": "ay_g$"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "green"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": "az_g$"
+              "options": "^S1 "
             },
             "properties": [
               {
@@ -1695,14 +1701,14 @@
           {
             "matcher": {
               "id": "byRegexp",
-              "options": "gx_dps$"
+              "options": "^S2 "
             },
             "properties": [
               {
                 "id": "color",
                 "value": {
                   "mode": "fixed",
-                  "fixedColor": "red"
+                  "fixedColor": "orange"
                 }
               }
             ]
@@ -1710,7 +1716,7 @@
           {
             "matcher": {
               "id": "byRegexp",
-              "options": "gy_dps$"
+              "options": "^S3 "
             },
             "properties": [
               {
@@ -1725,14 +1731,80 @@
           {
             "matcher": {
               "id": "byRegexp",
-              "options": "gz_dps$"
+              "options": "^S4 "
             },
             "properties": [
               {
                 "id": "color",
                 "value": {
                   "mode": "fixed",
-                  "fixedColor": "blue"
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^S5 "
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "purple"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^S6 "
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "yellow"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "axis_y$"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    10
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "axis_z$"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    2,
+                    6
+                  ]
                 }
               }
             ]
@@ -1765,7 +1837,7 @@
             "type": "influxdb",
             "uid": "efmtstss6rcw0d"
           },
-          "query": "from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"stm_mission_wave\" and (r._field == \"ax_g\" or r._field == \"ay_g\" or r._field == \"az_g\")) |> filter(fn: (r) => r.shuttle_id =~ /${shuttle:regex}/) |> group(columns: [\"shuttle_id\", \"_field\"]) |> keep(columns: [\"_time\", \"_value\", \"shuttle_id\", \"_field\"])"
+          "query": "from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"stm_mission_wave\" and (r._field == \"ax_g\" or r._field == \"ay_g\" or r._field == \"az_g\")) |> filter(fn: (r) => r.shuttle_id =~ /${shuttle:regex}/) |> map(fn: (r) => ({ r with _field: if r._field == \"ax_g\" or r._field == \"gx_dps\" then \"axis_x\" else if r._field == \"ay_g\" or r._field == \"gy_dps\" then \"axis_y\" else \"axis_z\" })) |> group(columns: [\"shuttle_id\", \"_field\"]) |> keep(columns: [\"_time\", \"_value\", \"shuttle_id\", \"_field\"])"
         }
       ],
       "gridPos": {
@@ -1794,37 +1866,7 @@
           {
             "matcher": {
               "id": "byRegexp",
-              "options": "ax_g$"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "red"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": "ay_g$"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "green"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": "az_g$"
+              "options": "^S1 "
             },
             "properties": [
               {
@@ -1839,14 +1881,14 @@
           {
             "matcher": {
               "id": "byRegexp",
-              "options": "gx_dps$"
+              "options": "^S2 "
             },
             "properties": [
               {
                 "id": "color",
                 "value": {
                   "mode": "fixed",
-                  "fixedColor": "red"
+                  "fixedColor": "orange"
                 }
               }
             ]
@@ -1854,7 +1896,7 @@
           {
             "matcher": {
               "id": "byRegexp",
-              "options": "gy_dps$"
+              "options": "^S3 "
             },
             "properties": [
               {
@@ -1869,14 +1911,80 @@
           {
             "matcher": {
               "id": "byRegexp",
-              "options": "gz_dps$"
+              "options": "^S4 "
             },
             "properties": [
               {
                 "id": "color",
                 "value": {
                   "mode": "fixed",
-                  "fixedColor": "blue"
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^S5 "
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "purple"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^S6 "
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "yellow"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "axis_y$"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    10
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "axis_z$"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    2,
+                    6
+                  ]
                 }
               }
             ]
@@ -1909,7 +2017,7 @@
             "type": "influxdb",
             "uid": "efmtstss6rcw0d"
           },
-          "query": "from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"stm_mission_wave\" and (r._field == \"gx_dps\" or r._field == \"gy_dps\" or r._field == \"gz_dps\")) |> filter(fn: (r) => r.shuttle_id =~ /${shuttle:regex}/) |> group(columns: [\"shuttle_id\", \"_field\"]) |> keep(columns: [\"_time\", \"_value\", \"shuttle_id\", \"_field\"])"
+          "query": "from(bucket: \"alumet_energy\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"stm_mission_wave\" and (r._field == \"gx_dps\" or r._field == \"gy_dps\" or r._field == \"gz_dps\")) |> filter(fn: (r) => r.shuttle_id =~ /${shuttle:regex}/) |> map(fn: (r) => ({ r with _field: if r._field == \"ax_g\" or r._field == \"gx_dps\" then \"axis_x\" else if r._field == \"ay_g\" or r._field == \"gy_dps\" then \"axis_y\" else \"axis_z\" })) |> group(columns: [\"shuttle_id\", \"_field\"]) |> keep(columns: [\"_time\", \"_value\", \"shuttle_id\", \"_field\"])"
         }
       ],
       "gridPos": {
@@ -1938,37 +2046,7 @@
           {
             "matcher": {
               "id": "byRegexp",
-              "options": "ax_g$"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "red"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": "ay_g$"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "green"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": "az_g$"
+              "options": "^S1 "
             },
             "properties": [
               {
@@ -1983,14 +2061,14 @@
           {
             "matcher": {
               "id": "byRegexp",
-              "options": "gx_dps$"
+              "options": "^S2 "
             },
             "properties": [
               {
                 "id": "color",
                 "value": {
                   "mode": "fixed",
-                  "fixedColor": "red"
+                  "fixedColor": "orange"
                 }
               }
             ]
@@ -1998,7 +2076,7 @@
           {
             "matcher": {
               "id": "byRegexp",
-              "options": "gy_dps$"
+              "options": "^S3 "
             },
             "properties": [
               {
@@ -2013,14 +2091,80 @@
           {
             "matcher": {
               "id": "byRegexp",
-              "options": "gz_dps$"
+              "options": "^S4 "
             },
             "properties": [
               {
                 "id": "color",
                 "value": {
                   "mode": "fixed",
-                  "fixedColor": "blue"
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^S5 "
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "purple"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^S6 "
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "yellow"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "axis_y$"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    10
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "axis_z$"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    2,
+                    6
+                  ]
                 }
               }
             ]
